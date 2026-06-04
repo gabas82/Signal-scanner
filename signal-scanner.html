@@ -119,7 +119,7 @@
   <span>ИЗТОЧНИЦИ:</span>
   <span class="src-tag src-gecko">CoinGecko Trending</span>
   <span class="src-tag src-binance">Binance Top Gainers</span>
-  <span class="src-tag src-oi">Binance OI Leaders</span>
+  <span class="src-tag src-oi">CoinGlass OI</span>
 </div>
 <div id="main-content">
   <div class="loading">ЗАРЕЖДАНЕ НА ДАННИ...<div class="loading-bar"><div class="loading-fill"></div></div></div>
@@ -127,20 +127,25 @@
 <div class="last-update" id="last-update">-- : -- : --</div>
 
 <script>
+// ===== КОНФИГУРАЦИЯ =====
+const WORKER_URL = 'https://orange-grass-d809.gabas82.workers.dev';
+
 let allCoins = [];
 let currentFilter = 'all';
 let refreshTimer = null;
 let trendingSymbols = new Set();
-const CG_KEY = 'df09f4d8e3374d4b99a0ee1c49f3bf5f';
 const liqCache = {};
+
+// CoinGlass заявки минават през Worker (ключът е в Worker-а)
+async function cgFetch(path) {
+  const r = await fetch(`${WORKER_URL}${path}`);
+  return r.json();
+}
 
 async function fetchLiqLevels(symbol) {
   try {
     const sym = symbol.replace('USDT','');
-    const r = await fetch(`https://open-api-v4.coinglass.com/api/futures/liquidation/aggregated-heatmap/model1?symbol=${sym}&range=3d`, {
-      headers: {'CG-API-KEY': CG_KEY}
-    });
-    const d = await r.json();
+    const d = await cgFetch(`/api/futures/liquidation/aggregated-heatmap/model1?symbol=${sym}&range=3d`);
     if (!d.data) return null;
     return d.data;
   } catch(e) { return null; }
@@ -152,7 +157,6 @@ async function getLiqNearPrice(symbol, price) {
   }
   const data = await fetchLiqLevels(symbol);
   if (!data) return null;
-  // data има y[] (цени) и liq[] (количества)
   const levels = data.y || [];
   const liqData = data.liq || [];
   const combined = levels.map((p, i) => ({
@@ -168,36 +172,26 @@ async function getLiqNearPrice(symbol, price) {
   return result;
 }
 
-// Базови символи — винаги сканирани
 const BASE_SYMBOLS = [
   'BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT',
   'DOGEUSDT','ADAUSDT','AVAXUSDT','LINKUSDT','DOTUSDT',
   'NEARUSDT','LTCUSDT','UNIUSDT','AAVEUSDT','INJUSDT',
   'SUIUSDT','APTUSDT','ARBUSDT','WLDUSDT','ENAUSDT',
   'FETUSDT','RENDERUSDT','ATOMUSDT','TIAUSDT','ONDOUSDT',
-  'HYPEUSDT','TAOUSDT','ROVERUSDT','ETCUSDT','RIVERUSDT','VVVUSDT'
+  'HYPEUSDT','TAOUSDT','ETCUSDT','VVVUSDT'
 ];
 
-// Символи с известни проблеми на Binance Futures
-const SYMBOL_MAP = {
-  'MATIC':'POL','TIAO':'TIA'
-};
+const SYMBOL_MAP = {'MATIC':'POL','TIAO':'TIA'};
+function fixSymbol(s) { return (SYMBOL_MAP[s] || s) + 'USDT'; }
 
-function fixSymbol(s) {
-  return (SYMBOL_MAP[s] || s) + 'USDT';
-}
-
-// Дърпа CoinGecko trending
 async function fetchTrending() {
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/search/trending');
     const d = await r.json();
-    const symbols = d.coins.map(c => c.item.symbol.toUpperCase());
-    return symbols;
+    return d.coins.map(c => c.item.symbol.toUpperCase());
   } catch(e) { return []; }
 }
 
-// Дърпа топ gainers от Binance Futures (24h)
 async function fetchTopGainers() {
   try {
     const r = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
@@ -210,11 +204,11 @@ async function fetchTopGainers() {
   } catch(e) { return []; }
 }
 
-// Дърпа топ по OI
 async function fetchTopOI() {
   try {
-    const r = await fetch('https://fapi.binance.com/futures/data/openInterestHist?symbol=BTCUSDT&period=1h&limit=1');
-    // Вземаме всички символи с голям OI
+    // Вземаме топ OI монети от CoinGlass през Worker
+    const d = await cgFetch('/api/futures/open-interest/exchange-list?symbol=BTC');
+    // Fallback към Binance volume ако CoinGlass не отговори
     const r2 = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
     const data = await r2.json();
     return data
@@ -234,7 +228,7 @@ async function fetchCoinData(symbol) {
       fetch(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`).then(r=>r.json())
     ]);
 
-    if (t24.code) return null; // невалиден символ
+    if (t24.code) return null;
 
     const price = parseFloat(t24.lastPrice);
     const chg24 = parseFloat(t24.priceChangePercent);
@@ -247,8 +241,7 @@ async function fetchCoinData(symbol) {
 
     const sym = symbol.replace('USDT','');
     return {
-      symbol: sym,
-      fullSymbol: symbol,
+      symbol: sym, fullSymbol: symbol,
       price, chg24, vol24, funding,
       lsRatio, longPct, shortPct, oi,
       isTrending: trendingSymbols.has(sym),
@@ -259,33 +252,26 @@ async function fetchCoinData(symbol) {
 
 function calcSignal(coin) {
   let ls = 0; let ss = 0;
-
   if (coin.chg24 >= 10) ls += 3;
   else if (coin.chg24 >= 5) ls += 2;
   else if (coin.chg24 >= 2) ls += 1;
   else if (coin.chg24 <= -10) ss += 3;
   else if (coin.chg24 <= -5) ss += 2;
   else if (coin.chg24 <= -2) ss += 1;
-
   if (coin.longPct >= 65) ls += 2;
   else if (coin.longPct >= 58) ls += 1;
   else if (coin.shortPct >= 55) ss += 1;
   else if (coin.shortPct >= 65) ss += 2;
-
   if (coin.funding < -0.01) ls += 1;
   else if (coin.funding > 0.08) ss += 2;
   else if (coin.funding > 0.05) ss += 1;
   else if (coin.funding > 0.03) ss += 1;
-
   if (coin.vol24 > 1000000000) ls += 1;
   else if (coin.vol24 > 500000000) ls += 1;
-
   if (coin.isTrending && coin.chg24 > 0) ls += 1;
   if (coin.isTrending && coin.chg24 < 0) ss += 1;
-
   const lsDiff = Math.abs(coin.longPct - 50);
   if (coin.funding > 0.06 && lsDiff < 15) return {signal:'SQUEEZE',ls,ss};
-
   if (ls >= 3) return {signal:'LONG',ls,ss};
   if (ss >= 3) return {signal:'SHORT',ls,ss};
   if (ls >= 2 && ls > ss) return {signal:'LONG',ls,ss};
@@ -293,9 +279,7 @@ function calcSignal(coin) {
   return {signal:'NEUTRAL',ls,ss};
 }
 
-function isManipulable(coin) {
-  return coin.vol24 < 30000000 || coin.oi < 3000000;
-}
+function isManipulable(coin) { return coin.vol24 < 30000000 || coin.oi < 3000000; }
 
 function formatNum(n) {
   if (!n && n!==0) return '--';
@@ -320,13 +304,11 @@ function renderCard(coin, idx) {
   const delay = idx * 0.05;
   const fColor = coin.funding > 0.05 ? 'var(--red)' : coin.funding < -0.01 ? 'var(--green)' : 'var(--text2)';
   const fSign = coin.funding > 0 ? '+' : '';
-
   const maxDots = 5;
   const activeDots = Math.min(Math.max(sig.ls, sig.ss), maxDots);
   const dotClass = sig.ls >= sig.ss ? 'on-long' : 'on-short';
   const dotsHtml = Array.from({length:maxDots},(_,i)=>
     `<div class="dot ${i < activeDots ? dotClass : ''}"></div>`).join('');
-
   const tags = [];
   if (coin.isTrending) tags.push(`<span class="tag tag-trending">🔥 TRENDING</span>`);
   if (coin.chg24 > 5) tags.push(`<span class="tag tag-gainer">▲ GAINER</span>`);
@@ -446,7 +428,6 @@ function renderList() {
     content.innerHTML = `<div class="no-results">НЯМА МОНЕТИ С ТОЗИ КРИТЕРИЙ</div>`;
     return;
   }
-
   content.innerHTML = `<div class="coins-list">${filtered.map((c,i)=>renderCard(c,i)).join('')}</div>`;
 }
 
@@ -471,42 +452,33 @@ function updateStats() {
 async function loadAll() {
   document.getElementById('main-content').innerHTML =
     `<div class="loading">ЗАРЕЖДАНЕ...<div class="loading-bar"><div class="loading-fill"></div></div></div>`;
-
   try {
     const [trendList, gainerSymbols, oiSymbols] = await Promise.all([
       fetchTrending(),
       fetchTopGainers(),
       fetchTopOI()
     ]);
-
     trendingSymbols = new Set(trendList);
-
     const allSymbols = new Set([
       ...BASE_SYMBOLS,
       ...gainerSymbols,
       ...oiSymbols,
       ...trendList.map(s => fixSymbol(s))
     ]);
-
     const symbolsArr = [...allSymbols].filter(s => s.endsWith('USDT')).slice(0,40);
-
     const results = [];
     for (let i=0; i<symbolsArr.length; i+=10) {
       const batch = symbolsArr.slice(i,i+10);
       const batchResults = await Promise.all(batch.map(s => fetchCoinData(s)));
       results.push(...batchResults.filter(r => r !== null));
     }
-
     allCoins = results.filter(c => c.vol24 > 3000000);
-
     updateStats();
     renderList();
     loadLiqLevels();
-
     const now = new Date();
     document.getElementById('last-update').textContent =
       `ОБНОВЕНО: ${now.toLocaleTimeString('bg')} · AUTO 30s · ${allCoins.length} МОНЕТИ`;
-
   } catch(e) {
     document.getElementById('main-content').innerHTML =
       `<div class="error-msg">ГРЕШКА ПРИ ЗАРЕЖДАНЕ<br>${e.message}</div>`;
@@ -525,98 +497,47 @@ startAutoRefresh();
 </html>
 <!-- DCA MODULE INJECTION -->
 <script>
-// ===== DCA МОДУЛ =====
 const DCA_LEVERAGE = 3;
 const DCA_ENTRY = 10;
 
 function calcLiquidationPrice(entryPrice, avgPrice, totalSize, leverage, side) {
-  const margin = totalSize / leverage;
   const maintenanceRate = 0.004;
-  if (side === 'long') {
-    return avgPrice * (1 - (1/leverage) + maintenanceRate);
-  } else {
-    return avgPrice * (1 + (1/leverage) - maintenanceRate);
-  }
+  if (side === 'long') return avgPrice * (1 - (1/leverage) + maintenanceRate);
+  else return avgPrice * (1 + (1/leverage) - maintenanceRate);
 }
 
 function calcDCALevels(entryPrice, side) {
   const steps = [];
-
   const entryQty = DCA_ENTRY / entryPrice;
   const entryLiq = calcLiquidationPrice(entryPrice, entryPrice, DCA_ENTRY, DCA_LEVERAGE, side);
-
-  steps.push({
-    step: 0,
-    label: 'ВХОД',
-    addAmount: DCA_ENTRY,
-    totalUSDT: DCA_ENTRY,
-    levelPrice: entryPrice,
-    avgPrice: entryPrice,
-    liqPrice: entryLiq,
-    safeOrder: null,
-    pctFromEntry: 0
-  });
-
+  steps.push({step:0,label:'ВХОД',addAmount:DCA_ENTRY,totalUSDT:DCA_ENTRY,levelPrice:entryPrice,avgPrice:entryPrice,liqPrice:entryLiq,safeOrder:null,pctFromEntry:0});
   const drops = [0.24, 0.40];
   let totalUSDT = DCA_ENTRY;
   let totalQty = entryQty;
   let addAmount = DCA_ENTRY;
-
   for (let i = 0; i < drops.length; i++) {
     addAmount = DCA_ENTRY * Math.pow(2, i + 1);
     const drop = drops[i];
-    const levelPrice = side === 'long'
-      ? entryPrice * (1 - drop)
-      : entryPrice * (1 + drop);
-
+    const levelPrice = side === 'long' ? entryPrice * (1 - drop) : entryPrice * (1 + drop);
     const qty = addAmount / levelPrice;
     totalUSDT += addAmount;
     totalQty += qty;
-
     const avgPrice = totalUSDT / totalQty;
     const liqPrice = calcLiquidationPrice(entryPrice, avgPrice, totalUSDT, DCA_LEVERAGE, side);
     const safeOrder = side === 'long' ? liqPrice * 1.02 : liqPrice * 0.98;
-
-    steps.push({
-      step: i + 1,
-      label: `DCA ${i + 1}`,
-      addAmount,
-      totalUSDT,
-      levelPrice,
-      avgPrice,
-      liqPrice,
-      safeOrder,
-      pctFromEntry: drop * 100
-    });
+    steps.push({step:i+1,label:`DCA ${i+1}`,addAmount,totalUSDT,levelPrice,avgPrice,liqPrice,safeOrder,pctFromEntry:drop*100});
   }
-
   const finalLiq = steps[steps.length - 1].liqPrice;
   const dca3Amount = DCA_ENTRY * 8;
-  const dca3Price = side === 'long'
-    ? entryPrice - (entryPrice - finalLiq) * 0.75
-    : entryPrice + (finalLiq - entryPrice) * 0.75;
-
+  const dca3Price = side === 'long' ? entryPrice - (entryPrice - finalLiq) * 0.75 : entryPrice + (finalLiq - entryPrice) * 0.75;
   const dca3Qty = dca3Amount / dca3Price;
   totalUSDT += dca3Amount;
   totalQty += dca3Qty;
-
   const dca3Avg = totalUSDT / totalQty;
   const dca3Liq = calcLiquidationPrice(entryPrice, dca3Avg, totalUSDT, DCA_LEVERAGE, side);
   const dca3Safe = side === 'long' ? dca3Liq * 1.02 : dca3Liq * 0.98;
   const dca3Pct = Math.abs((dca3Price - entryPrice) / entryPrice * 100);
-
-  steps.push({
-    step: 3,
-    label: 'DCA 3 · ПОСЛЕДЕН БУФЕР',
-    addAmount: dca3Amount,
-    totalUSDT,
-    levelPrice: dca3Price,
-    avgPrice: dca3Avg,
-    liqPrice: dca3Liq,
-    safeOrder: dca3Safe,
-    pctFromEntry: dca3Pct
-  });
-
+  steps.push({step:3,label:'DCA 3 · ПОСЛЕДЕН БУФЕР',addAmount:dca3Amount,totalUSDT,levelPrice:dca3Price,avgPrice:dca3Avg,liqPrice:dca3Liq,safeOrder:dca3Safe,pctFromEntry:dca3Pct});
   return steps;
 }
 
@@ -630,13 +551,10 @@ function formatP(p) {
 function openDCA(symbol, price) {
   document.querySelectorAll('.tab').forEach(t => t.className = 'tab');
   document.querySelector('[data-tab="dca"]').className = 'tab active-dca';
-  
   document.getElementById('scanner-view').style.display = 'none';
   document.getElementById('dca-view').style.display = 'block';
-
   document.getElementById('dca-symbol').value = symbol || '';
   document.getElementById('dca-price').value = price || '';
-  
   if (symbol && price) renderDCA();
 }
 
@@ -644,17 +562,13 @@ function renderDCA() {
   const symbol = document.getElementById('dca-symbol').value.toUpperCase().trim();
   const price = parseFloat(document.getElementById('dca-price').value);
   const side = document.querySelector('input[name="dca-side"]:checked').value;
-
   if (!symbol || !price || isNaN(price)) {
-    document.getElementById('dca-result').innerHTML = 
-      `<div style="text-align:center;color:var(--text2);padding:20px;font-family:'Share Tech Mono',monospace;font-size:12px;">ВЪВЕДИ МОНЕТА И ЦЕНА</div>`;
+    document.getElementById('dca-result').innerHTML = `<div style="text-align:center;color:var(--text2);padding:20px;font-family:'Share Tech Mono',monospace;font-size:12px;">ВЪВЕДИ МОНЕТА И ЦЕНА</div>`;
     return;
   }
-
   const steps = calcDCALevels(price, side);
   const sideColor = side === 'long' ? 'var(--green)' : 'var(--red)';
   const sideLabel = side === 'long' ? '▲ LONG' : '▼ SHORT';
-
   let html = `
   <div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:10px 14px;">
     <div style="padding:10px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
@@ -664,28 +578,16 @@ function renderDCA() {
       </div>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;padding:8px 12px;border-bottom:1px solid var(--border);">
-      <div style="text-align:center;">
-        <div style="font-size:9px;color:var(--text2);letter-spacing:1px;">ЛЕВЪРИДЖ</div>
-        <div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--yellow);">х${DCA_LEVERAGE}</div>
-      </div>
-      <div style="text-align:center;border-left:1px solid var(--border);border-right:1px solid var(--border);">
-        <div style="font-size:9px;color:var(--text2);letter-spacing:1px;">НАЧАЛНА СУМА</div>
-        <div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--accent);">$${DCA_ENTRY}</div>
-      </div>
-      <div style="text-align:center;">
-        <div style="font-size:9px;color:var(--text2);letter-spacing:1px;">МАКС ОБЩО</div>
-        <div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--red);">$${steps[steps.length-1].totalUSDT.toFixed(0)}</div>
-      </div>
+      <div style="text-align:center;"><div style="font-size:9px;color:var(--text2);letter-spacing:1px;">ЛЕВЪРИДЖ</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--yellow);">х${DCA_LEVERAGE}</div></div>
+      <div style="text-align:center;border-left:1px solid var(--border);border-right:1px solid var(--border);"><div style="font-size:9px;color:var(--text2);letter-spacing:1px;">НАЧАЛНА СУМА</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--accent);">$${DCA_ENTRY}</div></div>
+      <div style="text-align:center;"><div style="font-size:9px;color:var(--text2);letter-spacing:1px;">МАКС ОБЩО</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--red);">$${steps[steps.length-1].totalUSDT.toFixed(0)}</div></div>
     </div>
   </div>`;
-
   html += `<div style="margin:0 14px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden;">`;
-  
   steps.forEach((s, idx) => {
     const isEntry = s.step === 0;
     const rowBg = isEntry ? 'rgba(0,229,255,0.05)' : '';
     const labelColor = isEntry ? 'var(--accent)' : sideColor;
-    
     html += `
     <div style="padding:10px 12px;border-bottom:${idx < steps.length-1 ? '1px solid var(--border)' : 'none'};background:${rowBg};">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
@@ -696,44 +598,19 @@ function renderDCA() {
         <span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:#fff;font-weight:bold;">+$${s.addAmount.toFixed(0)} → $${s.totalUSDT.toFixed(0)}</span>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;">
-        <div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;">
-          <div style="font-size:8px;color:var(--text2);letter-spacing:0.5px;">ЦЕНА НИВО</div>
-          <div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);">${formatP(s.levelPrice)}</div>
-        </div>
-        <div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;">
-          <div style="font-size:8px;color:var(--text2);letter-spacing:0.5px;">СРЕДНА ЦЕНА</div>
-          <div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--yellow);">${formatP(s.avgPrice)}</div>
-        </div>
-        <div style="background:rgba(255,51,102,0.08);border-radius:6px;padding:5px 6px;text-align:center;border:1px solid rgba(255,51,102,0.15);">
-          <div style="font-size:8px;color:var(--text2);letter-spacing:0.5px;">ЛИКВИДАЦИЯ</div>
-          <div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--red);">${formatP(s.liqPrice)}</div>
-        </div>
+        <div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">ЦЕНА НИВО</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);">${formatP(s.levelPrice)}</div></div>
+        <div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">СРЕДНА ЦЕНА</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--yellow);">${formatP(s.avgPrice)}</div></div>
+        <div style="background:rgba(255,51,102,0.08);border-radius:6px;padding:5px 6px;text-align:center;border:1px solid rgba(255,51,102,0.15);"><div style="font-size:8px;color:var(--text2);">ЛИКВИДАЦИЯ</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--red);">${formatP(s.liqPrice)}</div></div>
       </div>
-      ${!isEntry ? `
-      <div style="margin-top:5px;background:rgba(255,204,0,0.06);border:1px solid rgba(255,204,0,0.2);border-radius:6px;padding:5px 8px;display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-size:9px;color:var(--yellow);letter-spacing:0.5px;">📌 LIMIT ОРДЪР</span>
-        <span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--yellow);font-weight:bold;">${formatP(s.safeOrder)}</span>
-      </div>` : ''}
+      ${!isEntry ? `<div style="margin-top:5px;background:rgba(255,204,0,0.06);border:1px solid rgba(255,204,0,0.2);border-radius:6px;padding:5px 8px;display:flex;justify-content:space-between;align-items:center;"><span style="font-size:9px;color:var(--yellow);">📌 LIMIT ОРДЪР</span><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--yellow);font-weight:bold;">${formatP(s.safeOrder)}</span></div>` : ''}
     </div>`;
   });
-  
   html += `</div>`;
-
-  html += `
-  <div style="margin:0 14px 14px;background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.2);border-radius:10px;padding:10px 12px;">
-    <div style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--green);letter-spacing:1px;margin-bottom:8px;">→ СТРАТЕГИЯ ЗА ИЗХОД</div>
-    <div style="font-size:12px;color:var(--text);line-height:1.6;">
-      При възстановяване → освобождаваш <span style="color:var(--green);font-weight:bold;">75%</span> от позицията веднага<br>
-      Оставяш <span style="color:var(--accent);font-weight:bold;">25%</span> да продължи при по-висока цел
-    </div>
-  </div>`;
-
+  html += `<div style="margin:0 14px 14px;background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.2);border-radius:10px;padding:10px 12px;"><div style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--green);letter-spacing:1px;margin-bottom:8px;">→ СТРАТЕГИЯ ЗА ИЗХОД</div><div style="font-size:12px;color:var(--text);line-height:1.6;">При възстановяване → освобождаваш <span style="color:var(--green);font-weight:bold;">75%</span> от позицията веднага<br>Оставяш <span style="color:var(--accent);font-weight:bold;">25%</span> да продължи при по-висока цел</div></div>`;
   document.getElementById('dca-result').innerHTML = html;
 }
 
-document.addEventListener('DOMContentLoaded', function() {
-  injectDCAUI();
-});
+document.addEventListener('DOMContentLoaded', function() { injectDCAUI(); });
 
 function injectDCAUI() {
   const tabs = document.querySelector('.filter-tabs');
@@ -750,60 +627,27 @@ function injectDCAUI() {
   tabs.appendChild(dcaTab);
 
   const style = document.createElement('style');
-  style.textContent = `
-    .tab.active-dca{background:rgba(68,136,255,0.12);border-color:var(--blue);color:var(--blue);}
-    .dca-btn{background:rgba(0,229,255,0.1);border:1px solid rgba(0,229,255,0.3);color:var(--accent);font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 10px;border-radius:12px;cursor:pointer;letter-spacing:1px;margin-top:6px;}
-    .dca-btn:active{opacity:0.7;}
-    .dca-input{background:var(--bg3);border:1px solid var(--border);color:#fff;font-family:'Share Tech Mono',monospace;font-size:14px;padding:10px 12px;border-radius:8px;width:100%;outline:none;}
-    .dca-input:focus{border-color:var(--accent);}
-    .side-btn{flex:1;padding:10px;border-radius:8px;font-family:'Share Tech Mono',monospace;font-size:13px;font-weight:bold;cursor:pointer;border:1px solid var(--border);background:var(--bg3);color:var(--text2);transition:all 0.2s;letter-spacing:1px;}
-    .side-btn.sel-long{background:rgba(0,255,136,0.15);border-color:var(--green);color:var(--green);}
-    .side-btn.sel-short{background:rgba(255,51,102,0.15);border-color:var(--red);color:var(--red);}
-    .calc-btn{width:100%;padding:13px;background:var(--accent);color:#000;font-family:'Share Tech Mono',monospace;font-size:14px;font-weight:bold;border:none;border-radius:8px;cursor:pointer;letter-spacing:2px;margin-top:4px;}
-    .calc-btn:active{opacity:0.8;}
-  `;
+  style.textContent = `.tab.active-dca{background:rgba(68,136,255,0.12);border-color:var(--blue);color:var(--blue);}.dca-btn{background:rgba(0,229,255,0.1);border:1px solid rgba(0,229,255,0.3);color:var(--accent);font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 10px;border-radius:12px;cursor:pointer;letter-spacing:1px;margin-top:6px;}.dca-btn:active{opacity:0.7;}.dca-input{background:var(--bg3);border:1px solid var(--border);color:#fff;font-family:'Share Tech Mono',monospace;font-size:14px;padding:10px 12px;border-radius:8px;width:100%;outline:none;}.dca-input:focus{border-color:var(--accent);}.side-btn{flex:1;padding:10px;border-radius:8px;font-family:'Share Tech Mono',monospace;font-size:13px;font-weight:bold;cursor:pointer;border:1px solid var(--border);background:var(--bg3);color:var(--text2);transition:all 0.2s;letter-spacing:1px;}.side-btn.sel-long{background:rgba(0,255,136,0.15);border-color:var(--green);color:var(--green);}.side-btn.sel-short{background:rgba(255,51,102,0.15);border-color:var(--red);color:var(--red);}.calc-btn{width:100%;padding:13px;background:var(--accent);color:#000;font-family:'Share Tech Mono',monospace;font-size:14px;font-weight:bold;border:none;border-radius:8px;cursor:pointer;letter-spacing:2px;margin-top:4px;}.calc-btn:active{opacity:0.8;}`;
   document.head.appendChild(style);
 
   const mainContent = document.getElementById('main-content');
   const lastUpdate = document.getElementById('last-update');
   const sourceBar = document.querySelector('.source-bar');
-
   const scannerWrapper = document.createElement('div');
   scannerWrapper.id = 'scanner-view';
-  
   const dcaView = document.createElement('div');
   dcaView.id = 'dca-view';
   dcaView.style.display = 'none';
   dcaView.innerHTML = `
     <div style="padding:14px;">
       <div style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2);letter-spacing:2px;margin-bottom:10px;">DCA КАЛКУЛАТОР · х${DCA_LEVERAGE} · $${DCA_ENTRY} НАЧАЛО</div>
-      
-      <div style="margin-bottom:10px;">
-        <div style="font-size:10px;color:var(--text2);letter-spacing:1px;margin-bottom:5px;">МОНЕТА</div>
-        <input id="dca-symbol" class="dca-input" placeholder="BTC, ETH, WLD..." oninput="this.value=this.value.toUpperCase()">
-      </div>
-      
-      <div style="margin-bottom:10px;">
-        <div style="font-size:10px;color:var(--text2);letter-spacing:1px;margin-bottom:5px;">ЦЕНА НА ВХОД ($)</div>
-        <input id="dca-price" class="dca-input" type="number" placeholder="0.00000" step="any">
-      </div>
-
-      <div style="margin-bottom:12px;">
-        <div style="font-size:10px;color:var(--text2);letter-spacing:1px;margin-bottom:5px;">ПОСОКА</div>
-        <div style="display:flex;gap:8px;">
-          <input type="radio" name="dca-side" value="long" id="side-long" checked style="display:none">
-          <input type="radio" name="dca-side" value="short" id="side-short" style="display:none">
-          <button class="side-btn sel-long" onclick="document.getElementById('side-long').checked=true;document.querySelectorAll('.side-btn').forEach(b=>b.className='side-btn');this.className='side-btn sel-long';">▲ LONG</button>
-          <button class="side-btn" onclick="document.getElementById('side-short').checked=true;document.querySelectorAll('.side-btn').forEach(b=>b.className='side-btn');this.className='side-btn sel-short';">▼ SHORT</button>
-        </div>
-      </div>
-
+      <div style="margin-bottom:10px;"><div style="font-size:10px;color:var(--text2);letter-spacing:1px;margin-bottom:5px;">МОНЕТА</div><input id="dca-symbol" class="dca-input" placeholder="BTC, ETH, WLD..." oninput="this.value=this.value.toUpperCase()"></div>
+      <div style="margin-bottom:10px;"><div style="font-size:10px;color:var(--text2);letter-spacing:1px;margin-bottom:5px;">ЦЕНА НА ВХОД ($)</div><input id="dca-price" class="dca-input" type="number" placeholder="0.00000" step="any"></div>
+      <div style="margin-bottom:12px;"><div style="font-size:10px;color:var(--text2);letter-spacing:1px;margin-bottom:5px;">ПОСОКА</div><div style="display:flex;gap:8px;"><input type="radio" name="dca-side" value="long" id="side-long" checked style="display:none"><input type="radio" name="dca-side" value="short" id="side-short" style="display:none"><button class="side-btn sel-long" onclick="document.getElementById('side-long').checked=true;document.querySelectorAll('.side-btn').forEach(b=>b.className='side-btn');this.className='side-btn sel-long';">▲ LONG</button><button class="side-btn" onclick="document.getElementById('side-short').checked=true;document.querySelectorAll('.side-btn').forEach(b=>b.className='side-btn');this.className='side-btn sel-short';">▼ SHORT</button></div></div>
       <button class="calc-btn" onclick="renderDCA()">⚡ ИЗЧИСЛИ DCA</button>
     </div>
     <div id="dca-result"></div>
-    <div style="height:20px;"></div>
-  `;
-
+    <div style="height:20px;"></div>`;
   sourceBar.after(scannerWrapper);
   scannerWrapper.appendChild(mainContent);
   scannerWrapper.appendChild(lastUpdate);
