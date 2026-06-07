@@ -70,6 +70,8 @@
   .tag-top{background:rgba(255,51,102,0.2);color:var(--red);border:1px solid rgba(255,51,102,0.5);font-weight:bold;}
   .tag-oi-up{background:rgba(0,229,255,0.1);color:var(--accent);border:1px solid rgba(0,229,255,0.3);}
   .tag-oi-down{background:rgba(255,51,102,0.1);color:var(--red);border:1px solid rgba(255,51,102,0.3);}
+  .tag-ath{background:rgba(255,204,0,0.1);color:var(--yellow);border:1px solid rgba(255,204,0,0.3);}
+  .tag-atl{background:rgba(0,255,136,0.15);color:var(--green);border:1px solid rgba(0,255,136,0.4);font-weight:bold;}
   .coin-right{text-align:right;}
   .coin-price{font-family:'Share Tech Mono',monospace;font-size:15px;color:#fff;font-weight:bold;}
   .coin-chg{font-size:13px;font-weight:700;margin-top:2px;}
@@ -80,6 +82,7 @@
   .metric:not(:last-child){border-right:1px solid var(--border);}
   .metric-label{font-size:9px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;}
   .metric-value{font-family:'Share Tech Mono',monospace;font-size:12px;margin-top:2px;font-weight:bold;}
+  .ath-bar{display:flex;justify-content:space-between;padding:5px 12px;font-family:'Share Tech Mono',monospace;font-size:10px;border-bottom:1px solid var(--border);background:rgba(0,0,0,0.2);}
   .ls-section{padding:8px 12px;border-bottom:1px solid var(--border);}
   .ls-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;}
   .ls-label{font-size:9px;color:var(--text2);letter-spacing:1px;}
@@ -233,7 +236,9 @@ const BASE_SYMBOLS = [
   'NEARUSDT','LTCUSDT','UNIUSDT','AAVEUSDT','INJUSDT',
   'SUIUSDT','APTUSDT','ARBUSDT','WLDUSDT','ENAUSDT',
   'FETUSDT','RENDERUSDT','ATOMUSDT','TIAUSDT','ONDOUSDT',
-  'HYPEUSDT','TAOUSDT','ETCUSDT','VVVUSDT'
+  'HYPEUSDT','TAOUSDT','ETCUSDT','VVVUSDT',
+  'RIVERUSDT','TONUSDT','TWTUSDT','AIXBTUSDT','MNTUSDT',
+  'SAHARAUSDT','RAVEUSDT'
 ];
 
 const SYMBOL_MAP = {'MATIC':'POL','TIAO':'TIA'};
@@ -290,8 +295,33 @@ const geckoIdMap = {
   'SUIUSDT':'sui','APTUSDT':'aptos','ARBUSDT':'arbitrum',
   'WLDUSDT':'worldcoin-wld','ENAUSDT':'ethena','FETUSDT':'fetch-ai',
   'RENDERUSDT':'render-token','ATOMUSDT':'cosmos','TIAUSDT':'celestia',
-  'HYPEUSDT':'hyperliquid','ETCUSDT':'ethereum-classic'
+  'HYPEUSDT':'hyperliquid','ETCUSDT':'ethereum-classic',
+  'ONDOUSDT':'ondo-finance','VVVUSDT':'venice-token',
+  'TONUSDT':'the-open-network','TWTUSDT':'trust-wallet-token',
+  'AIXBTUSDT':'aixbt-by-virtuals','MNTUSDT':'mantle',
+  'RIVERUSDT':'river-protocol'
 };
+
+const athCache = {};
+
+async function fetchCoinGeckoExtras(symbol) {
+  if (athCache[symbol] && athCache[symbol].ts > Date.now() - 3600000) return athCache[symbol].data;
+  try {
+    const coinId = geckoIdMap[symbol];
+    if (!coinId) return null;
+    const r = await fetch(`https://api.coingecko.com/api/v3/coins/${coinId}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false`);
+    const d = await r.json();
+    if (!d.market_data) return null;
+    const price = d.market_data.current_price?.usd || 0;
+    const ath = d.market_data.ath?.usd || 0;
+    const atl = d.market_data.atl?.usd || 0;
+    const pctFromAth = ath > 0 ? ((price - ath) / ath) * 100 : null;
+    const pctFromAtl = atl > 0 ? ((price - atl) / atl) * 100 : null;
+    const result = { pctFromAth, pctFromAtl, ath, atl };
+    athCache[symbol] = { data: result, ts: Date.now() };
+    return result;
+  } catch(e) { return null; }
+}
 
 async function fetchCoinData(symbol) {
   try {
@@ -313,8 +343,73 @@ async function fetchCoinData(symbol) {
     const shortPct = 100 - longPct;
     const oi = oiR.openInterest ? parseFloat(oiR.openInterest)*price : 0;
     const sym = symbol.replace('USDT','');
-    return {symbol:sym,fullSymbol:symbol,price,chg24,vol24,funding,longPct,shortPct,oi,oiDelta,volSpike,isTrending:trendingSymbols.has(sym),pctFromAth:null,pctFromAtl:null,valid:true};
+    return {
+      symbol:sym, fullSymbol:symbol,
+      price, chg24, vol24, funding,
+      longPct, shortPct, oi,
+      oiDelta, volSpike,
+      isTrending: trendingSymbols.has(sym),
+      pctFromAth: null, pctFromAtl: null, ath: null, atl: null,
+      valid: true
+    };
   } catch(e) { return null; }
+}
+
+async function loadAthAtlAsync() {
+  const symbols = allCoins.map(c => c.fullSymbol).filter(s => geckoIdMap[s]);
+  for (const symbol of symbols) {
+    const extras = await fetchCoinGeckoExtras(symbol);
+    if (extras) {
+      const coin = allCoins.find(c => c.fullSymbol === symbol);
+      if (coin) {
+        coin.pctFromAth = extras.pctFromAth;
+        coin.pctFromAtl = extras.pctFromAtl;
+        coin.ath = extras.ath;
+        coin.atl = extras.atl;
+        updateCardAth(symbol, extras);
+      }
+    }
+    await new Promise(res => setTimeout(res, 1200));
+  }
+}
+
+function updateCardAth(fullSymbol, extras) {
+  const sym = fullSymbol.replace('USDT','');
+  const cards = document.querySelectorAll('.coin-card');
+  for (const card of cards) {
+    const nameEl = card.querySelector('.coin-name');
+    if (nameEl && nameEl.textContent.trim() === sym) {
+      const athBar = card.querySelector('.ath-bar');
+      if (athBar && extras.pctFromAth !== null) {
+        const athColor = extras.pctFromAth > -15 ? 'var(--red)' : extras.pctFromAth > -50 ? 'var(--yellow)' : 'var(--green)';
+        const atlColor = extras.pctFromAtl !== null && extras.pctFromAtl < 100 ? 'var(--green)' : 'var(--text2)';
+        athBar.innerHTML = `
+          <span style="color:var(--text2)">ATH: <span style="color:${athColor}">${extras.pctFromAth.toFixed(0)}%</span></span>
+          <span style="color:var(--text2)">$${formatPrice(extras.ath)}</span>
+          <span style="color:var(--text2)">ATL: <span style="color:${atlColor}">+${extras.pctFromAtl ? extras.pctFromAtl.toFixed(0) : '?'}%</span></span>`;
+        const coin = allCoins.find(c => c.fullSymbol === fullSymbol);
+        if (coin) {
+          const tagsEl = card.querySelector('.coin-tags');
+          if (tagsEl) {
+            if (extras.pctFromAtl !== null && extras.pctFromAtl < 100 && !tagsEl.querySelector('.tag-atl')) {
+              const atlTag = document.createElement('span');
+              atlTag.className = 'tag tag-atl';
+              atlTag.textContent = '🟢 БЛИЗО ATL';
+              tagsEl.insertBefore(atlTag, tagsEl.firstChild);
+            }
+            if (extras.pctFromAth !== null && extras.pctFromAth > -15 && !tagsEl.querySelector('.tag-ath')) {
+              const athTag = document.createElement('span');
+              athTag.className = 'tag tag-ath';
+              athTag.textContent = '🔴 БЛИЗО ATH';
+              tagsEl.insertBefore(athTag, tagsEl.firstChild);
+            }
+          }
+        }
+      }
+      break;
+    }
+  }
+  updateStats();
 }
 
 function detectBottom(coin) {
@@ -322,11 +417,13 @@ function detectBottom(coin) {
   const oiRising = coin.oiDelta > 1;
   const oversold = coin.chg24 < -5;
   const longsDominated = coin.longPct < 45;
+  const nearAtl = coin.pctFromAtl !== null && coin.pctFromAtl < 100;
   let score = 0;
   if (fundingNeutral) score++;
   if (oiRising) score++;
   if (oversold) score++;
   if (longsDominated) score++;
+  if (nearAtl) score += 2;
   return score >= 3;
 }
 
@@ -335,11 +432,13 @@ function detectTop(coin) {
   const oiFalling = coin.oiDelta < -1;
   const overbought = coin.chg24 > 10;
   const longsDominated = coin.longPct > 70;
+  const nearAth = coin.pctFromAth !== null && coin.pctFromAth > -15;
   let score = 0;
   if (fundingHigh) score += 2;
   if (oiFalling) score++;
   if (overbought) score++;
   if (longsDominated) score += 2;
+  if (nearAth) score += 2;
   return score >= 4;
 }
 
@@ -413,6 +512,8 @@ function renderCard(coin, idx) {
   const tags = [];
   if (isBottom) tags.push(`<span class="tag tag-bottom">🟢 ДЪНО</span>`);
   if (isTop) tags.push(`<span class="tag tag-top">🔴 ВРЪХ</span>`);
+  if (coin.pctFromAtl !== null && coin.pctFromAtl < 100) tags.push(`<span class="tag tag-atl">🟢 БЛИЗО ATL</span>`);
+  if (coin.pctFromAth !== null && coin.pctFromAth > -15) tags.push(`<span class="tag tag-ath">🔴 БЛИЗО ATH</span>`);
   if (coin.isTrending) tags.push(`<span class="tag tag-trending">🔥 TRENDING</span>`);
   if (coin.chg24 > 5) tags.push(`<span class="tag tag-gainer">▲ GAINER</span>`);
   if (coin.oi > 500000000) tags.push(`<span class="tag tag-oi">HIGH OI</span>`);
@@ -424,6 +525,14 @@ function renderCard(coin, idx) {
     ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>`
     : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding.toFixed(3)}% · L/S>${coin.longPct.toFixed(0)}% · OI↓</div>` : '';
   const detectorClass = isBottom ? ' detector-bottom' : isTop ? ' detector-top' : '';
+  let athBarHtml = '';
+  if (coin.pctFromAth !== null) {
+    const athColor = coin.pctFromAth > -15 ? 'var(--red)' : coin.pctFromAth > -50 ? 'var(--yellow)' : 'var(--green)';
+    const atlColor = coin.pctFromAtl !== null && coin.pctFromAtl < 100 ? 'var(--green)' : 'var(--text2)';
+    athBarHtml = `<div class="ath-bar"><span style="color:var(--text2)">ATH: <span style="color:${athColor}">${coin.pctFromAth.toFixed(0)}%</span></span><span style="color:var(--text2)">$${formatPrice(coin.ath)}</span><span style="color:var(--text2)">ATL: <span style="color:${atlColor}">+${coin.pctFromAtl?coin.pctFromAtl.toFixed(0):'?'}%</span></span></div>`;
+  } else {
+    athBarHtml = `<div class="ath-bar"><span style="color:var(--text2);font-size:9px;">ATH/ATL: зареждане...</span></div>`;
+  }
   return `
   <div class="coin-card signal-${sc}${detectorClass}" style="animation-delay:${delay}s">
     <div class="card-top">
@@ -436,6 +545,7 @@ function renderCard(coin, idx) {
         <div class="coin-chg ${coin.chg24>=0?'pos':'neg'}">${coin.chg24>=0?'+':''}${coin.chg24.toFixed(2)}%</div>
       </div>
     </div>
+    ${athBarHtml}
     <div class="card-metrics">
       <div class="metric"><div class="metric-label">OI</div><div class="metric-value" style="color:var(--accent)">$${formatNum(coin.oi)}</div></div>
       <div class="metric"><div class="metric-label">OI Δ 15M</div><div class="metric-value">${formatOIDelta(coin.oiDelta)}</div></div>
@@ -553,19 +663,20 @@ async function loadAll() {
     const [trendList, gainerSymbols, oiSymbols] = await Promise.all([fetchTrending(), fetchTopGainers(), fetchTopOI()]);
     trendingSymbols = new Set(trendList);
     const allSymbols = new Set([...BASE_SYMBOLS,...gainerSymbols,...oiSymbols,...trendList.map(s=>fixSymbol(s))]);
-    const symbolsArr = [...allSymbols].filter(s=>s.endsWith('USDT')).slice(0,40);
+    const symbolsArr = [...allSymbols].filter(s=>s.endsWith('USDT')).slice(0,45);
     const results = [];
     for (let i=0; i<symbolsArr.length; i+=10) {
       const batch = symbolsArr.slice(i,i+10);
       const batchResults = await Promise.all(batch.map(s=>fetchCoinData(s)));
       results.push(...batchResults.filter(r=>r!==null));
     }
-    allCoins = results.filter(c=>c.vol24>3000000);
+    allCoins = results.filter(c=>c.vol24>1000000);
     updateStats();
     renderList();
     loadLiqLevels();
     const now = new Date();
     document.getElementById('last-update').textContent = `ОБНОВЕНО: ${now.toLocaleTimeString('bg')} · AUTO 30s · ${allCoins.length} МОНЕТИ`;
+    loadAthAtlAsync();
   } catch(e) {
     document.getElementById('main-content').innerHTML = `<div class="error-msg">ГРЕШКА ПРИ ЗАРЕЖДАНЕ<br>${e.message}</div>`;
   }
@@ -641,38 +752,15 @@ function renderDCA() {
   const steps = calcDCALevels(price, side);
   const sideColor = side==='long'?'var(--green)':'var(--red)';
   const sideLabel = side==='long'?'▲ LONG':'▼ SHORT';
-  let html = `<div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:10px 14px;">
-    <div style="padding:10px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
-      <div style="font-size:18px;font-weight:700;color:#fff;">${symbol}/USDT</div>
-      <span style="font-family:'Share Tech Mono',monospace;font-size:11px;padding:3px 10px;border-radius:12px;background:${side==='long'?'rgba(0,255,136,0.15)':'rgba(255,51,102,0.15)'};color:${sideColor};border:1px solid ${sideColor};">${sideLabel}</span>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;padding:8px 12px;border-bottom:1px solid var(--border);">
-      <div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">ЛЕВЪРИДЖ</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--yellow);">х${DCA_LEVERAGE}</div></div>
-      <div style="text-align:center;border-left:1px solid var(--border);border-right:1px solid var(--border);"><div style="font-size:9px;color:var(--text2);">НАЧАЛНА СУМА</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--accent);">$${DCA_ENTRY}</div></div>
-      <div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">МАКС ОБЩО</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--red);">$${steps[steps.length-1].totalUSDT.toFixed(0)}</div></div>
-    </div></div>`;
+  let html = `<div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:10px 14px;"><div style="padding:10px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;"><div style="font-size:18px;font-weight:700;color:#fff;">${symbol}/USDT</div><span style="font-family:'Share Tech Mono',monospace;font-size:11px;padding:3px 10px;border-radius:12px;background:${side==='long'?'rgba(0,255,136,0.15)':'rgba(255,51,102,0.15)'};color:${sideColor};border:1px solid ${sideColor};">${sideLabel}</span></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;padding:8px 12px;border-bottom:1px solid var(--border);"><div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">ЛЕВЪРИДЖ</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--yellow);">х${DCA_LEVERAGE}</div></div><div style="text-align:center;border-left:1px solid var(--border);border-right:1px solid var(--border);"><div style="font-size:9px;color:var(--text2);">НАЧАЛНА СУМА</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--accent);">$${DCA_ENTRY}</div></div><div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">МАКС ОБЩО</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--red);">$${steps[steps.length-1].totalUSDT.toFixed(0)}</div></div></div></div>`;
   html += `<div style="margin:0 14px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden;">`;
   steps.forEach((s,idx) => {
     const isEntry = s.step===0;
     const rowBg = isEntry?'rgba(0,229,255,0.05)':'';
     const labelColor = isEntry?'var(--accent)':sideColor;
-    html += `<div style="padding:10px 12px;border-bottom:${idx<steps.length-1?'1px solid var(--border)':'none'};background:${rowBg};">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-        <div><span style="font-family:'Share Tech Mono',monospace;font-size:11px;color:${labelColor};">${s.label}</span>${s.pctFromEntry>0?`<span style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2);margin-left:6px;">-${s.pctFromEntry.toFixed(0)}%</span>`:''}</div>
-        <span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:#fff;font-weight:bold;">+$${s.addAmount.toFixed(0)} → $${s.totalUSDT.toFixed(0)}</span>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;">
-        <div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">ЦЕНА НИВО</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);">${formatP(s.levelPrice)}</div></div>
-        <div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">СРЕДНА ЦЕНА</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--yellow);">${formatP(s.avgPrice)}</div></div>
-        <div style="background:rgba(255,51,102,0.08);border-radius:6px;padding:5px 6px;text-align:center;border:1px solid rgba(255,51,102,0.15);"><div style="font-size:8px;color:var(--text2);">ЛИКВИДАЦИЯ</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--red);">${formatP(s.liqPrice)}</div></div>
-      </div>
-      ${!isEntry?`<div style="margin-top:5px;background:rgba(255,204,0,0.06);border:1px solid rgba(255,204,0,0.2);border-radius:6px;padding:5px 8px;display:flex;justify-content:space-between;align-items:center;"><span style="font-size:9px;color:var(--yellow);">📌 LIMIT ОРДЪР</span><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--yellow);font-weight:bold;">${formatP(s.safeOrder)}</span></div>`:''}
-    </div>`;
+    html += `<div style="padding:10px 12px;border-bottom:${idx<steps.length-1?'1px solid var(--border)':'none'};background:${rowBg};"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><div><span style="font-family:'Share Tech Mono',monospace;font-size:11px;color:${labelColor};">${s.label}</span>${s.pctFromEntry>0?`<span style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2);margin-left:6px;">-${s.pctFromEntry.toFixed(0)}%</span>`:''}</div><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:#fff;font-weight:bold;">+$${s.addAmount.toFixed(0)} → $${s.totalUSDT.toFixed(0)}</span></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;"><div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">ЦЕНА НИВО</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);">${formatP(s.levelPrice)}</div></div><div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">СРЕДНА ЦЕНА</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--yellow);">${formatP(s.avgPrice)}</div></div><div style="background:rgba(255,51,102,0.08);border-radius:6px;padding:5px 6px;text-align:center;border:1px solid rgba(255,51,102,0.15);"><div style="font-size:8px;color:var(--text2);">ЛИКВИДАЦИЯ</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--red);">${formatP(s.liqPrice)}</div></div></div>${!isEntry?`<div style="margin-top:5px;background:rgba(255,204,0,0.06);border:1px solid rgba(255,204,0,0.2);border-radius:6px;padding:5px 8px;display:flex;justify-content:space-between;align-items:center;"><span style="font-size:9px;color:var(--yellow);">📌 LIMIT ОРДЪР</span><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--yellow);font-weight:bold;">${formatP(s.safeOrder)}</span></div>`:''}</div>`;
   });
-  html += `</div><div style="margin:0 14px 14px;background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.2);border-radius:10px;padding:10px 12px;">
-    <div style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--green);letter-spacing:1px;margin-bottom:8px;">→ СТРАТЕГИЯ ЗА ИЗХОД</div>
-    <div style="font-size:12px;color:var(--text);line-height:1.6;">При възстановяване → освобождаваш <span style="color:var(--green);font-weight:bold;">75%</span> от позицията веднага<br>Оставяш <span style="color:var(--accent);font-weight:bold;">25%</span> да продължи при по-висока цел</div>
-  </div>`;
+  html += `</div><div style="margin:0 14px 14px;background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.2);border-radius:10px;padding:10px 12px;"><div style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--green);letter-spacing:1px;margin-bottom:8px;">→ СТРАТЕГИЯ ЗА ИЗХОД</div><div style="font-size:12px;color:var(--text);line-height:1.6;">При възстановяване → освобождаваш <span style="color:var(--green);font-weight:bold;">75%</span> от позицията веднага<br>Оставяш <span style="color:var(--accent);font-weight:bold;">25%</span> да продължи при по-висока цел</div></div>`;
   document.getElementById('dca-result').innerHTML = html;
 }
 </script>
