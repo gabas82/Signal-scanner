@@ -20,6 +20,20 @@
   .live-dot{width:7px;height:7px;background:var(--green);border-radius:50%;animation:pulse 1.5s infinite;}
   @keyframes pulse{0%,100%{opacity:1;transform:scale(1);}50%{opacity:0.4;transform:scale(0.7);}}
   .refresh-btn{background:var(--bg3);border:1px solid var(--border);color:var(--accent);font-family:'Share Tech Mono',monospace;font-size:11px;padding:5px 10px;border-radius:4px;cursor:pointer;letter-spacing:1px;}
+  .btc-macro{margin:10px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden;}
+  .btc-macro-header{padding:8px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;}
+  .btc-macro-title{font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--accent);letter-spacing:2px;}
+  .btc-season-badge{font-family:'Share Tech Mono',monospace;font-size:11px;font-weight:bold;padding:3px 12px;border-radius:12px;letter-spacing:1px;}
+  .season-bull{background:rgba(0,255,136,0.15);color:var(--green);border:1px solid rgba(0,255,136,0.4);}
+  .season-bear{background:rgba(255,51,102,0.15);color:var(--red);border:1px solid rgba(255,51,102,0.4);}
+  .season-neutral{background:rgba(255,204,0,0.15);color:var(--yellow);border:1px solid rgba(255,204,0,0.4);}
+  .season-loading{background:rgba(74,85,104,0.3);color:var(--text2);border:1px solid var(--border);}
+  .btc-macro-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:0;}
+  .btc-macro-item{text-align:center;padding:8px 4px;border-right:1px solid var(--border);}
+  .btc-macro-item:last-child{border-right:none;}
+  .btc-macro-label{font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;}
+  .btc-macro-value{font-family:'Share Tech Mono',monospace;font-size:12px;margin-top:2px;font-weight:bold;}
+  .btc-macro-sub{font-size:8px;color:var(--text2);margin-top:1px;}
   .search-bar{padding:8px 14px;background:var(--bg2);border-bottom:1px solid var(--border);}
   .search-input{width:100%;background:var(--bg3);border:1px solid var(--border);color:#fff;font-family:'Share Tech Mono',monospace;font-size:12px;padding:8px 12px;border-radius:8px;outline:none;letter-spacing:1px;}
   .search-input:focus{border-color:var(--accent);}
@@ -72,6 +86,8 @@
   .tag-oi-down{background:rgba(255,51,102,0.1);color:var(--red);border:1px solid rgba(255,51,102,0.3);}
   .tag-ath{background:rgba(255,204,0,0.1);color:var(--yellow);border:1px solid rgba(255,204,0,0.3);}
   .tag-atl{background:rgba(0,255,136,0.15);color:var(--green);border:1px solid rgba(0,255,136,0.4);font-weight:bold;}
+  .tag-golden{background:rgba(255,204,0,0.15);color:var(--yellow);border:1px solid rgba(255,204,0,0.4);font-weight:bold;}
+  .tag-death{background:rgba(255,51,102,0.15);color:var(--red);border:1px solid rgba(255,51,102,0.4);font-weight:bold;}
   .coin-right{text-align:right;}
   .coin-price{font-family:'Share Tech Mono',monospace;font-size:15px;color:#fff;font-weight:bold;}
   .coin-chg{font-size:13px;font-weight:700;margin-top:2px;}
@@ -82,6 +98,11 @@
   .metric:not(:last-child){border-right:1px solid var(--border);}
   .metric-label{font-size:9px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;}
   .metric-value{font-family:'Share Tech Mono',monospace;font-size:12px;margin-top:2px;font-weight:bold;}
+  .card-metrics2{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:0;padding:6px 12px;border-bottom:1px solid var(--border);background:rgba(0,0,0,0.15);}
+  .metric2{text-align:center;padding:3px 0;}
+  .metric2:not(:last-child){border-right:1px solid var(--border);}
+  .metric2-label{font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;}
+  .metric2-value{font-family:'Share Tech Mono',monospace;font-size:11px;margin-top:1px;font-weight:bold;}
   .ath-bar{display:flex;justify-content:space-between;padding:5px 12px;font-family:'Share Tech Mono',monospace;font-size:10px;border-bottom:1px solid var(--border);background:rgba(0,0,0,0.2);}
   .ls-section{padding:8px 12px;border-bottom:1px solid var(--border);}
   .ls-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;}
@@ -89,13 +110,13 @@
   .ls-values{display:flex;gap:8px;font-family:'Share Tech Mono',monospace;font-size:11px;}
   .ls-bar-wrap{height:5px;background:var(--bg3);border-radius:3px;overflow:hidden;}
   .ls-bar-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--green),var(--red));}
-  .signal-box{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;}
+  .signal-box{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;flex-wrap:wrap;gap:6px;}
   .signal-badge{padding:5px 14px;border-radius:20px;font-family:'Share Tech Mono',monospace;font-size:13px;font-weight:bold;letter-spacing:2px;}
   .badge-long{background:rgba(0,255,136,0.15);color:var(--green);border:1px solid rgba(0,255,136,0.3);}
   .badge-short{background:rgba(255,51,102,0.15);color:var(--red);border:1px solid rgba(255,51,102,0.3);}
   .badge-squeeze{background:rgba(255,204,0,0.15);color:var(--yellow);border:1px solid rgba(255,204,0,0.3);}
   .badge-neutral{background:rgba(74,85,104,0.3);color:var(--text2);border:1px solid var(--border);}
-  .signal-detail{font-size:11px;color:var(--text2);text-align:right;max-width:55%;line-height:1.4;}
+  .signal-detail{font-size:11px;color:var(--text2);text-align:right;line-height:1.4;}
   .score-dots{display:flex;gap:3px;margin-top:4px;justify-content:flex-end;}
   .dot{width:6px;height:6px;border-radius:50%;background:var(--border);}
   .dot.on-long{background:var(--green);}
@@ -103,6 +124,9 @@
   .detector-banner{display:flex;align-items:center;gap:8px;padding:7px 12px;font-family:'Share Tech Mono',monospace;font-size:10px;letter-spacing:1px;border-top:1px solid var(--border);}
   .detector-banner.bottom{background:rgba(0,255,136,0.07);color:var(--green);}
   .detector-banner.top{background:rgba(255,51,102,0.07);color:var(--red);}
+  .tv-btn{background:rgba(68,136,255,0.1);border:1px solid rgba(68,136,255,0.3);color:var(--blue);font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 10px;border-radius:12px;cursor:pointer;letter-spacing:1px;text-decoration:none;display:inline-block;}
+  .dca-btn{background:rgba(0,229,255,0.1);border:1px solid rgba(0,229,255,0.3);color:var(--accent);font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 10px;border-radius:12px;cursor:pointer;letter-spacing:1px;}
+  .dca-btn:active,.tv-btn:active{opacity:0.7;}
   .loading{text-align:center;padding:40px 20px;font-family:'Share Tech Mono',monospace;color:var(--text2);font-size:12px;letter-spacing:2px;}
   .loading-bar{width:120px;height:2px;background:var(--border);margin:12px auto 0;border-radius:2px;overflow:hidden;}
   .loading-fill{height:100%;background:var(--accent);animation:load 1.2s ease infinite;border-radius:2px;}
@@ -110,8 +134,6 @@
   .last-update{text-align:center;padding:12px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2);letter-spacing:1px;border-top:1px solid var(--border);margin-top:6px;}
   .error-msg{background:rgba(255,51,102,0.08);border:1px solid rgba(255,51,102,0.2);border-radius:8px;padding:12px;margin:10px 14px;font-size:12px;color:var(--red);text-align:center;font-family:'Share Tech Mono',monospace;}
   .no-results{text-align:center;padding:30px;color:var(--text2);font-size:13px;font-family:'Share Tech Mono',monospace;letter-spacing:1px;}
-  .dca-btn{background:rgba(0,229,255,0.1);border:1px solid rgba(0,229,255,0.3);color:var(--accent);font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 10px;border-radius:12px;cursor:pointer;letter-spacing:1px;margin-top:6px;}
-  .dca-btn:active{opacity:0.7;}
   .dca-input{background:var(--bg3);border:1px solid var(--border);color:#fff;font-family:'Share Tech Mono',monospace;font-size:14px;padding:10px 12px;border-radius:8px;width:100%;outline:none;}
   .dca-input:focus{border-color:var(--accent);}
   .side-btn{flex:1;padding:10px;border-radius:8px;font-family:'Share Tech Mono',monospace;font-size:13px;font-weight:bold;cursor:pointer;border:1px solid var(--border);background:var(--bg3);color:var(--text2);transition:all 0.2s;letter-spacing:1px;}
@@ -127,6 +149,34 @@
   <div class="header-right">
     <div class="live-dot"></div>
     <button class="refresh-btn" onclick="loadAll()">↻ REFRESH</button>
+  </div>
+</div>
+<div class="btc-macro" id="btc-macro-panel">
+  <div class="btc-macro-header">
+    <div class="btc-macro-title">⬡ BTC MACRO ПАНЕЛ</div>
+    <div class="btc-season-badge season-loading" id="season-badge">⏳ ЗАРЕЖДАНЕ</div>
+  </div>
+  <div class="btc-macro-grid">
+    <div class="btc-macro-item">
+      <div class="btc-macro-label">ATH %</div>
+      <div class="btc-macro-value" id="btc-ath-pct" style="color:var(--text2)">--</div>
+      <div class="btc-macro-sub" id="btc-price-val">--</div>
+    </div>
+    <div class="btc-macro-item">
+      <div class="btc-macro-label">ТРЕНД</div>
+      <div class="btc-macro-value" id="btc-cross" style="color:var(--text2)">--</div>
+      <div class="btc-macro-sub">50/200 DMA</div>
+    </div>
+    <div class="btc-macro-item">
+      <div class="btc-macro-label">MAYER</div>
+      <div class="btc-macro-value" id="btc-mayer" style="color:var(--text2)">--</div>
+      <div class="btc-macro-sub">Цена/200DMA</div>
+    </div>
+    <div class="btc-macro-item">
+      <div class="btc-macro-label">RSI 90D</div>
+      <div class="btc-macro-value" id="btc-rsi90" style="color:var(--text2)">--</div>
+      <div class="btc-macro-sub" id="btc-rsi-sub">--</div>
+    </div>
   </div>
 </div>
 <div class="search-bar">
@@ -153,8 +203,8 @@
 </div>
 <div class="source-bar">
   <span>ИЗТОЧНИЦИ:</span>
-  <span class="src-tag src-gecko">CoinGecko Trending</span>
-  <span class="src-tag src-binance">Binance Top Gainers</span>
+  <span class="src-tag src-gecko">CoinGecko</span>
+  <span class="src-tag src-binance">Binance</span>
   <span class="src-tag src-oi">CoinGlass OI</span>
 </div>
 <div id="scanner-view">
@@ -191,43 +241,31 @@ let searchQuery = '';
 let refreshTimer = null;
 let trendingSymbols = new Set();
 const liqCache = {};
+const athCache = {};
+const klineCache = {};
 
-function handleSearch(val) {
-  searchQuery = val.toUpperCase().trim();
-  renderList();
-}
+function handleSearch(val) { searchQuery = val.toUpperCase().trim(); renderList(); }
 
-async function cgFetch(path) {
-  const r = await fetch(`${WORKER_URL}${path}`);
-  return r.json();
-}
+async function cgFetch(path) { const r = await fetch(`${WORKER_URL}${path}`); return r.json(); }
 
 async function fetchLiqLevels(symbol) {
   try {
     const sym = symbol.replace('USDT','');
     const d = await cgFetch(`/api/futures/liquidation/aggregated-heatmap/model1?symbol=${sym}&range=3d`);
-    if (!d.data) return null;
-    return d.data;
+    if (!d.data) return null; return d.data;
   } catch(e) { return null; }
 }
 
 async function getLiqNearPrice(symbol, price) {
   if (liqCache[symbol] && liqCache[symbol].ts > Date.now() - 300000) return liqCache[symbol].levels;
-  const data = await fetchLiqLevels(symbol);
-  if (!data) return null;
-  const levels = data.y || [];
-  const liqData = data.liq || [];
-  const combined = levels.map((p, i) => ({
-    price: parseFloat(p),
-    amount: Array.isArray(liqData[i]) ? liqData[i].reduce((a,b) => a + parseFloat(b||0), 0) : parseFloat(liqData[i]||0)
-  })).filter(l => l.amount > 0);
+  const data = await fetchLiqLevels(symbol); if (!data) return null;
+  const levels = data.y || []; const liqData = data.liq || [];
+  const combined = levels.map((p, i) => ({ price: parseFloat(p), amount: Array.isArray(liqData[i]) ? liqData[i].reduce((a,b) => a + parseFloat(b||0), 0) : parseFloat(liqData[i]||0) })).filter(l => l.amount > 0);
   combined.sort((a,b) => b.amount - a.amount);
   const top20 = combined.slice(0, 20);
   const above = top20.filter(l => l.price > price).sort((a,b) => a.price - b.price).slice(0,2);
   const below = top20.filter(l => l.price < price).sort((a,b) => b.price - a.price).slice(0,2);
-  const result = {above, below};
-  liqCache[symbol] = {levels: result, ts: Date.now()};
-  return result;
+  const result = {above, below}; liqCache[symbol] = {levels: result, ts: Date.now()}; return result;
 }
 
 const BASE_SYMBOLS = [
@@ -244,33 +282,113 @@ const BASE_SYMBOLS = [
 const SYMBOL_MAP = {'MATIC':'POL','TIAO':'TIA'};
 function fixSymbol(s) { return (SYMBOL_MAP[s] || s) + 'USDT'; }
 
-async function fetchTrending() {
+async function fetchKlines(symbol, interval, limit) {
+  const key = `${symbol}_${interval}_${limit}`;
+  if (klineCache[key] && klineCache[key].ts > Date.now() - 3600000) return klineCache[key].data;
   try {
-    const r = await fetch('https://api.coingecko.com/api/v3/search/trending');
-    const d = await r.json();
-    return d.coins.map(c => c.item.symbol.toUpperCase());
+    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+    const data = await r.json(); klineCache[key] = {data, ts: Date.now()}; return data;
   } catch(e) { return []; }
+}
+
+function calcSMA(closes, period) {
+  if (closes.length < period) return null;
+  return closes.slice(-period).reduce((a,b) => a+b, 0) / period;
+}
+
+function calcRSI(closes, period) {
+  if (closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i-1];
+    if (diff > 0) gains += diff; else losses += Math.abs(diff);
+  }
+  const avgGain = gains / period; const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  return 100 - (100 / (1 + avgGain/avgLoss));
+}
+
+async function loadBTCMacro() {
+  try {
+    const klines = await fetchKlines('BTCUSDT', '1d', 200);
+    if (!klines || klines.length < 100) return;
+    const closes = klines.map(k => parseFloat(k[4]));
+    const currentPrice = closes[closes.length - 1];
+    const dma50 = calcSMA(closes, 50);
+    const dma200 = calcSMA(closes, 200);
+    const mayer = dma200 ? (currentPrice / dma200) : null;
+    const rsi90 = calcRSI(closes, 90);
+    const btcAth = 109588;
+    const athPct = ((currentPrice - btcAth) / btcAth) * 100;
+    const athEl = document.getElementById('btc-ath-pct');
+    athEl.textContent = athPct.toFixed(0) + '%';
+    athEl.style.color = athPct > -20 ? 'var(--red)' : athPct > -50 ? 'var(--yellow)' : 'var(--green)';
+    document.getElementById('btc-price-val').textContent = '$' + formatPrice(currentPrice);
+    const crossEl = document.getElementById('btc-cross');
+    if (dma50 && dma200) {
+      crossEl.textContent = dma50 > dma200 ? '🟡 GOLDEN' : '💀 DEATH';
+      crossEl.style.color = dma50 > dma200 ? 'var(--yellow)' : 'var(--red)';
+    }
+    const mayerEl = document.getElementById('btc-mayer');
+    if (mayer) {
+      mayerEl.textContent = mayer.toFixed(2);
+      mayerEl.style.color = mayer > 2.4 ? 'var(--red)' : mayer < 1 ? 'var(--green)' : 'var(--yellow)';
+    }
+    const rsiEl = document.getElementById('btc-rsi90');
+    if (rsi90) {
+      rsiEl.textContent = rsi90.toFixed(0);
+      rsiEl.style.color = rsi90 > 70 ? 'var(--red)' : rsi90 < 35 ? 'var(--green)' : 'var(--yellow)';
+      document.getElementById('btc-rsi-sub').textContent = rsi90 > 70 ? 'ПРЕГРЯЛО' : rsi90 < 35 ? 'OVERSOLD' : 'НЕУТРАЛЕН';
+    }
+    updateSeasonBadge(dma50, dma200, mayer, rsi90, athPct);
+  } catch(e) { console.error('BTC Macro error:', e); }
+}
+
+function updateSeasonBadge(dma50, dma200, mayer, rsi90, athPct) {
+  let bullScore = 0, bearScore = 0;
+  if (dma50 && dma200) { if (dma50 > dma200) bullScore += 2; else bearScore += 2; }
+  if (mayer) { if (mayer < 1) bullScore += 2; else if (mayer > 2.4) bearScore += 2; else if (mayer < 1.5) bullScore++; }
+  if (rsi90) { if (rsi90 < 40) bullScore += 2; else if (rsi90 > 70) bearScore += 2; }
+  if (athPct < -60) bullScore += 2; else if (athPct > -15) bearScore++;
+  const greenCoins = allCoins.filter(c => { const sig = calcSignal(c); return sig.signal === 'LONG' && c.funding < 0.03 && c.oiDelta > 0; }).length;
+  const badge = document.getElementById('season-badge');
+  if (bullScore >= 5 && greenCoins >= 3) { badge.textContent = '🚀 БУЛ СЕЗОН'; badge.className = 'btc-season-badge season-bull'; }
+  else if (bearScore >= 5) { badge.textContent = '🐻 МЕЧИ ПАЗАР'; badge.className = 'btc-season-badge season-bear'; }
+  else { badge.textContent = '⚡ НЕУТРАЛЕН'; badge.className = 'btc-season-badge season-neutral'; }
+}
+
+async function fetchCoinKlineData(symbol) {
+  try {
+    const klines = await fetchKlines(symbol, '1d', 200);
+    if (!klines || klines.length < 55) return null;
+    const closes = klines.map(k => parseFloat(k[4]));
+    const dma50 = calcSMA(closes, 50);
+    const dma200 = calcSMA(closes, closes.length >= 200 ? 200 : closes.length);
+    const klines1h = await fetchKlines(symbol, '1h', 8);
+    let vol1h = 0, vol4h = 0;
+    if (klines1h && klines1h.length >= 4) {
+      vol1h = parseFloat(klines1h[klines1h.length-1][7]);
+      vol4h = klines1h.slice(-4).reduce((s, k) => s + parseFloat(k[7]), 0) / 4;
+    }
+    return { dma50, dma200, goldenCross: dma50 && dma200 ? dma50 > dma200 : null, vol1h, vol4h };
+  } catch(e) { return null; }
+}
+
+async function fetchTrending() {
+  try { const r = await fetch('https://api.coingecko.com/api/v3/search/trending'); const d = await r.json(); return d.coins.map(c => c.item.symbol.toUpperCase()); } catch(e) { return []; }
 }
 
 async function fetchTopGainers() {
   try {
-    const r = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
-    const data = await r.json();
-    return data
-      .filter(t => t.symbol.endsWith('USDT') && parseFloat(t.priceChangePercent) > 5 && parseFloat(t.quoteVolume) > 5000000)
-      .sort((a,b) => parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent))
-      .slice(0,15).map(t => t.symbol);
+    const r = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr'); const data = await r.json();
+    return data.filter(t => t.symbol.endsWith('USDT') && parseFloat(t.priceChangePercent) > 5 && parseFloat(t.quoteVolume) > 5000000).sort((a,b) => parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent)).slice(0,15).map(t => t.symbol);
   } catch(e) { return []; }
 }
 
 async function fetchTopOI() {
   try {
-    const r = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
-    const data = await r.json();
-    return data
-      .filter(t => t.symbol.endsWith('USDT') && parseFloat(t.quoteVolume) > 100000000)
-      .sort((a,b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
-      .slice(0,10).map(t => t.symbol);
+    const r = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr'); const data = await r.json();
+    return data.filter(t => t.symbol.endsWith('USDT') && parseFloat(t.quoteVolume) > 100000000).sort((a,b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume)).slice(0,10).map(t => t.symbol);
   } catch(e) { return []; }
 }
 
@@ -279,47 +397,34 @@ async function fetchOIDelta(symbol) {
     const r = await fetch(`https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=15m&limit=2`);
     const data = await r.json();
     if (!Array.isArray(data) || data.length < 2) return 0;
-    const prev = parseFloat(data[0].sumOpenInterestValue);
-    const curr = parseFloat(data[1].sumOpenInterestValue);
-    if (prev === 0) return 0;
-    return ((curr - prev) / prev) * 100;
+    const prev = parseFloat(data[0].sumOpenInterestValue); const curr = parseFloat(data[1].sumOpenInterestValue);
+    if (prev === 0) return 0; return ((curr - prev) / prev) * 100;
   } catch(e) { return 0; }
 }
 
 const geckoIdMap = {
-  'BTCUSDT':'bitcoin','ETHUSDT':'ethereum','SOLUSDT':'solana',
-  'BNBUSDT':'binancecoin','XRPUSDT':'ripple','DOGEUSDT':'dogecoin',
-  'ADAUSDT':'cardano','AVAXUSDT':'avalanche-2','LINKUSDT':'chainlink',
-  'DOTUSDT':'polkadot','NEARUSDT':'near','LTCUSDT':'litecoin',
-  'UNIUSDT':'uniswap','AAVEUSDT':'aave','INJUSDT':'injective-protocol',
-  'SUIUSDT':'sui','APTUSDT':'aptos','ARBUSDT':'arbitrum',
-  'WLDUSDT':'worldcoin-wld','ENAUSDT':'ethena','FETUSDT':'fetch-ai',
-  'RENDERUSDT':'render-token','ATOMUSDT':'cosmos','TIAUSDT':'celestia',
-  'HYPEUSDT':'hyperliquid','ETCUSDT':'ethereum-classic',
-  'ONDOUSDT':'ondo-finance','VVVUSDT':'venice-token',
-  'TONUSDT':'the-open-network','TWTUSDT':'trust-wallet-token',
-  'AIXBTUSDT':'aixbt-by-virtuals','MNTUSDT':'mantle',
-  'RIVERUSDT':'river-protocol'
+  'BTCUSDT':'bitcoin','ETHUSDT':'ethereum','SOLUSDT':'solana','BNBUSDT':'binancecoin','XRPUSDT':'ripple',
+  'DOGEUSDT':'dogecoin','ADAUSDT':'cardano','AVAXUSDT':'avalanche-2','LINKUSDT':'chainlink','DOTUSDT':'polkadot',
+  'NEARUSDT':'near','LTCUSDT':'litecoin','UNIUSDT':'uniswap','AAVEUSDT':'aave','INJUSDT':'injective-protocol',
+  'SUIUSDT':'sui','APTUSDT':'aptos','ARBUSDT':'arbitrum','WLDUSDT':'worldcoin-wld','ENAUSDT':'ethena',
+  'FETUSDT':'fetch-ai','RENDERUSDT':'render-token','ATOMUSDT':'cosmos','TIAUSDT':'celestia','HYPEUSDT':'hyperliquid',
+  'ETCUSDT':'ethereum-classic','ONDOUSDT':'ondo-finance','VVVUSDT':'venice-token','TONUSDT':'the-open-network',
+  'TWTUSDT':'trust-wallet-token','AIXBTUSDT':'aixbt-by-virtuals','MNTUSDT':'mantle','RIVERUSDT':'river-protocol'
 };
-
-const athCache = {};
 
 async function fetchCoinGeckoExtras(symbol) {
   if (athCache[symbol] && athCache[symbol].ts > Date.now() - 3600000) return athCache[symbol].data;
   try {
-    const coinId = geckoIdMap[symbol];
-    if (!coinId) return null;
+    const coinId = geckoIdMap[symbol]; if (!coinId) return null;
     const r = await fetch(`https://api.coingecko.com/api/v3/coins/${coinId}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false`);
-    const d = await r.json();
-    if (!d.market_data) return null;
+    const d = await r.json(); if (!d.market_data) return null;
     const price = d.market_data.current_price?.usd || 0;
-    const ath = d.market_data.ath?.usd || 0;
-    const atl = d.market_data.atl?.usd || 0;
+    const ath = d.market_data.ath?.usd || 0; const atl = d.market_data.atl?.usd || 0;
+    const marketCap = d.market_data.market_cap?.usd || 0;
     const pctFromAth = ath > 0 ? ((price - ath) / ath) * 100 : null;
     const pctFromAtl = atl > 0 ? ((price - atl) / atl) * 100 : null;
-    const result = { pctFromAth, pctFromAtl, ath, atl };
-    athCache[symbol] = { data: result, ts: Date.now() };
-    return result;
+    const result = { pctFromAth, pctFromAtl, ath, atl, marketCap };
+    athCache[symbol] = { data: result, ts: Date.now() }; return result;
   } catch(e) { return null; }
 }
 
@@ -333,9 +438,7 @@ async function fetchCoinData(symbol) {
       fetchOIDelta(symbol)
     ]);
     if (t24.code) return null;
-    const price = parseFloat(t24.lastPrice);
-    const chg24 = parseFloat(t24.priceChangePercent);
-    const vol24 = parseFloat(t24.quoteVolume);
+    const price = parseFloat(t24.lastPrice); const chg24 = parseFloat(t24.priceChangePercent); const vol24 = parseFloat(t24.quoteVolume);
     const avgExpectedVol = Math.abs(parseFloat(t24.priceChange)) > 0 ? (vol24/24)*8 : vol24/3;
     const volSpike = vol24 > 0 && (vol24/(avgExpectedVol||1)) > 1.5;
     const funding = fundR[0] ? parseFloat(fundR[0].fundingRate)*100 : 0;
@@ -343,15 +446,7 @@ async function fetchCoinData(symbol) {
     const shortPct = 100 - longPct;
     const oi = oiR.openInterest ? parseFloat(oiR.openInterest)*price : 0;
     const sym = symbol.replace('USDT','');
-    return {
-      symbol:sym, fullSymbol:symbol,
-      price, chg24, vol24, funding,
-      longPct, shortPct, oi,
-      oiDelta, volSpike,
-      isTrending: trendingSymbols.has(sym),
-      pctFromAth: null, pctFromAtl: null, ath: null, atl: null,
-      valid: true
-    };
+    return { symbol:sym, fullSymbol:symbol, price, chg24, vol24, funding, longPct, shortPct, oi, oiDelta, volSpike, isTrending: trendingSymbols.has(sym), pctFromAth:null, pctFromAtl:null, ath:null, atl:null, marketCap:null, goldenCross:null, vol1h:null, vol4h:null, valid:true };
   } catch(e) { return null; }
 }
 
@@ -361,113 +456,95 @@ async function loadAthAtlAsync() {
     const extras = await fetchCoinGeckoExtras(symbol);
     if (extras) {
       const coin = allCoins.find(c => c.fullSymbol === symbol);
-      if (coin) {
-        coin.pctFromAth = extras.pctFromAth;
-        coin.pctFromAtl = extras.pctFromAtl;
-        coin.ath = extras.ath;
-        coin.atl = extras.atl;
-        updateCardAth(symbol, extras);
-      }
+      if (coin) { coin.pctFromAth=extras.pctFromAth; coin.pctFromAtl=extras.pctFromAtl; coin.ath=extras.ath; coin.atl=extras.atl; coin.marketCap=extras.marketCap; updateCardExtras(symbol, extras); }
     }
-    await new Promise(res => setTimeout(res, 1200));
+    await new Promise(res => setTimeout(res, 2500));
+  }
+  loadBTCMacro();
+}
+
+async function loadKlinesAsync() {
+  for (const coin of allCoins) {
+    const kdata = await fetchCoinKlineData(coin.fullSymbol);
+    if (kdata) { coin.goldenCross=kdata.goldenCross; coin.vol1h=kdata.vol1h; coin.vol4h=kdata.vol4h; updateCardKlines(coin.fullSymbol, kdata); }
+    await new Promise(res => setTimeout(res, 200));
   }
 }
 
-function updateCardAth(fullSymbol, extras) {
+function updateCardExtras(fullSymbol, extras) {
   const sym = fullSymbol.replace('USDT','');
-  const cards = document.querySelectorAll('.coin-card');
-  for (const card of cards) {
+  document.querySelectorAll('.coin-card').forEach(card => {
     const nameEl = card.querySelector('.coin-name');
     if (nameEl && nameEl.textContent.trim() === sym) {
       const athBar = card.querySelector('.ath-bar');
       if (athBar && extras.pctFromAth !== null) {
         const athColor = extras.pctFromAth > -15 ? 'var(--red)' : extras.pctFromAth > -50 ? 'var(--yellow)' : 'var(--green)';
         const atlColor = extras.pctFromAtl !== null && extras.pctFromAtl < 100 ? 'var(--green)' : 'var(--text2)';
-        athBar.innerHTML = `
-          <span style="color:var(--text2)">ATH: <span style="color:${athColor}">${extras.pctFromAth.toFixed(0)}%</span></span>
-          <span style="color:var(--text2)">$${formatPrice(extras.ath)}</span>
-          <span style="color:var(--text2)">ATL: <span style="color:${atlColor}">+${extras.pctFromAtl ? extras.pctFromAtl.toFixed(0) : '?'}%</span></span>`;
-        const coin = allCoins.find(c => c.fullSymbol === fullSymbol);
-        if (coin) {
-          const tagsEl = card.querySelector('.coin-tags');
-          if (tagsEl) {
-            if (extras.pctFromAtl !== null && extras.pctFromAtl < 100 && !tagsEl.querySelector('.tag-atl')) {
-              const atlTag = document.createElement('span');
-              atlTag.className = 'tag tag-atl';
-              atlTag.textContent = '🟢 БЛИЗО ATL';
-              tagsEl.insertBefore(atlTag, tagsEl.firstChild);
-            }
-            if (extras.pctFromAth !== null && extras.pctFromAth > -15 && !tagsEl.querySelector('.tag-ath')) {
-              const athTag = document.createElement('span');
-              athTag.className = 'tag tag-ath';
-              athTag.textContent = '🔴 БЛИЗО ATH';
-              tagsEl.insertBefore(athTag, tagsEl.firstChild);
-            }
-          }
+        const mcap = extras.marketCap > 0 ? formatNum(extras.marketCap) : '--';
+        athBar.innerHTML = `<span style="color:var(--text2)">ATH: <span style="color:${athColor}">${extras.pctFromAth.toFixed(0)}%</span></span><span style="color:var(--text2)">MCap: <span style="color:var(--text)">$${mcap}</span></span><span style="color:var(--text2)">ATL: <span style="color:${atlColor}">+${extras.pctFromAtl?extras.pctFromAtl.toFixed(0):'?'}%</span></span>`;
+        const tagsEl = card.querySelector('.coin-tags');
+        if (tagsEl) {
+          if (extras.pctFromAtl !== null && extras.pctFromAtl < 100 && !tagsEl.querySelector('.tag-atl')) { const t=document.createElement('span'); t.className='tag tag-atl'; t.textContent='🟢 БЛИЗО ATL'; tagsEl.insertBefore(t,tagsEl.firstChild); }
+          if (extras.pctFromAth !== null && extras.pctFromAth > -15 && !tagsEl.querySelector('.tag-ath')) { const t=document.createElement('span'); t.className='tag tag-ath'; t.textContent='🔴 БЛИЗО ATH'; tagsEl.insertBefore(t,tagsEl.firstChild); }
         }
       }
-      break;
     }
-  }
+  });
   updateStats();
 }
 
+function updateCardKlines(fullSymbol, kdata) {
+  const sym = fullSymbol.replace('USDT','');
+  document.querySelectorAll('.coin-card').forEach(card => {
+    const nameEl = card.querySelector('.coin-name');
+    if (nameEl && nameEl.textContent.trim() === sym) {
+      if (kdata.goldenCross !== null) {
+        const tagsEl = card.querySelector('.coin-tags');
+        if (tagsEl && !tagsEl.querySelector('.tag-golden') && !tagsEl.querySelector('.tag-death')) {
+          const t = document.createElement('span');
+          if (kdata.goldenCross) { t.className='tag tag-golden'; t.textContent='🟡 GOLDEN X'; } else { t.className='tag tag-death'; t.textContent='💀 DEATH X'; }
+          tagsEl.appendChild(t);
+        }
+      }
+      const v1 = card.querySelector('.vol1h-val'); const v4 = card.querySelector('.vol4h-val');
+      if (v1 && kdata.vol1h) v1.textContent = '$'+formatNum(kdata.vol1h);
+      if (v4 && kdata.vol4h) v4.textContent = '$'+formatNum(kdata.vol4h);
+    }
+  });
+}
+
 function detectBottom(coin) {
-  const fundingNeutral = Math.abs(coin.funding) < 0.03;
-  const oiRising = coin.oiDelta > 1;
-  const oversold = coin.chg24 < -5;
-  const longsDominated = coin.longPct < 45;
-  const nearAtl = coin.pctFromAtl !== null && coin.pctFromAtl < 100;
   let score = 0;
-  if (fundingNeutral) score++;
-  if (oiRising) score++;
-  if (oversold) score++;
-  if (longsDominated) score++;
-  if (nearAtl) score += 2;
+  if (Math.abs(coin.funding) < 0.03) score++;
+  if (coin.oiDelta > 1) score++;
+  if (coin.chg24 < -5) score++;
+  if (coin.longPct < 45) score++;
+  if (coin.pctFromAtl !== null && coin.pctFromAtl < 100) score += 2;
   return score >= 3;
 }
 
 function detectTop(coin) {
-  const fundingHigh = coin.funding > 0.08;
-  const oiFalling = coin.oiDelta < -1;
-  const overbought = coin.chg24 > 10;
-  const longsDominated = coin.longPct > 70;
-  const nearAth = coin.pctFromAth !== null && coin.pctFromAth > -15;
   let score = 0;
-  if (fundingHigh) score += 2;
-  if (oiFalling) score++;
-  if (overbought) score++;
-  if (longsDominated) score += 2;
-  if (nearAth) score += 2;
+  if (coin.funding > 0.08) score += 2;
+  if (coin.oiDelta < -1) score++;
+  if (coin.chg24 > 10) score++;
+  if (coin.longPct > 70) score += 2;
+  if (coin.pctFromAth !== null && coin.pctFromAth > -15) score += 2;
   return score >= 4;
 }
 
 function calcSignal(coin) {
-  let ls = 0; let ss = 0;
-  if (coin.chg24 >= 10) ls += 3;
-  else if (coin.chg24 >= 5) ls += 2;
-  else if (coin.chg24 >= 2) ls += 1;
-  else if (coin.chg24 <= -10) ss += 3;
-  else if (coin.chg24 <= -5) ss += 2;
-  else if (coin.chg24 <= -2) ss += 1;
-  if (coin.longPct >= 65) ls += 2;
-  else if (coin.longPct >= 58) ls += 1;
-  else if (coin.shortPct >= 55) ss += 1;
-  else if (coin.shortPct >= 65) ss += 2;
-  if (coin.funding < -0.01) ls += 1;
-  else if (coin.funding > 0.08) ss += 2;
-  else if (coin.funding > 0.05) ss += 1;
-  else if (coin.funding > 0.03) ss += 1;
-  if (coin.vol24 > 1000000000) ls += 1;
-  else if (coin.vol24 > 500000000) ls += 1;
-  if (coin.isTrending && coin.chg24 > 0) ls += 1;
-  if (coin.isTrending && coin.chg24 < 0) ss += 1;
-  const lsDiff = Math.abs(coin.longPct - 50);
-  if (coin.funding > 0.06 && lsDiff < 15) return {signal:'SQUEEZE',ls,ss};
-  if (ls >= 3) return {signal:'LONG',ls,ss};
-  if (ss >= 3) return {signal:'SHORT',ls,ss};
-  if (ls >= 2 && ls > ss) return {signal:'LONG',ls,ss};
-  if (ss >= 2 && ss > ls) return {signal:'SHORT',ls,ss};
+  let ls = 0, ss = 0;
+  if (coin.chg24 >= 10) ls += 3; else if (coin.chg24 >= 5) ls += 2; else if (coin.chg24 >= 2) ls += 1;
+  else if (coin.chg24 <= -10) ss += 3; else if (coin.chg24 <= -5) ss += 2; else if (coin.chg24 <= -2) ss += 1;
+  if (coin.longPct >= 65) ls += 2; else if (coin.longPct >= 58) ls += 1;
+  else if (coin.shortPct >= 55) ss += 1; else if (coin.shortPct >= 65) ss += 2;
+  if (coin.funding < -0.01) ls += 1; else if (coin.funding > 0.08) ss += 2; else if (coin.funding > 0.05) ss += 1; else if (coin.funding > 0.03) ss += 1;
+  if (coin.vol24 > 1000000000) ls += 1; else if (coin.vol24 > 500000000) ls += 1;
+  if (coin.isTrending && coin.chg24 > 0) ls += 1; if (coin.isTrending && coin.chg24 < 0) ss += 1;
+  if (coin.funding > 0.06 && Math.abs(coin.longPct - 50) < 15) return {signal:'SQUEEZE',ls,ss};
+  if (ls >= 3) return {signal:'LONG',ls,ss}; if (ss >= 3) return {signal:'SHORT',ls,ss};
+  if (ls >= 2 && ls > ss) return {signal:'LONG',ls,ss}; if (ss >= 2 && ss > ls) return {signal:'SHORT',ls,ss};
   return {signal:'NEUTRAL',ls,ss};
 }
 
@@ -475,45 +552,39 @@ function isManipulable(coin) { return coin.vol24 < 30000000 || coin.oi < 3000000
 
 function formatNum(n) {
   if (!n && n!==0) return '--';
-  if (n>=1e9) return (n/1e9).toFixed(2)+'B';
-  if (n>=1e6) return (n/1e6).toFixed(1)+'M';
-  if (n>=1e3) return (n/1e3).toFixed(1)+'K';
-  return n.toFixed(2);
+  if (n>=1e9) return (n/1e9).toFixed(2)+'B'; if (n>=1e6) return (n/1e6).toFixed(1)+'M';
+  if (n>=1e3) return (n/1e3).toFixed(1)+'K'; return n.toFixed(2);
 }
 
 function formatPrice(p) {
   if (!p) return '--';
-  if (p>=10000) return p.toLocaleString('en',{maximumFractionDigits:0});
-  if (p>=1000) return p.toLocaleString('en',{maximumFractionDigits:1});
-  if (p>=1) return p.toFixed(4);
-  return p.toFixed(6);
+  if (p>=10000) return p.toLocaleString('en',{maximumFractionDigits:0}); if (p>=1000) return p.toLocaleString('en',{maximumFractionDigits:1});
+  if (p>=1) return p.toFixed(4); return p.toFixed(6);
 }
 
 function formatOIDelta(delta) {
   if (!delta) return '<span style="color:var(--text2)">--</span>';
-  const color = delta > 0 ? 'var(--green)' : 'var(--red)';
-  const arrow = delta > 0 ? '▲' : '▼';
-  return `<span style="color:${color}">${arrow}${Math.abs(delta).toFixed(2)}%</span>`;
+  return `<span style="color:${delta>0?'var(--green)':'var(--red)'}">${delta>0?'▲':'▼'}${Math.abs(delta).toFixed(2)}%</span>`;
 }
 
+function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=BINANCE:${symbol}.P`; }
+
 function renderCard(coin, idx) {
-  const sig = calcSignal(coin);
-  const manip = isManipulable(coin);
-  const isBottom = detectBottom(coin);
-  const isTop = detectTop(coin);
-  const sc = sig.signal.toLowerCase();
-  const delay = idx * 0.05;
+  const sig = calcSignal(coin); const manip = isManipulable(coin);
+  const isBottom = detectBottom(coin); const isTop = detectTop(coin);
+  const sc = sig.signal.toLowerCase(); const delay = idx * 0.05;
   const fColor = coin.funding > 0.05 ? 'var(--red)' : coin.funding < -0.01 ? 'var(--green)' : 'var(--text2)';
   const fSign = coin.funding > 0 ? '+' : '';
-  const maxDots = 5;
-  const activeDots = Math.min(Math.max(sig.ls, sig.ss), maxDots);
+  const activeDots = Math.min(Math.max(sig.ls, sig.ss), 5);
   const dotClass = sig.ls >= sig.ss ? 'on-long' : 'on-short';
-  const dotsHtml = Array.from({length:maxDots},(_,i)=>`<div class="dot ${i<activeDots?dotClass:''}"></div>`).join('');
+  const dotsHtml = Array.from({length:5},(_,i)=>`<div class="dot ${i<activeDots?dotClass:''}"></div>`).join('');
   const tags = [];
   if (isBottom) tags.push(`<span class="tag tag-bottom">🟢 ДЪНО</span>`);
   if (isTop) tags.push(`<span class="tag tag-top">🔴 ВРЪХ</span>`);
   if (coin.pctFromAtl !== null && coin.pctFromAtl < 100) tags.push(`<span class="tag tag-atl">🟢 БЛИЗО ATL</span>`);
   if (coin.pctFromAth !== null && coin.pctFromAth > -15) tags.push(`<span class="tag tag-ath">🔴 БЛИЗО ATH</span>`);
+  if (coin.goldenCross === true) tags.push(`<span class="tag tag-golden">🟡 GOLDEN X</span>`);
+  if (coin.goldenCross === false) tags.push(`<span class="tag tag-death">💀 DEATH X</span>`);
   if (coin.isTrending) tags.push(`<span class="tag tag-trending">🔥 TRENDING</span>`);
   if (coin.chg24 > 5) tags.push(`<span class="tag tag-gainer">▲ GAINER</span>`);
   if (coin.oi > 500000000) tags.push(`<span class="tag tag-oi">HIGH OI</span>`);
@@ -521,18 +592,11 @@ function renderCard(coin, idx) {
   if (manip) tags.push(`<span class="tag tag-manip">⚠ МАНИП</span>`);
   if (coin.oiDelta > 2) tags.push(`<span class="tag tag-oi-up">OI↑ ${coin.oiDelta.toFixed(1)}%</span>`);
   if (coin.oiDelta < -2) tags.push(`<span class="tag tag-oi-down">OI↓ ${Math.abs(coin.oiDelta).toFixed(1)}%</span>`);
-  const detectorBanner = isBottom
-    ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>`
-    : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding.toFixed(3)}% · L/S>${coin.longPct.toFixed(0)}% · OI↓</div>` : '';
+  const detectorBanner = isBottom ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>` : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding.toFixed(3)}% · L/S>${coin.longPct.toFixed(0)}% · OI↓</div>` : '';
   const detectorClass = isBottom ? ' detector-bottom' : isTop ? ' detector-top' : '';
-  let athBarHtml = '';
-  if (coin.pctFromAth !== null) {
-    const athColor = coin.pctFromAth > -15 ? 'var(--red)' : coin.pctFromAth > -50 ? 'var(--yellow)' : 'var(--green)';
-    const atlColor = coin.pctFromAtl !== null && coin.pctFromAtl < 100 ? 'var(--green)' : 'var(--text2)';
-    athBarHtml = `<div class="ath-bar"><span style="color:var(--text2)">ATH: <span style="color:${athColor}">${coin.pctFromAth.toFixed(0)}%</span></span><span style="color:var(--text2)">$${formatPrice(coin.ath)}</span><span style="color:var(--text2)">ATL: <span style="color:${atlColor}">+${coin.pctFromAtl?coin.pctFromAtl.toFixed(0):'?'}%</span></span></div>`;
-  } else {
-    athBarHtml = `<div class="ath-bar"><span style="color:var(--text2);font-size:9px;">ATH/ATL: зареждане...</span></div>`;
-  }
+  let athBarHtml = coin.pctFromAth !== null
+    ? `<div class="ath-bar"><span style="color:var(--text2)">ATH: <span style="color:${coin.pctFromAth>-15?'var(--red)':coin.pctFromAth>-50?'var(--yellow)':'var(--green)'}">${coin.pctFromAth.toFixed(0)}%</span></span><span style="color:var(--text2)">MCap: <span style="color:var(--text)">$${coin.marketCap>0?formatNum(coin.marketCap):'--'}</span></span><span style="color:var(--text2)">ATL: <span style="color:${coin.pctFromAtl&&coin.pctFromAtl<100?'var(--green)':'var(--text2)'}">+${coin.pctFromAtl?coin.pctFromAtl.toFixed(0):'?'}%</span></span></div>`
+    : `<div class="ath-bar"><span style="color:var(--text2);font-size:9px;">ATH/ATL/MCap: зареждане...</span></div>`;
   return `
   <div class="coin-card signal-${sc}${detectorClass}" style="animation-delay:${delay}s">
     <div class="card-top">
@@ -551,6 +615,12 @@ function renderCard(coin, idx) {
       <div class="metric"><div class="metric-label">OI Δ 15M</div><div class="metric-value">${formatOIDelta(coin.oiDelta)}</div></div>
       <div class="metric"><div class="metric-label">VOL 24H</div><div class="metric-value" style="color:${coin.volSpike?'var(--purple)':'var(--text)'}">$${formatNum(coin.vol24)}</div></div>
       <div class="metric"><div class="metric-label">FUNDING</div><div class="metric-value" style="color:${fColor}">${fSign}${coin.funding.toFixed(4)}%</div></div>
+    </div>
+    <div class="card-metrics2">
+      <div class="metric2"><div class="metric2-label">VOL 1H</div><div class="metric2-value vol1h-val" style="color:var(--text2)">${coin.vol1h?'$'+formatNum(coin.vol1h):'...'}</div></div>
+      <div class="metric2"><div class="metric2-label">VOL 4H AVG</div><div class="metric2-value vol4h-val" style="color:var(--text2)">${coin.vol4h?'$'+formatNum(coin.vol4h):'...'}</div></div>
+      <div class="metric2"><div class="metric2-label">50 DMA</div><div class="metric2-value">${coin.goldenCross!==null?(coin.goldenCross?'<span style="color:var(--yellow)">▲ BULL</span>':'<span style="color:var(--red)">▼ BEAR</span>'):'...'}</div></div>
+      <div class="metric2"><div class="metric2-label">TV CHART</div><div class="metric2-value"><a href="${getTVLink(coin.fullSymbol)}" target="_blank" class="tv-btn">📈 TV</a></div></div>
     </div>
     <div class="ls-section">
       <div class="ls-row">
@@ -577,10 +647,8 @@ function setFilter(filter, el) {
   document.getElementById('dca-view').style.display = 'none';
   document.querySelectorAll('.tab').forEach(t => t.className='tab');
   el.className = `tab active-${filter}`;
-  document.getElementById('search-input').value = '';
-  searchQuery = '';
-  renderList();
-  loadLiqLevels();
+  document.getElementById('search-input').value = ''; searchQuery = '';
+  renderList(); loadLiqLevels();
 }
 
 function openDCAView() {
@@ -593,18 +661,16 @@ function openDCAView() {
 async function loadLiqLevels() {
   const visible = document.querySelectorAll('.coin-card');
   for (const card of visible) {
-    const liqEl = card.querySelector('[id^="liq-"]');
-    if (!liqEl) continue;
+    const liqEl = card.querySelector('[id^="liq-"]'); if (!liqEl) continue;
     const sym = liqEl.id.replace('liq-','');
-    const priceEl = card.querySelector('.coin-price');
-    if (!priceEl) continue;
+    const priceEl = card.querySelector('.coin-price'); if (!priceEl) continue;
     const price = parseFloat(priceEl.textContent.replace('$','').replace(',',''));
     try {
       const levels = await getLiqNearPrice(sym, price);
       if (!levels) { liqEl.innerHTML = `<span style="color:var(--text2);font-size:10px;">🔴 ЛИК: няма данни</span>`; continue; }
       const aboveHtml = levels.above.length > 0 ? levels.above.map(l=>`<span style="color:var(--red)">▲$${formatPrice(l.price)}</span>`).join(' ') : '<span style="color:var(--text2)">--</span>';
       const belowHtml = levels.below.length > 0 ? levels.below.map(l=>`<span style="color:var(--green)">▼$${formatPrice(l.price)}</span>`).join(' ') : '<span style="color:var(--text2)">--</span>';
-      liqEl.innerHTML = `<div style="width:100%;display:flex;justify-content:space-between;align-items:center;"><div><span style="color:var(--text2);font-size:9px;">ЛИК↑ </span>${aboveHtml}</div><div><span style="color:var(--text2);font-size:9px;">ЛИК↓ </span>${belowHtml}</div></div>`;
+      liqEl.innerHTML = `<div style="width:100%;display:flex;justify-content:space-between;"><div><span style="color:var(--text2);font-size:9px;">ЛИК↑ </span>${aboveHtml}</div><div><span style="color:var(--text2);font-size:9px;">ЛИК↓ </span>${belowHtml}</div></div>`;
     } catch(e) { liqEl.innerHTML = `<span style="color:var(--text2);font-size:10px;">--</span>`; }
   }
 }
@@ -612,37 +678,28 @@ async function loadLiqLevels() {
 function renderList() {
   const content = document.getElementById('main-content');
   let filtered = allCoins;
-  if (searchQuery.length > 0) {
-    filtered = allCoins.filter(c => c.symbol.includes(searchQuery));
-  } else {
+  if (searchQuery.length > 0) { filtered = allCoins.filter(c => c.symbol.includes(searchQuery)); }
+  else {
     if (currentFilter === 'trending') filtered = allCoins.filter(c => c.isTrending);
     else if (currentFilter === 'bottom') filtered = allCoins.filter(c => detectBottom(c));
     else if (currentFilter === 'top') filtered = allCoins.filter(c => detectTop(c));
     else if (currentFilter !== 'all') filtered = allCoins.filter(c => calcSignal(c).signal.toLowerCase() === currentFilter);
   }
   filtered.sort((a,b) => {
-    const aD = detectBottom(a)||detectTop(a), bD = detectBottom(b)||detectTop(b);
-    if (aD && !bD) return -1; if (bD && !aD) return 1;
-    const sa = calcSignal(a), sb = calcSignal(b);
-    if (sa.signal==='SQUEEZE' && sb.signal!=='SQUEEZE') return -1;
-    if (sb.signal==='SQUEEZE' && sa.signal!=='SQUEEZE') return 1;
-    const scoreA = Math.max(sa.ls,sa.ss), scoreB = Math.max(sb.ls,sb.ss);
-    if (scoreB !== scoreA) return scoreB - scoreA;
-    return Math.abs(b.chg24) - Math.abs(a.chg24);
+    const aD=detectBottom(a)||detectTop(a), bD=detectBottom(b)||detectTop(b);
+    if (aD&&!bD) return -1; if (bD&&!aD) return 1;
+    const sa=calcSignal(a), sb=calcSignal(b);
+    if (sa.signal==='SQUEEZE'&&sb.signal!=='SQUEEZE') return -1; if (sb.signal==='SQUEEZE'&&sa.signal!=='SQUEEZE') return 1;
+    const sA=Math.max(sa.ls,sa.ss), sB=Math.max(sb.ls,sb.ss);
+    if (sB!==sA) return sB-sA; return Math.abs(b.chg24)-Math.abs(a.chg24);
   });
   if (filtered.length===0) { content.innerHTML = `<div class="no-results">НЯМА МОНЕТИ С ТОЗИ КРИТЕРИЙ</div>`; return; }
   content.innerHTML = `<div class="coins-list">${filtered.map((c,i)=>renderCard(c,i)).join('')}</div>`;
 }
 
 function updateStats() {
-  const counts = {long:0,short:0,squeeze:0,neutral:0};
-  let bottomCount=0, topCount=0;
-  allCoins.forEach(c => {
-    const s = calcSignal(c).signal.toLowerCase();
-    counts[s] = (counts[s]||0)+1;
-    if (detectBottom(c)) bottomCount++;
-    if (detectTop(c)) topCount++;
-  });
+  const counts = {long:0,short:0,squeeze:0,neutral:0}; let bottomCount=0, topCount=0;
+  allCoins.forEach(c => { const s=calcSignal(c).signal.toLowerCase(); counts[s]=(counts[s]||0)+1; if(detectBottom(c))bottomCount++; if(detectTop(c))topCount++; });
   document.getElementById('stat-count').textContent = allCoins.length;
   document.getElementById('stat-long').textContent = counts.long||0;
   document.getElementById('stat-short').textContent = counts.short||0;
@@ -650,11 +707,7 @@ function updateStats() {
   document.getElementById('stat-bottom').textContent = bottomCount;
   document.getElementById('stat-top').textContent = topCount;
   const btc = allCoins.find(c=>c.symbol==='BTC');
-  if (btc) {
-    const el = document.getElementById('stat-btc');
-    el.textContent = (btc.chg24>=0?'+':'')+btc.chg24.toFixed(1)+'%';
-    el.style.color = btc.chg24>=0?'var(--green)':'var(--red)';
-  }
+  if (btc) { const el=document.getElementById('stat-btc'); el.textContent=(btc.chg24>=0?'+':'')+btc.chg24.toFixed(1)+'%'; el.style.color=btc.chg24>=0?'var(--green)':'var(--red)'; }
 }
 
 async function loadAll() {
@@ -671,97 +724,64 @@ async function loadAll() {
       results.push(...batchResults.filter(r=>r!==null));
     }
     allCoins = results.filter(c=>c.vol24>1000000);
-    updateStats();
-    renderList();
-    loadLiqLevels();
+    updateStats(); renderList(); loadLiqLevels();
     const now = new Date();
     document.getElementById('last-update').textContent = `ОБНОВЕНО: ${now.toLocaleTimeString('bg')} · AUTO 30s · ${allCoins.length} МОНЕТИ`;
-    loadAthAtlAsync();
-  } catch(e) {
-    document.getElementById('main-content').innerHTML = `<div class="error-msg">ГРЕШКА ПРИ ЗАРЕЖДАНЕ<br>${e.message}</div>`;
-  }
+    loadBTCMacro(); loadAthAtlAsync(); loadKlinesAsync();
+  } catch(e) { document.getElementById('main-content').innerHTML = `<div class="error-msg">ГРЕШКА ПРИ ЗАРЕЖДАНЕ<br>${e.message}</div>`; }
 }
 
-function startAutoRefresh() {
-  if (refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = setInterval(loadAll, 30000);
-}
-
-loadAll();
-startAutoRefresh();
+function startAutoRefresh() { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = setInterval(loadAll, 30000); }
+loadAll(); startAutoRefresh();
 
 function calcLiquidationPrice(entryPrice, avgPrice, totalSize, leverage, side) {
   const maintenanceRate = 0.004;
-  if (side === 'long') return avgPrice * (1 - (1/leverage) + maintenanceRate);
-  else return avgPrice * (1 + (1/leverage) - maintenanceRate);
+  return side==='long' ? avgPrice*(1-(1/leverage)+maintenanceRate) : avgPrice*(1+(1/leverage)-maintenanceRate);
 }
 
 function calcDCALevels(entryPrice, side) {
   const steps = [];
-  const entryQty = DCA_ENTRY / entryPrice;
   const entryLiq = calcLiquidationPrice(entryPrice, entryPrice, DCA_ENTRY, DCA_LEVERAGE, side);
   steps.push({step:0,label:'ВХОД',addAmount:DCA_ENTRY,totalUSDT:DCA_ENTRY,levelPrice:entryPrice,avgPrice:entryPrice,liqPrice:entryLiq,safeOrder:null,pctFromEntry:0});
-  const drops = [0.24, 0.40];
-  let totalUSDT = DCA_ENTRY, totalQty = entryQty, addAmount = DCA_ENTRY;
-  for (let i=0; i<drops.length; i++) {
-    addAmount = DCA_ENTRY * Math.pow(2, i+1);
-    const drop = drops[i];
-    const levelPrice = side==='long' ? entryPrice*(1-drop) : entryPrice*(1+drop);
-    const qty = addAmount/levelPrice;
-    totalUSDT += addAmount; totalQty += qty;
-    const avgPrice = totalUSDT/totalQty;
-    const liqPrice = calcLiquidationPrice(entryPrice, avgPrice, totalUSDT, DCA_LEVERAGE, side);
-    const safeOrder = side==='long' ? liqPrice*1.02 : liqPrice*0.98;
-    steps.push({step:i+1,label:`DCA ${i+1}`,addAmount,totalUSDT,levelPrice,avgPrice,liqPrice,safeOrder,pctFromEntry:drop*100});
-  }
-  const finalLiq = steps[steps.length-1].liqPrice;
-  const dca3Amount = DCA_ENTRY*8;
-  const dca3Price = side==='long' ? entryPrice-(entryPrice-finalLiq)*0.75 : entryPrice+(finalLiq-entryPrice)*0.75;
-  const dca3Qty = dca3Amount/dca3Price;
-  totalUSDT += dca3Amount; totalQty += dca3Qty;
-  const dca3Avg = totalUSDT/totalQty;
-  const dca3Liq = calcLiquidationPrice(entryPrice, dca3Avg, totalUSDT, DCA_LEVERAGE, side);
-  const dca3Safe = side==='long' ? dca3Liq*1.02 : dca3Liq*0.98;
-  const dca3Pct = Math.abs((dca3Price-entryPrice)/entryPrice*100);
-  steps.push({step:3,label:'DCA 3 · ПОСЛЕДЕН БУФЕР',addAmount:dca3Amount,totalUSDT,levelPrice:dca3Price,avgPrice:dca3Avg,liqPrice:dca3Liq,safeOrder:dca3Safe,pctFromEntry:dca3Pct});
+  let totalUSDT=DCA_ENTRY, totalQty=DCA_ENTRY/entryPrice;
+  [0.24,0.40].forEach((drop,i) => {
+    const addAmount=DCA_ENTRY*Math.pow(2,i+1);
+    const levelPrice=side==='long'?entryPrice*(1-drop):entryPrice*(1+drop);
+    totalUSDT+=addAmount; totalQty+=addAmount/levelPrice;
+    const avgPrice=totalUSDT/totalQty;
+    const liqPrice=calcLiquidationPrice(entryPrice,avgPrice,totalUSDT,DCA_LEVERAGE,side);
+    steps.push({step:i+1,label:`DCA ${i+1}`,addAmount,totalUSDT,levelPrice,avgPrice,liqPrice,safeOrder:side==='long'?liqPrice*1.02:liqPrice*0.98,pctFromEntry:drop*100});
+  });
+  const finalLiq=steps[steps.length-1].liqPrice;
+  const dca3Amount=DCA_ENTRY*8;
+  const dca3Price=side==='long'?entryPrice-(entryPrice-finalLiq)*0.75:entryPrice+(finalLiq-entryPrice)*0.75;
+  totalUSDT+=dca3Amount; totalQty+=dca3Amount/dca3Price;
+  const dca3Avg=totalUSDT/totalQty;
+  const dca3Liq=calcLiquidationPrice(entryPrice,dca3Avg,totalUSDT,DCA_LEVERAGE,side);
+  steps.push({step:3,label:'DCA 3 · ПОСЛЕДЕН БУФЕР',addAmount:dca3Amount,totalUSDT,levelPrice:dca3Price,avgPrice:dca3Avg,liqPrice:dca3Liq,safeOrder:side==='long'?dca3Liq*1.02:dca3Liq*0.98,pctFromEntry:Math.abs((dca3Price-entryPrice)/entryPrice*100)});
   return steps;
 }
 
-function formatP(p) {
-  if (!p) return '--';
-  if (p>=1000) return '$'+p.toLocaleString('en',{maximumFractionDigits:1});
-  if (p>=1) return '$'+p.toFixed(4);
-  return '$'+p.toFixed(6);
-}
+function formatP(p) { if(!p)return'--'; if(p>=1000)return'$'+p.toLocaleString('en',{maximumFractionDigits:1}); if(p>=1)return'$'+p.toFixed(4); return'$'+p.toFixed(6); }
 
-function openDCA(symbol, price) {
-  openDCAView();
-  document.getElementById('dca-symbol').value = symbol||'';
-  document.getElementById('dca-price').value = price||'';
-  if (symbol && price) renderDCA();
-}
+function openDCA(symbol, price) { openDCAView(); document.getElementById('dca-symbol').value=symbol||''; document.getElementById('dca-price').value=price||''; if(symbol&&price)renderDCA(); }
 
 function renderDCA() {
-  const symbol = document.getElementById('dca-symbol').value.toUpperCase().trim();
-  const price = parseFloat(document.getElementById('dca-price').value);
-  const side = document.querySelector('input[name="dca-side"]:checked').value;
-  if (!symbol||!price||isNaN(price)) {
-    document.getElementById('dca-result').innerHTML = `<div style="text-align:center;color:var(--text2);padding:20px;font-family:'Share Tech Mono',monospace;font-size:12px;">ВЪВЕДИ МОНЕТА И ЦЕНА</div>`;
-    return;
-  }
-  const steps = calcDCALevels(price, side);
-  const sideColor = side==='long'?'var(--green)':'var(--red)';
-  const sideLabel = side==='long'?'▲ LONG':'▼ SHORT';
-  let html = `<div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:10px 14px;"><div style="padding:10px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;"><div style="font-size:18px;font-weight:700;color:#fff;">${symbol}/USDT</div><span style="font-family:'Share Tech Mono',monospace;font-size:11px;padding:3px 10px;border-radius:12px;background:${side==='long'?'rgba(0,255,136,0.15)':'rgba(255,51,102,0.15)'};color:${sideColor};border:1px solid ${sideColor};">${sideLabel}</span></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;padding:8px 12px;border-bottom:1px solid var(--border);"><div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">ЛЕВЪРИДЖ</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--yellow);">х${DCA_LEVERAGE}</div></div><div style="text-align:center;border-left:1px solid var(--border);border-right:1px solid var(--border);"><div style="font-size:9px;color:var(--text2);">НАЧАЛНА СУМА</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--accent);">$${DCA_ENTRY}</div></div><div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">МАКС ОБЩО</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--red);">$${steps[steps.length-1].totalUSDT.toFixed(0)}</div></div></div></div>`;
-  html += `<div style="margin:0 14px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden;">`;
-  steps.forEach((s,idx) => {
-    const isEntry = s.step===0;
-    const rowBg = isEntry?'rgba(0,229,255,0.05)':'';
-    const labelColor = isEntry?'var(--accent)':sideColor;
-    html += `<div style="padding:10px 12px;border-bottom:${idx<steps.length-1?'1px solid var(--border)':'none'};background:${rowBg};"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><div><span style="font-family:'Share Tech Mono',monospace;font-size:11px;color:${labelColor};">${s.label}</span>${s.pctFromEntry>0?`<span style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2);margin-left:6px;">-${s.pctFromEntry.toFixed(0)}%</span>`:''}</div><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:#fff;font-weight:bold;">+$${s.addAmount.toFixed(0)} → $${s.totalUSDT.toFixed(0)}</span></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;"><div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">ЦЕНА НИВО</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);">${formatP(s.levelPrice)}</div></div><div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">СРЕДНА ЦЕНА</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--yellow);">${formatP(s.avgPrice)}</div></div><div style="background:rgba(255,51,102,0.08);border-radius:6px;padding:5px 6px;text-align:center;border:1px solid rgba(255,51,102,0.15);"><div style="font-size:8px;color:var(--text2);">ЛИКВИДАЦИЯ</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--red);">${formatP(s.liqPrice)}</div></div></div>${!isEntry?`<div style="margin-top:5px;background:rgba(255,204,0,0.06);border:1px solid rgba(255,204,0,0.2);border-radius:6px;padding:5px 8px;display:flex;justify-content:space-between;align-items:center;"><span style="font-size:9px;color:var(--yellow);">📌 LIMIT ОРДЪР</span><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--yellow);font-weight:bold;">${formatP(s.safeOrder)}</span></div>`:''}</div>`;
+  const symbol=document.getElementById('dca-symbol').value.toUpperCase().trim();
+  const price=parseFloat(document.getElementById('dca-price').value);
+  const side=document.querySelector('input[name="dca-side"]:checked').value;
+  if(!symbol||!price||isNaN(price)){document.getElementById('dca-result').innerHTML=`<div style="text-align:center;color:var(--text2);padding:20px;font-family:'Share Tech Mono',monospace;font-size:12px;">ВЪВЕДИ МОНЕТА И ЦЕНА</div>`;return;}
+  const steps=calcDCALevels(price,side);
+  const sideColor=side==='long'?'var(--green)':'var(--red)';
+  const sideLabel=side==='long'?'▲ LONG':'▼ SHORT';
+  let html=`<div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:10px 14px;"><div style="padding:10px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;"><div style="font-size:18px;font-weight:700;color:#fff;">${symbol}/USDT</div><span style="font-family:'Share Tech Mono',monospace;font-size:11px;padding:3px 10px;border-radius:12px;background:${side==='long'?'rgba(0,255,136,0.15)':'rgba(255,51,102,0.15)'};color:${sideColor};border:1px solid ${sideColor};">${sideLabel}</span></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;padding:8px 12px;border-bottom:1px solid var(--border);"><div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">ЛЕВЪРИДЖ</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--yellow);">х${DCA_LEVERAGE}</div></div><div style="text-align:center;border-left:1px solid var(--border);border-right:1px solid var(--border);"><div style="font-size:9px;color:var(--text2);">НАЧАЛНА СУМА</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--accent);">$${DCA_ENTRY}</div></div><div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">МАКС ОБЩО</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--red);">$${steps[steps.length-1].totalUSDT.toFixed(0)}</div></div></div></div>`;
+  html+=`<div style="margin:0 14px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden;">`;
+  steps.forEach((s,idx)=>{
+    const isEntry=s.step===0; const rowBg=isEntry?'rgba(0,229,255,0.05)':''; const labelColor=isEntry?'var(--accent)':sideColor;
+    html+=`<div style="padding:10px 12px;border-bottom:${idx<steps.length-1?'1px solid var(--border)':'none'};background:${rowBg};"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><div><span style="font-family:'Share Tech Mono',monospace;font-size:11px;color:${labelColor};">${s.label}</span>${s.pctFromEntry>0?`<span style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2);margin-left:6px;">-${s.pctFromEntry.toFixed(0)}%</span>`:''}</div><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:#fff;font-weight:bold;">+$${s.addAmount.toFixed(0)} → $${s.totalUSDT.toFixed(0)}</span></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;"><div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">ЦЕНА НИВО</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);">${formatP(s.levelPrice)}</div></div><div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">СРЕДНА ЦЕНА</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--yellow);">${formatP(s.avgPrice)}</div></div><div style="background:rgba(255,51,102,0.08);border-radius:6px;padding:5px 6px;text-align:center;border:1px solid rgba(255,51,102,0.15);"><div style="font-size:8px;color:var(--text2);">ЛИКВИДАЦИЯ</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--red);">${formatP(s.liqPrice)}</div></div></div>${!isEntry?`<div style="margin-top:5px;background:rgba(255,204,0,0.06);border:1px solid rgba(255,204,0,0.2);border-radius:6px;padding:5px 8px;display:flex;justify-content:space-between;align-items:center;"><span style="font-size:9px;color:var(--yellow);">📌 LIMIT ОРДЪР</span><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--yellow);font-weight:bold;">${formatP(s.safeOrder)}</span></div>`:''}</div>`;
   });
-  html += `</div><div style="margin:0 14px 14px;background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.2);border-radius:10px;padding:10px 12px;"><div style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--green);letter-spacing:1px;margin-bottom:8px;">→ СТРАТЕГИЯ ЗА ИЗХОД</div><div style="font-size:12px;color:var(--text);line-height:1.6;">При възстановяване → освобождаваш <span style="color:var(--green);font-weight:bold;">75%</span> от позицията веднага<br>Оставяш <span style="color:var(--accent);font-weight:bold;">25%</span> да продължи при по-висока цел</div></div>`;
-  document.getElementById('dca-result').innerHTML = html;
+  html+=`</div><div style="margin:0 14px 14px;background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.2);border-radius:10px;padding:10px 12px;"><div style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--green);letter-spacing:1px;margin-bottom:8px;">→ СТРАТЕГИЯ ЗА ИЗХОД</div><div style="font-size:12px;color:var(--text);line-height:1.6;">При възстановяване → освобождаваш <span style="color:var(--green);font-weight:bold;">75%</span> от позицията веднага<br>Оставяш <span style="color:var(--accent);font-weight:bold;">25%</span> да продължи при по-висока цел</div></div>`;
+  document.getElementById('dca-result').innerHTML=html;
 }
 </script>
 </body>
