@@ -48,6 +48,7 @@
   .tab.active-trending{background:rgba(255,100,0,0.12);border-color:#ff6400;color:#ff6400;}
   .tab.active-bottom{background:rgba(0,255,136,0.12);border-color:var(--green);color:var(--green);}
   .tab.active-top{background:rgba(255,51,102,0.12);border-color:var(--red);color:var(--red);}
+  .tab.active-setup{background:rgba(168,85,247,0.12);border-color:var(--purple);color:var(--purple);}
   .tab.active-dca{background:rgba(68,136,255,0.12);border-color:var(--blue);color:var(--blue);}
   .stats-bar{display:flex;gap:0;padding:8px 14px;background:var(--bg2);border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none;}
   .stat-item{flex-shrink:0;padding:0 12px;border-right:1px solid var(--border);text-align:center;}
@@ -69,6 +70,7 @@
   .coin-card.signal-neutral{border-left:3px solid var(--gray);}
   .coin-card.detector-bottom{box-shadow:0 0 0 1px var(--green),0 0 15px rgba(0,255,136,0.15);}
   .coin-card.detector-top{box-shadow:0 0 0 1px var(--red),0 0 15px rgba(255,51,102,0.15);}
+  .coin-card.oi-flip{box-shadow:0 0 0 1px var(--accent),0 0 18px rgba(0,229,255,0.2);}
   .card-top{display:flex;align-items:center;justify-content:space-between;padding:10px 12px 8px;border-bottom:1px solid var(--border);}
   .coin-left{display:flex;align-items:center;gap:8px;}
   .coin-icon{width:32px;height:32px;border-radius:50%;background:var(--bg3);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--accent);}
@@ -88,6 +90,9 @@
   .tag-atl{background:rgba(0,255,136,0.15);color:var(--green);border:1px solid rgba(0,255,136,0.4);font-weight:bold;}
   .tag-golden{background:rgba(255,204,0,0.15);color:var(--yellow);border:1px solid rgba(255,204,0,0.4);font-weight:bold;}
   .tag-death{background:rgba(255,51,102,0.15);color:var(--red);border:1px solid rgba(255,51,102,0.4);font-weight:bold;}
+  .tag-flip-up{background:rgba(0,255,136,0.25);color:var(--green);border:1px solid var(--green);font-weight:bold;animation:flipPulse 1.5s infinite;}
+  .tag-flip-down{background:rgba(255,51,102,0.25);color:var(--red);border:1px solid var(--red);font-weight:bold;animation:flipPulse 1.5s infinite;}
+  @keyframes flipPulse{0%,100%{opacity:1;}50%{opacity:0.5;}}
   .coin-right{text-align:right;}
   .coin-price{font-family:'Share Tech Mono',monospace;font-size:15px;color:#fff;font-weight:bold;}
   .coin-chg{font-size:13px;font-weight:700;margin-top:2px;}
@@ -124,6 +129,22 @@
   .detector-banner{display:flex;align-items:center;gap:8px;padding:7px 12px;font-family:'Share Tech Mono',monospace;font-size:10px;letter-spacing:1px;border-top:1px solid var(--border);}
   .detector-banner.bottom{background:rgba(0,255,136,0.07);color:var(--green);}
   .detector-banner.top{background:rgba(255,51,102,0.07);color:var(--red);}
+  .setup-banner{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;font-family:'Share Tech Mono',monospace;font-size:11px;letter-spacing:1px;border-top:1px solid var(--border);font-weight:bold;}
+  .setup-banner.setup-long{background:rgba(0,255,136,0.1);color:var(--green);}
+  .setup-banner.setup-short{background:rgba(255,51,102,0.1);color:var(--red);}
+  .setup-banner.setup-watch{background:rgba(255,204,0,0.07);color:var(--yellow);}
+  .setup-pts{display:flex;gap:3px;}
+  .setup-pt{width:8px;height:8px;border-radius:50%;background:var(--border);}
+  .setup-pt.on-l{background:var(--green);}
+  .setup-pt.on-s{background:var(--red);}
+  .setup-pt.on-w{background:var(--yellow);}
+  .wall-section{padding:7px 12px;border-top:1px solid var(--border);font-family:'Share Tech Mono',monospace;font-size:10px;background:rgba(0,0,0,0.15);}
+  .wall-row{display:flex;justify-content:space-between;margin-bottom:3px;}
+  .wall-row:last-child{margin-bottom:0;}
+  .wall-plan{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-top:5px;}
+  .wall-plan-item{background:var(--bg3);border-radius:6px;padding:4px 5px;text-align:center;}
+  .wall-plan-label{font-size:8px;color:var(--text2);}
+  .wall-plan-val{font-size:10px;font-weight:bold;margin-top:1px;}
   .tv-btn{background:rgba(68,136,255,0.1);border:1px solid rgba(68,136,255,0.3);color:var(--blue);font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 10px;border-radius:12px;cursor:pointer;letter-spacing:1px;text-decoration:none;display:inline-block;}
   .dca-btn{background:rgba(0,229,255,0.1);border:1px solid rgba(0,229,255,0.3);color:var(--accent);font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 10px;border-radius:12px;cursor:pointer;letter-spacing:1px;}
   .dca-btn:active,.tv-btn:active{opacity:0.7;}
@@ -184,6 +205,7 @@
 </div>
 <div class="filter-tabs">
   <div class="tab active-all" onclick="setFilter('all',this)">ВСИЧКИ</div>
+  <div class="tab" onclick="setFilter('setup',this)">🎯 SETUP</div>
   <div class="tab" onclick="setFilter('trending',this)">🔥 TRENDING</div>
   <div class="tab" onclick="setFilter('long',this)">▲ LONG</div>
   <div class="tab" onclick="setFilter('short',this)">▼ SHORT</div>
@@ -194,6 +216,7 @@
 </div>
 <div class="stats-bar">
   <div class="stat-item"><div class="stat-label">МОНЕТИ</div><div class="stat-value" id="stat-count" style="color:var(--accent)">--</div></div>
+  <div class="stat-item"><div class="stat-label">🎯 SETUP</div><div class="stat-value" id="stat-setup" style="color:var(--purple)">--</div></div>
   <div class="stat-item"><div class="stat-label">LONG</div><div class="stat-value" id="stat-long" style="color:var(--green)">--</div></div>
   <div class="stat-item"><div class="stat-label">SHORT</div><div class="stat-value" id="stat-short" style="color:var(--red)">--</div></div>
   <div class="stat-item"><div class="stat-label">SQUEEZE</div><div class="stat-value" id="stat-squeeze" style="color:var(--yellow)">--</div></div>
@@ -243,6 +266,8 @@ let trendingSymbols = new Set();
 const liqCache = {};
 const athCache = {};
 const klineCache = {};
+const wallCache = {};
+const oiPrevMap = {}; // 🔔 OI ОБРЪЩАНЕ: пази предишния знак на OI Δ15M между refresh-ите
 
 function handleSearch(val) { searchQuery = val.toUpperCase().trim(); renderList(); }
 
@@ -266,6 +291,57 @@ async function getLiqNearPrice(symbol, price) {
   const above = top20.filter(l => l.price > price).sort((a,b) => a.price - b.price).slice(0,2);
   const below = top20.filter(l => l.price < price).sort((a,b) => b.price - a.price).slice(0,2);
   const result = {above, below}; liqCache[symbol] = {levels: result, ts: Date.now()}; return result;
+}
+
+// ============ 📊 ORDER BOOK WALLS (Binance API, безплатно) ============
+async function fetchOrderBookWalls(symbol, price) {
+  if (wallCache[symbol] && wallCache[symbol].ts > Date.now() - 120000) return wallCache[symbol].data;
+  try {
+    const r = await fetch(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=500`);
+    const d = await r.json();
+    if (!d.bids || !d.asks) return null;
+    const bids = d.bids.map(b => ({price: parseFloat(b[0]), usd: parseFloat(b[0])*parseFloat(b[1])}));
+    const asks = d.asks.map(a => ({price: parseFloat(a[0]), usd: parseFloat(a[0])*parseFloat(a[1])}));
+    const avgBid = bids.reduce((s,b)=>s+b.usd,0)/bids.length;
+    const avgAsk = asks.reduce((s,a)=>s+a.usd,0)/asks.length;
+    // Стена = ниво поне 8х над средното за книгата
+    const buyWalls = bids.filter(b => b.usd > avgBid*8).sort((a,b)=>b.usd-a.usd).slice(0,2);
+    const sellWalls = asks.filter(a => a.usd > avgAsk*8).sort((a,b)=>b.usd-a.usd).slice(0,2);
+    const buyWall = buyWalls.length ? buyWalls.sort((a,b)=>b.price-a.price)[0] : null;
+    const sellWall = sellWalls.length ? sellWalls.sort((a,b)=>a.price-b.price)[0] : null;
+    const data = {buyWall, sellWall};
+    wallCache[symbol] = {data, ts: Date.now()};
+    return data;
+  } catch(e) { return null; }
+}
+
+async function loadWalls() {
+  const visible = document.querySelectorAll('.coin-card');
+  for (const card of visible) {
+    const wallEl = card.querySelector('[id^="wall-"]'); if (!wallEl) continue;
+    const sym = wallEl.id.replace('wall-','');
+    const coin = allCoins.find(c => c.fullSymbol === sym); if (!coin) continue;
+    try {
+      const walls = await fetchOrderBookWalls(sym, coin.price);
+      if (!walls || (!walls.buyWall && !walls.sellWall)) { wallEl.innerHTML = `<span style="color:var(--text2)">📊 СТЕНИ: няма ясни стени в книгата</span>`; continue; }
+      const sig = calcSignal(coin);
+      const bw = walls.buyWall, sw = walls.sellWall;
+      let rows = `<div class="wall-row"><span style="color:var(--text2)">📊 ORDER BOOK СТЕНИ</span><span style="color:var(--text2)">limit 500</span></div>`;
+      rows += `<div class="wall-row"><span style="color:var(--red)">🟥 Sell Wall: ${sw?'$'+formatPrice(sw.price)+' ('+formatNum(sw.usd)+')':'--'}</span><span style="color:var(--green)">🟩 Buy Wall: ${bw?'$'+formatPrice(bw.price)+' ('+formatNum(bw.usd)+')':'--'}</span></div>`;
+      // План: вход малко над Buy Wall, цел малко преди Sell Wall, SL под Buy Wall (огледално за SHORT)
+      if (bw && sw && (sig.signal==='LONG'||sig.signal==='SHORT')) {
+        let entry, target, sl;
+        if (sig.signal==='LONG') { entry=bw.price*1.003; target=sw.price*0.997; sl=bw.price*0.99; }
+        else { entry=sw.price*0.997; target=bw.price*1.003; sl=sw.price*1.01; }
+        rows += `<div class="wall-plan">
+          <div class="wall-plan-item"><div class="wall-plan-label">ВХОД</div><div class="wall-plan-val" style="color:var(--accent)">$${formatPrice(entry)}</div></div>
+          <div class="wall-plan-item"><div class="wall-plan-label">ЦЕЛ</div><div class="wall-plan-val" style="color:var(--green)">$${formatPrice(target)}</div></div>
+          <div class="wall-plan-item"><div class="wall-plan-label">SL</div><div class="wall-plan-val" style="color:var(--red)">$${formatPrice(sl)}</div></div>
+        </div>`;
+      }
+      wallEl.innerHTML = rows;
+    } catch(e) { wallEl.innerHTML = `<span style="color:var(--text2)">📊 СТЕНИ: --</span>`; }
+  }
 }
 
 const BASE_SYMBOLS = [
@@ -446,7 +522,15 @@ async function fetchCoinData(symbol) {
     const shortPct = 100 - longPct;
     const oi = oiR.openInterest ? parseFloat(oiR.openInterest)*price : 0;
     const sym = symbol.replace('USDT','');
-    return { symbol:sym, fullSymbol:symbol, price, chg24, vol24, funding, longPct, shortPct, oi, oiDelta, volSpike, isTrending: trendingSymbols.has(sym), pctFromAth:null, pctFromAtl:null, ath:null, atl:null, marketCap:null, goldenCross:null, vol1h:null, vol4h:null, valid:true };
+    // 🔔 OI ОБРЪЩАНЕ: сравни предишния знак с новия
+    let oiFlip = null;
+    const prevDelta = oiPrevMap[symbol];
+    if (prevDelta !== undefined && Math.abs(oiDelta) > 0.1) {
+      if (prevDelta < 0 && oiDelta > 0) oiFlip = 'up';
+      else if (prevDelta > 0 && oiDelta < 0) oiFlip = 'down';
+    }
+    oiPrevMap[symbol] = oiDelta;
+    return { symbol:sym, fullSymbol:symbol, price, chg24, vol24, funding, longPct, shortPct, oi, oiDelta, oiFlip, volSpike, isTrending: trendingSymbols.has(sym), pctFromAth:null, pctFromAtl:null, ath:null, atl:null, marketCap:null, goldenCross:null, vol1h:null, vol4h:null, valid:true };
   } catch(e) { return null; }
 }
 
@@ -533,6 +617,31 @@ function detectTop(coin) {
   return score >= 4;
 }
 
+// ============ 🎯 SETUP QUALITY ТОЧКОВА СИСТЕМА ============
+// ЛОНГ точки: Funding<0%, Long%<45%, OI Δ15M>+2%, Сигнал=LONG, GOLDEN X, Дъно детектор
+// ШОРТ точки: Funding>0.08%, Long%>70%, OI пада при pump, Сигнал=SHORT, DEATH X, Връх детектор
+function calcSetupQuality(coin) {
+  const sig = calcSignal(coin);
+  let longPts = 0, shortPts = 0;
+  if (coin.funding < 0) longPts++;
+  if (coin.longPct < 45) longPts++;
+  if (coin.oiDelta > 2) longPts++;
+  if (sig.signal === 'LONG') longPts++;
+  if (coin.goldenCross === true) longPts++;
+  if (detectBottom(coin)) longPts++;
+  if (coin.funding > 0.08) shortPts++;
+  if (coin.longPct > 70) shortPts++;
+  if (coin.chg24 > 5 && coin.oiDelta < 0) shortPts++; // OI пада при pump
+  if (sig.signal === 'SHORT') shortPts++;
+  if (coin.goldenCross === false) shortPts++;
+  if (detectTop(coin)) shortPts++;
+  const pts = Math.max(longPts, shortPts);
+  const side = longPts >= shortPts ? 'long' : 'short';
+  if (pts >= 4) return {grade:'setup', side, pts, label: side==='long' ? '🟢 ЛОНГ SETUP' : '🔴 ШОРТ SETUP'};
+  if (pts >= 2) return {grade:'watch', side, pts, label:'🟡 НАБЛЮДАВАЙ'};
+  return {grade:'none', side, pts, label:null};
+}
+
 function calcSignal(coin) {
   let ls = 0, ss = 0;
   if (coin.chg24 >= 10) ls += 3; else if (coin.chg24 >= 5) ls += 2; else if (coin.chg24 >= 2) ls += 1;
@@ -572,6 +681,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
 function renderCard(coin, idx) {
   const sig = calcSignal(coin); const manip = isManipulable(coin);
   const isBottom = detectBottom(coin); const isTop = detectTop(coin);
+  const setup = calcSetupQuality(coin);
   const sc = sig.signal.toLowerCase(); const delay = idx * 0.05;
   const fColor = coin.funding > 0.05 ? 'var(--red)' : coin.funding < -0.01 ? 'var(--green)' : 'var(--text2)';
   const fSign = coin.funding > 0 ? '+' : '';
@@ -579,6 +689,8 @@ function renderCard(coin, idx) {
   const dotClass = sig.ls >= sig.ss ? 'on-long' : 'on-short';
   const dotsHtml = Array.from({length:5},(_,i)=>`<div class="dot ${i<activeDots?dotClass:''}"></div>`).join('');
   const tags = [];
+  if (coin.oiFlip === 'up') tags.push(`<span class="tag tag-flip-up">🔔 OI ОБРЪЩАНЕ ▲</span>`);
+  if (coin.oiFlip === 'down') tags.push(`<span class="tag tag-flip-down">🔔 OI ОБРЪЩАНЕ ▼</span>`);
   if (isBottom) tags.push(`<span class="tag tag-bottom">🟢 ДЪНО</span>`);
   if (isTop) tags.push(`<span class="tag tag-top">🔴 ВРЪХ</span>`);
   if (coin.pctFromAtl !== null && coin.pctFromAtl < 100) tags.push(`<span class="tag tag-atl">🟢 БЛИЗО ATL</span>`);
@@ -593,7 +705,15 @@ function renderCard(coin, idx) {
   if (coin.oiDelta > 2) tags.push(`<span class="tag tag-oi-up">OI↑ ${coin.oiDelta.toFixed(1)}%</span>`);
   if (coin.oiDelta < -2) tags.push(`<span class="tag tag-oi-down">OI↓ ${Math.abs(coin.oiDelta).toFixed(1)}%</span>`);
   const detectorBanner = isBottom ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>` : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding.toFixed(3)}% · L/S>${coin.longPct.toFixed(0)}% · OI↓</div>` : '';
-  const detectorClass = isBottom ? ' detector-bottom' : isTop ? ' detector-top' : '';
+  // 🎯 SETUP QUALITY банер с точки
+  let setupBanner = '';
+  if (setup.label) {
+    const ptClass = setup.grade==='setup' ? (setup.side==='long'?'on-l':'on-s') : 'on-w';
+    const ptsHtml = Array.from({length:6},(_,i)=>`<div class="setup-pt ${i<setup.pts?ptClass:''}"></div>`).join('');
+    const bClass = setup.grade==='setup' ? (setup.side==='long'?'setup-long':'setup-short') : 'setup-watch';
+    setupBanner = `<div class="setup-banner ${bClass}"><span>${setup.label} · ${setup.pts}/6 точки</span><div class="setup-pts">${ptsHtml}</div></div>`;
+  }
+  const detectorClass = (isBottom ? ' detector-bottom' : isTop ? ' detector-top' : '') + (coin.oiFlip ? ' oi-flip' : '');
   let athBarHtml = coin.pctFromAth !== null
     ? `<div class="ath-bar"><span style="color:var(--text2)">ATH: <span style="color:${coin.pctFromAth>-15?'var(--red)':coin.pctFromAth>-50?'var(--yellow)':'var(--green)'}">${coin.pctFromAth.toFixed(0)}%</span></span><span style="color:var(--text2)">MCap: <span style="color:var(--text)">$${coin.marketCap>0?formatNum(coin.marketCap):'--'}</span></span><span style="color:var(--text2)">ATL: <span style="color:${coin.pctFromAtl&&coin.pctFromAtl<100?'var(--green)':'var(--text2)'}">+${coin.pctFromAtl?coin.pctFromAtl.toFixed(0):'?'}%</span></span></div>`
     : `<div class="ath-bar"><span style="color:var(--text2);font-size:9px;">ATH/ATL/MCap: зареждане...</span></div>`;
@@ -632,7 +752,11 @@ function renderCard(coin, idx) {
     <div class="liq-section" id="liq-${coin.fullSymbol}" style="padding:6px 12px;border-top:1px solid var(--border);display:flex;justify-content:space-between;font-family:'Share Tech Mono',monospace;font-size:10px;">
       <span style="color:var(--text2)">🔴 ЛИК НИВА: зареждане...</span>
     </div>
+    <div class="wall-section" id="wall-${coin.fullSymbol}">
+      <span style="color:var(--text2)">📊 СТЕНИ: зареждане...</span>
+    </div>
     ${detectorBanner}
+    ${setupBanner}
     <div class="signal-box">
       <div class="signal-badge badge-${sc}">${sig.signal}</div>
       <div class="signal-detail">L:${sig.ls} / S:${sig.ss}<div class="score-dots">${dotsHtml}</div></div>
@@ -648,7 +772,7 @@ function setFilter(filter, el) {
   document.querySelectorAll('.tab').forEach(t => t.className='tab');
   el.className = `tab active-${filter}`;
   document.getElementById('search-input').value = ''; searchQuery = '';
-  renderList(); loadLiqLevels();
+  renderList(); loadLiqLevels(); loadWalls();
 }
 
 function openDCAView() {
@@ -683,9 +807,17 @@ function renderList() {
     if (currentFilter === 'trending') filtered = allCoins.filter(c => c.isTrending);
     else if (currentFilter === 'bottom') filtered = allCoins.filter(c => detectBottom(c));
     else if (currentFilter === 'top') filtered = allCoins.filter(c => detectTop(c));
+    else if (currentFilter === 'setup') filtered = allCoins.filter(c => calcSetupQuality(c).grade === 'setup');
     else if (currentFilter !== 'all') filtered = allCoins.filter(c => calcSignal(c).signal.toLowerCase() === currentFilter);
   }
   filtered.sort((a,b) => {
+    // 🔔 OI обръщане винаги най-горе
+    if (a.oiFlip && !b.oiFlip) return -1; if (b.oiFlip && !a.oiFlip) return 1;
+    // 🎯 SETUP QUALITY: по-висок резултат по-нагоре
+    const sqA = calcSetupQuality(a), sqB = calcSetupQuality(b);
+    if (sqA.grade==='setup' && sqB.grade!=='setup') return -1;
+    if (sqB.grade==='setup' && sqA.grade!=='setup') return 1;
+    if (sqA.grade==='setup' && sqB.grade==='setup' && sqB.pts !== sqA.pts) return sqB.pts - sqA.pts;
     const aD=detectBottom(a)||detectTop(a), bD=detectBottom(b)||detectTop(b);
     if (aD&&!bD) return -1; if (bD&&!aD) return 1;
     const sa=calcSignal(a), sb=calcSignal(b);
@@ -698,9 +830,10 @@ function renderList() {
 }
 
 function updateStats() {
-  const counts = {long:0,short:0,squeeze:0,neutral:0}; let bottomCount=0, topCount=0;
-  allCoins.forEach(c => { const s=calcSignal(c).signal.toLowerCase(); counts[s]=(counts[s]||0)+1; if(detectBottom(c))bottomCount++; if(detectTop(c))topCount++; });
+  const counts = {long:0,short:0,squeeze:0,neutral:0}; let bottomCount=0, topCount=0, setupCount=0;
+  allCoins.forEach(c => { const s=calcSignal(c).signal.toLowerCase(); counts[s]=(counts[s]||0)+1; if(detectBottom(c))bottomCount++; if(detectTop(c))topCount++; if(calcSetupQuality(c).grade==='setup')setupCount++; });
   document.getElementById('stat-count').textContent = allCoins.length;
+  document.getElementById('stat-setup').textContent = setupCount;
   document.getElementById('stat-long').textContent = counts.long||0;
   document.getElementById('stat-short').textContent = counts.short||0;
   document.getElementById('stat-squeeze').textContent = counts.squeeze||0;
@@ -724,7 +857,7 @@ async function loadAll() {
       results.push(...batchResults.filter(r=>r!==null));
     }
     allCoins = results.filter(c=>c.vol24>1000000);
-    updateStats(); renderList(); loadLiqLevels();
+    updateStats(); renderList(); loadLiqLevels(); loadWalls();
     const now = new Date();
     document.getElementById('last-update').textContent = `ОБНОВЕНО: ${now.toLocaleTimeString('bg')} · AUTO 30s · ${allCoins.length} МОНЕТИ`;
     loadBTCMacro(); loadAthAtlAsync(); loadKlinesAsync();
@@ -744,21 +877,23 @@ function calcDCALevels(entryPrice, side) {
   const entryLiq = calcLiquidationPrice(entryPrice, entryPrice, DCA_ENTRY, DCA_LEVERAGE, side);
   steps.push({step:0,label:'ВХОД',addAmount:DCA_ENTRY,totalUSDT:DCA_ENTRY,levelPrice:entryPrice,avgPrice:entryPrice,liqPrice:entryLiq,safeOrder:null,pctFromEntry:0});
   let totalUSDT=DCA_ENTRY, totalQty=DCA_ENTRY/entryPrice;
+  let dca2LevelPrice = null;
   [0.24,0.40].forEach((drop,i) => {
     const addAmount=DCA_ENTRY*Math.pow(2,i+1);
     const levelPrice=side==='long'?entryPrice*(1-drop):entryPrice*(1+drop);
+    if (i===1) dca2LevelPrice = levelPrice;
     totalUSDT+=addAmount; totalQty+=addAmount/levelPrice;
     const avgPrice=totalUSDT/totalQty;
     const liqPrice=calcLiquidationPrice(entryPrice,avgPrice,totalUSDT,DCA_LEVERAGE,side);
     steps.push({step:i+1,label:`DCA ${i+1}`,addAmount,totalUSDT,levelPrice,avgPrice,liqPrice,safeOrder:side==='long'?liqPrice*1.02:liqPrice*0.98,pctFromEntry:drop*100});
   });
-  const finalLiq=steps[steps.length-1].liqPrice;
+  // 🔧 DCA 3 КОРЕКЦИЯ: -35% от цената на DCA 2 (не от входната цена). Огледално за SHORT: +35% от DCA 2.
   const dca3Amount=DCA_ENTRY*8;
-  const dca3Price=side==='long'?entryPrice-(entryPrice-finalLiq)*0.75:entryPrice+(finalLiq-entryPrice)*0.75;
+  const dca3Price=side==='long'?dca2LevelPrice*(1-0.35):dca2LevelPrice*(1+0.35);
   totalUSDT+=dca3Amount; totalQty+=dca3Amount/dca3Price;
   const dca3Avg=totalUSDT/totalQty;
   const dca3Liq=calcLiquidationPrice(entryPrice,dca3Avg,totalUSDT,DCA_LEVERAGE,side);
-  steps.push({step:3,label:'DCA 3 · ПОСЛЕДЕН БУФЕР',addAmount:dca3Amount,totalUSDT,levelPrice:dca3Price,avgPrice:dca3Avg,liqPrice:dca3Liq,safeOrder:side==='long'?dca3Liq*1.02:dca3Liq*0.98,pctFromEntry:Math.abs((dca3Price-entryPrice)/entryPrice*100)});
+  steps.push({step:3,label:'DCA 3 · ПОСЛЕДЕН БУФЕР (-35% от DCA 2)',addAmount:dca3Amount,totalUSDT,levelPrice:dca3Price,avgPrice:dca3Avg,liqPrice:dca3Liq,safeOrder:side==='long'?dca3Liq*1.02:dca3Liq*0.98,pctFromEntry:Math.abs((dca3Price-entryPrice)/entryPrice*100)});
   return steps;
 }
 
