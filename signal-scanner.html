@@ -20,7 +20,25 @@
   .live-dot{width:7px;height:7px;background:var(--green);border-radius:50%;animation:pulse 1.5s infinite;}
   @keyframes pulse{0%,100%{opacity:1;transform:scale(1);}50%{opacity:0.4;transform:scale(0.7);}}
   .refresh-btn{background:var(--bg3);border:1px solid var(--border);color:var(--accent);font-family:'Share Tech Mono',monospace;font-size:11px;padding:5px 10px;border-radius:4px;cursor:pointer;letter-spacing:1px;}
-  .btc-macro{margin:10px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden;}
+  .market-row{margin:8px 14px 0;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden;}
+  .market-row-header{padding:6px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;}
+  .market-row-title{font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:2px;}
+  .market-row-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:0;}
+  .market-item{text-align:center;padding:7px 4px;border-right:1px solid var(--border);}
+  .market-item:last-child{border-right:none;}
+  .market-label{font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;}
+  .market-value{font-family:'Share Tech Mono',monospace;font-size:11px;margin-top:2px;font-weight:bold;}
+  .market-sub{font-size:8px;color:var(--text2);margin-top:1px;}
+  .macro-row{margin:6px 14px 0;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden;}
+  .macro-row-header{padding:6px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;}
+  .macro-row-title{font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--orange);letter-spacing:2px;}
+  .macro-row-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0;}
+  .macro-item{text-align:center;padding:7px 4px;border-right:1px solid var(--border);}
+  .macro-item:last-child{border-right:none;}
+  .macro-label{font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;}
+  .macro-value{font-family:'Share Tech Mono',monospace;font-size:11px;margin-top:2px;font-weight:bold;}
+  .macro-sub{font-size:8px;color:var(--text2);margin-top:1px;}
+  .btc-macro{margin:6px 14px 0;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden;}
   .btc-macro-header{padding:8px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;}
   .btc-macro-title{font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--accent);letter-spacing:2px;}
   .btc-season-badge{font-family:'Share Tech Mono',monospace;font-size:11px;font-weight:bold;padding:3px 12px;border-radius:12px;letter-spacing:1px;}
@@ -34,7 +52,7 @@
   .btc-macro-label{font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;}
   .btc-macro-value{font-family:'Share Tech Mono',monospace;font-size:12px;margin-top:2px;font-weight:bold;}
   .btc-macro-sub{font-size:8px;color:var(--text2);margin-top:1px;}
-  .search-bar{padding:8px 14px;background:var(--bg2);border-bottom:1px solid var(--border);}
+  .search-bar{padding:8px 14px;background:var(--bg2);border-bottom:1px solid var(--border);margin-top:8px;}
   .search-input{width:100%;background:var(--bg3);border:1px solid var(--border);color:#fff;font-family:'Share Tech Mono',monospace;font-size:12px;padding:8px 12px;border-radius:8px;outline:none;letter-spacing:1px;}
   .search-input:focus{border-color:var(--accent);}
   .search-input::placeholder{color:var(--text2);}
@@ -50,6 +68,7 @@
   .tab.active-top{background:rgba(255,51,102,0.12);border-color:var(--red);color:var(--red);}
   .tab.active-setup{background:rgba(168,85,247,0.12);border-color:var(--purple);color:var(--purple);}
   .tab.active-dca{background:rgba(68,136,255,0.12);border-color:var(--blue);color:var(--blue);}
+  .tab.active-filter200{background:rgba(255,100,0,0.12);border-color:var(--orange);color:var(--orange);}
   .stats-bar{display:flex;gap:0;padding:8px 14px;background:var(--bg2);border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none;}
   .stat-item{flex-shrink:0;padding:0 12px;border-right:1px solid var(--border);text-align:center;}
   .stat-item:first-child{padding-left:0;}
@@ -145,6 +164,9 @@
   .wall-plan-item{background:var(--bg3);border-radius:6px;padding:4px 5px;text-align:center;}
   .wall-plan-label{font-size:8px;color:var(--text2);}
   .wall-plan-val{font-size:10px;font-weight:bold;margin-top:1px;}
+  .wall-plan-header{font-size:10px;font-weight:bold;margin-bottom:4px;letter-spacing:1px;}
+  .wall-plan-header.long-plan{color:var(--green);}
+  .wall-plan-header.short-plan{color:var(--red);}
   .tv-btn{background:rgba(68,136,255,0.1);border:1px solid rgba(68,136,255,0.3);color:var(--blue);font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 10px;border-radius:12px;cursor:pointer;letter-spacing:1px;text-decoration:none;display:inline-block;}
   .dca-btn{background:rgba(0,229,255,0.1);border:1px solid rgba(0,229,255,0.3);color:var(--accent);font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 10px;border-radius:12px;cursor:pointer;letter-spacing:1px;}
   .dca-btn:active,.tv-btn:active{opacity:0.7;}
@@ -162,14 +184,40 @@
   .side-btn.sel-short{background:rgba(255,51,102,0.15);border-color:var(--red);color:var(--red);}
   .calc-btn{width:100%;padding:13px;background:var(--accent);color:#000;font-family:'Share Tech Mono',monospace;font-size:14px;font-weight:bold;border:none;border-radius:8px;cursor:pointer;letter-spacing:2px;margin-top:4px;}
   .calc-btn:active{opacity:0.8;}
+  .filter200-banner{margin:6px 14px 0;background:rgba(255,100,0,0.07);border:1px solid rgba(255,100,0,0.25);border-radius:8px;padding:7px 12px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);letter-spacing:1px;display:none;}
+  .filter200-banner.active{display:block;}
 </style>
 </head>
-<body>
-<div class="header">
+<body> <div class="header">
   <div class="header-title">⬡ ПРОЕКТ СИГНАЛ</div>
   <div class="header-right">
     <div class="live-dot"></div>
     <button class="refresh-btn" onclick="loadAll()">↻ REFRESH</button>
+  </div>
+</div>
+<div class="market-row">
+  <div class="market-row-header">
+    <div class="market-row-title">🪙 КРИПТО ПАЗАР</div>
+    <div style="font-family:'Share Tech Mono',monospace;font-size:8px;color:var(--text2);" id="market-row-updated">--</div>
+  </div>
+  <div class="market-row-grid">
+    <div class="market-item"><div class="market-label">BTC.D</div><div class="market-value" id="mkt-btcd" style="color:var(--yellow)">--</div><div class="market-sub" id="mkt-btcd-chg">--</div></div>
+    <div class="market-item"><div class="market-label">ETH.D</div><div class="market-value" id="mkt-ethd" style="color:var(--blue)">--</div><div class="market-sub" id="mkt-ethd-chg">--</div></div>
+    <div class="market-item"><div class="market-label">TOTAL MCAP</div><div class="market-value" id="mkt-mcap" style="color:var(--accent)">--</div><div class="market-sub" id="mkt-mcap-chg">--</div></div>
+    <div class="market-item"><div class="market-label">FEAR &amp; GREED</div><div class="market-value" id="mkt-fg" style="color:var(--text)">--</div><div class="market-sub" id="mkt-fg-label">--</div></div>
+    <div class="market-item"><div class="market-label">ALT MCAP</div><div class="market-value" id="mkt-alt" style="color:var(--purple)">--</div><div class="market-sub" id="mkt-alt-chg">--</div></div>
+  </div>
+</div>
+<div class="macro-row">
+  <div class="macro-row-header">
+    <div class="macro-row-title">🌍 МАКРО ПАЗАР</div>
+    <div style="font-family:'Share Tech Mono',monospace;font-size:8px;color:var(--text2);" id="macro-row-updated">--</div>
+  </div>
+  <div class="macro-row-grid">
+    <div class="macro-item"><div class="macro-label">DXY</div><div class="macro-value" id="mac-dxy" style="color:var(--text)">--</div><div class="macro-sub" id="mac-dxy-chg">--</div></div>
+    <div class="macro-item"><div class="macro-label">ЗЛАТО</div><div class="macro-value" id="mac-gold" style="color:var(--yellow)">--</div><div class="macro-sub" id="mac-gold-chg">--</div></div>
+    <div class="macro-item"><div class="macro-label">VIX</div><div class="macro-value" id="mac-vix" style="color:var(--text)">--</div><div class="macro-sub" id="mac-vix-chg">--</div></div>
+    <div class="macro-item"><div class="macro-label">SP500</div><div class="macro-value" id="mac-sp" style="color:var(--green)">--</div><div class="macro-sub" id="mac-sp-chg">--</div></div>
   </div>
 </div>
 <div class="btc-macro" id="btc-macro-panel">
@@ -178,28 +226,13 @@
     <div class="btc-season-badge season-loading" id="season-badge">⏳ ЗАРЕЖДАНЕ</div>
   </div>
   <div class="btc-macro-grid">
-    <div class="btc-macro-item">
-      <div class="btc-macro-label">ATH %</div>
-      <div class="btc-macro-value" id="btc-ath-pct" style="color:var(--text2)">--</div>
-      <div class="btc-macro-sub" id="btc-price-val">--</div>
-    </div>
-    <div class="btc-macro-item">
-      <div class="btc-macro-label">ТРЕНД</div>
-      <div class="btc-macro-value" id="btc-cross" style="color:var(--text2)">--</div>
-      <div class="btc-macro-sub">50/200 DMA</div>
-    </div>
-    <div class="btc-macro-item">
-      <div class="btc-macro-label">MAYER</div>
-      <div class="btc-macro-value" id="btc-mayer" style="color:var(--text2)">--</div>
-      <div class="btc-macro-sub">Цена/200DMA</div>
-    </div>
-    <div class="btc-macro-item">
-      <div class="btc-macro-label">RSI 90D</div>
-      <div class="btc-macro-value" id="btc-rsi90" style="color:var(--text2)">--</div>
-      <div class="btc-macro-sub" id="btc-rsi-sub">--</div>
-    </div>
+    <div class="btc-macro-item"><div class="btc-macro-label">ATH %</div><div class="btc-macro-value" id="btc-ath-pct" style="color:var(--text2)">--</div><div class="btc-macro-sub" id="btc-price-val">--</div></div>
+    <div class="btc-macro-item"><div class="btc-macro-label">ТРЕНД</div><div class="btc-macro-value" id="btc-cross" style="color:var(--text2)">--</div><div class="btc-macro-sub">50/200 DMA</div></div>
+    <div class="btc-macro-item"><div class="btc-macro-label">MAYER</div><div class="btc-macro-value" id="btc-mayer" style="color:var(--text2)">--</div><div class="btc-macro-sub">Цена/200DMA</div></div>
+    <div class="btc-macro-item"><div class="btc-macro-label">RSI 90D</div><div class="btc-macro-value" id="btc-rsi90" style="color:var(--text2)">--</div><div class="btc-macro-sub" id="btc-rsi-sub">--</div></div>
   </div>
 </div>
+<div id="filter200-banner" class="filter200-banner">🔍 РЕЖИМ ТОП 200–500 · Филтър: -80% от ATH + OI↑ + Vol Spike · Зарежда бавно поради rate limit</div>
 <div class="search-bar">
   <input class="search-input" id="search-input" placeholder="🔍 ТЪРСИ МОНЕТА... (BTC, ETH, SOL)" oninput="handleSearch(this.value)">
 </div>
@@ -212,6 +245,7 @@
   <div class="tab" onclick="setFilter('squeeze',this)">⚡ SQUEEZE</div>
   <div class="tab" onclick="setFilter('bottom',this)">🟢 ДЪНО</div>
   <div class="tab" onclick="setFilter('top',this)">🔴 ВРЪХ</div>
+  <div class="tab" onclick="setFilter('filter200',this)">📊 ТОП 200+</div>
   <div class="tab" data-tab="dca" onclick="openDCAView()">🧮 DCA</div>
 </div>
 <div class="stats-bar">
@@ -267,34 +301,76 @@ const liqCache = {};
 const athCache = {};
 const klineCache = {};
 const wallCache = {};
-const oiPrevMap = {}; // 🔔 OI ОБРЪЩАНЕ: пази предишния знак на OI Δ15M между refresh-ите
+const oiPrevMap = {};
 
 function handleSearch(val) { searchQuery = val.toUpperCase().trim(); renderList(); }
-
 async function cgFetch(path) { const r = await fetch(`${WORKER_URL}${path}`); return r.json(); }
 
-async function fetchLiqLevels(symbol) {
+async function loadCryptoMarketRow() {
   try {
-    const sym = symbol.replace('USDT','');
-    const d = await cgFetch(`/api/futures/liquidation/aggregated-heatmap/model1?symbol=${sym}&range=3d`);
-    if (!d.data) return null; return d.data;
-  } catch(e) { return null; }
+    const r = await fetch('https://api.coingecko.com/api/v3/global');
+    const d = await r.json();
+    if (d && d.data) {
+      const g = d.data;
+      const btcD = g.market_cap_percentage?.btc;
+      const ethD = g.market_cap_percentage?.eth;
+      const totalMcap = g.total_market_cap?.usd;
+      const mcapChg = g.market_cap_change_percentage_24h_usd;
+      const btcMcap = totalMcap * (btcD/100);
+      const ethMcap = totalMcap * (ethD/100);
+      const altMcap = totalMcap - btcMcap - ethMcap;
+      const el = id => document.getElementById(id);
+      if (btcD != null) { el('mkt-btcd').textContent = btcD.toFixed(1)+'%'; el('mkt-btcd').style.color = btcD > 55 ? 'var(--red)' : btcD < 45 ? 'var(--green)' : 'var(--yellow)'; el('mkt-btcd-chg').textContent = 'доминанс'; }
+      if (ethD != null) { el('mkt-ethd').textContent = ethD.toFixed(1)+'%'; el('mkt-ethd-chg').textContent = 'доминанс'; }
+      if (totalMcap) { el('mkt-mcap').textContent = '$'+formatNum(totalMcap); const chgEl=el('mkt-mcap-chg'); chgEl.textContent=(mcapChg>=0?'+':'')+mcapChg.toFixed(1)+'%'; chgEl.style.color=mcapChg>=0?'var(--green)':'var(--red)'; }
+      if (altMcap) { el('mkt-alt').textContent = '$'+formatNum(altMcap); el('mkt-alt-chg').textContent = 'без BTC+ETH'; }
+    }
+    const fg = await fetch('https://api.alternative.me/fng/?limit=1');
+    const fgd = await fg.json();
+    if (fgd && fgd.data && fgd.data[0]) {
+      const val = parseInt(fgd.data[0].value);
+      const label = fgd.data[0].value_classification;
+      const el = document.getElementById('mkt-fg');
+      el.textContent = val;
+      el.style.color = val >= 75 ? 'var(--red)' : val >= 55 ? 'var(--green)' : val >= 40 ? 'var(--yellow)' : val >= 25 ? 'var(--orange)' : 'var(--red)';
+      document.getElementById('mkt-fg-label').textContent = label.toUpperCase();
+    }
+    document.getElementById('market-row-updated').textContent = new Date().toLocaleTimeString('bg');
+  } catch(e) { console.error('Market row error:', e); }
 }
 
-async function getLiqNearPrice(symbol, price) {
-  if (liqCache[symbol] && liqCache[symbol].ts > Date.now() - 300000) return liqCache[symbol].levels;
-  const data = await fetchLiqLevels(symbol); if (!data) return null;
-  const levels = data.y || []; const liqData = data.liq || [];
-  const combined = levels.map((p, i) => ({ price: parseFloat(p), amount: Array.isArray(liqData[i]) ? liqData[i].reduce((a,b) => a + parseFloat(b||0), 0) : parseFloat(liqData[i]||0) })).filter(l => l.amount > 0);
-  combined.sort((a,b) => b.amount - a.amount);
-  const top20 = combined.slice(0, 20);
-  const above = top20.filter(l => l.price > price).sort((a,b) => a.price - b.price).slice(0,2);
-  const below = top20.filter(l => l.price < price).sort((a,b) => b.price - a.price).slice(0,2);
-  const result = {above, below}; liqCache[symbol] = {levels: result, ts: Date.now()}; return result;
-}
-
-// ============ 📊 ORDER BOOK WALLS (Binance API, безплатно) ============
-async function fetchOrderBookWalls(symbol, price) {
+async function loadMacroRow() {
+  const symbols = [
+    { id: 'DX-Y.NYB', elVal: 'mac-dxy', elChg: 'mac-dxy-chg' },
+    { id: 'GC=F',     elVal: 'mac-gold', elChg: 'mac-gold-chg' },
+    { id: '%5EVIX',   elVal: 'mac-vix',  elChg: 'mac-vix-chg' },
+    { id: '%5EGSPC',  elVal: 'mac-sp',   elChg: 'mac-sp-chg' },
+  ];
+  for (const s of symbols) {
+    try {
+      const r = await fetch(`${WORKER_URL}/yahoo/${s.id}`);
+      const d = await r.json();
+      const result = d?.chart?.result?.[0];
+      if (!result) continue;
+      const meta = result.meta;
+      const price = meta.regularMarketPrice;
+      const prevClose = meta.previousClose || meta.chartPreviousClose;
+      const chgPct = prevClose ? ((price - prevClose) / prevClose) * 100 : null;
+      const valEl = document.getElementById(s.elVal);
+      const chgEl = document.getElementById(s.elChg);
+      if (valEl) {
+        valEl.textContent = price >= 1000 ? price.toLocaleString('en',{maximumFractionDigits:0}) : price >= 10 ? price.toFixed(2) : price.toFixed(3);
+        if (chgPct !== null) {
+          valEl.style.color = chgPct >= 0 ? 'var(--green)' : 'var(--red)';
+          chgEl.textContent = (chgPct >= 0 ? '+' : '') + chgPct.toFixed(2) + '%';
+          chgEl.style.color = chgPct >= 0 ? 'var(--green)' : 'var(--red)';
+        }
+      }
+    } catch(e) { console.error('Macro row error for', s.id, e); }
+    await new Promise(res => setTimeout(res, 300));
+  }
+  document.getElementById('macro-row-updated').textContent = new Date().toLocaleTimeString('bg');
+} async function fetchOrderBookWalls(symbol, price) {
   if (wallCache[symbol] && wallCache[symbol].ts > Date.now() - 120000) return wallCache[symbol].data;
   try {
     const r = await fetch(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=500`);
@@ -304,7 +380,6 @@ async function fetchOrderBookWalls(symbol, price) {
     const asks = d.asks.map(a => ({price: parseFloat(a[0]), usd: parseFloat(a[0])*parseFloat(a[1])}));
     const avgBid = bids.reduce((s,b)=>s+b.usd,0)/bids.length;
     const avgAsk = asks.reduce((s,a)=>s+a.usd,0)/asks.length;
-    // Стена = ниво поне 8х над средното за книгата
     const buyWalls = bids.filter(b => b.usd > avgBid*8).sort((a,b)=>b.usd-a.usd).slice(0,2);
     const sellWalls = asks.filter(a => a.usd > avgAsk*8).sort((a,b)=>b.usd-a.usd).slice(0,2);
     const buyWall = buyWalls.length ? buyWalls.sort((a,b)=>b.price-a.price)[0] : null;
@@ -328,11 +403,14 @@ async function loadWalls() {
       const bw = walls.buyWall, sw = walls.sellWall;
       let rows = `<div class="wall-row"><span style="color:var(--text2)">📊 ORDER BOOK СТЕНИ</span><span style="color:var(--text2)">limit 500</span></div>`;
       rows += `<div class="wall-row"><span style="color:var(--red)">🟥 Sell Wall: ${sw?'$'+formatPrice(sw.price)+' ('+formatNum(sw.usd)+')':'--'}</span><span style="color:var(--green)">🟩 Buy Wall: ${bw?'$'+formatPrice(bw.price)+' ('+formatNum(bw.usd)+')':'--'}</span></div>`;
-      // План: вход малко над Buy Wall, цел малко преди Sell Wall, SL под Buy Wall (огледално за SHORT)
       if (bw && sw && (sig.signal==='LONG'||sig.signal==='SHORT')) {
         let entry, target, sl;
-        if (sig.signal==='LONG') { entry=bw.price*1.003; target=sw.price*0.997; sl=bw.price*0.99; }
+        const isLong = sig.signal === 'LONG';
+        if (isLong) { entry=bw.price*1.003; target=sw.price*0.997; sl=bw.price*0.99; }
         else { entry=sw.price*0.997; target=bw.price*1.003; sl=sw.price*1.01; }
+        const planLabel = isLong ? '▲ ЛОНГ ПЛАН' : '▼ ШОРТ ПЛАН';
+        const planClass = isLong ? 'long-plan' : 'short-plan';
+        rows += `<div class="wall-plan-header ${planClass}">${planLabel}</div>`;
         rows += `<div class="wall-plan">
           <div class="wall-plan-item"><div class="wall-plan-label">ВХОД</div><div class="wall-plan-val" style="color:var(--accent)">$${formatPrice(entry)}</div></div>
           <div class="wall-plan-item"><div class="wall-plan-label">ЦЕЛ</div><div class="wall-plan-val" style="color:var(--green)">$${formatPrice(target)}</div></div>
@@ -342,6 +420,47 @@ async function loadWalls() {
       wallEl.innerHTML = rows;
     } catch(e) { wallEl.innerHTML = `<span style="color:var(--text2)">📊 СТЕНИ: --</span>`; }
   }
+}
+
+async function fetchTop200Coins() {
+  const allCoinsRaw = [];
+  for (let page = 1; page <= 5; page++) {
+    try {
+      const r = await fetch(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=${page}&sparkline=false&price_change_percentage=24h`);
+      const d = await r.json();
+      if (Array.isArray(d)) allCoinsRaw.push(...d);
+    } catch(e) { console.error('Top200 page error:', page, e); }
+    await new Promise(res => setTimeout(res, 2500));
+  }
+  return allCoinsRaw;
+}
+
+async function loadFilter200() {
+  const content = document.getElementById('main-content');
+  content.innerHTML = `<div class="loading">ЗАРЕЖДАНЕ ТОП 200–500 МОНЕТИ...<br><span style="font-size:10px;color:var(--text2)">Бавно поради rate limit (5 страници × 2.5s)</span><div class="loading-bar"><div class="loading-fill"></div></div></div>`;
+  const geckoCoins = await fetchTop200Coins();
+  const filtered200 = geckoCoins.filter((c, idx) => {
+    const athChg = c.ath_change_percentage;
+    return idx >= 50 && athChg != null && athChg <= -80;
+  });
+  if (filtered200.length === 0) { content.innerHTML = `<div class="no-results">НЯМА МОНЕТИ СЪС -80% ОТ ATH В ТОП 200-500</div>`; return; }
+  const results = [];
+  for (const gc of filtered200.slice(0, 60)) {
+    const sym = gc.symbol.toUpperCase() + 'USDT';
+    try {
+      const coin = await fetchCoinData(sym);
+      if (!coin) continue;
+      coin.pctFromAth = gc.ath_change_percentage;
+      coin.marketCap = gc.market_cap;
+      if (coin.oiDelta > 0 && coin.volSpike) results.push(coin);
+    } catch(e) {}
+    await new Promise(res => setTimeout(res, 200));
+  }
+  allCoins = [...allCoins.filter(c => !results.find(r => r.fullSymbol === c.fullSymbol)), ...results];
+  if (results.length === 0) { content.innerHTML = `<div class="no-results">НЯМА МОНЕТИ С ВСИЧКИ ФИЛТРИ (-80% ATH + OI↑ + VOL SPIKE)</div>`; return; }
+  const html = results.map((c, i) => renderCard(c, i)).join('');
+  content.innerHTML = `<div style="padding:8px 14px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);">📊 ${results.length} МОНЕТИ · -80% ATH + OI↑ + VOL SPIKE</div><div class="coins-list">${html}</div>`;
+  loadLiqLevels(); loadWalls();
 }
 
 const BASE_SYMBOLS = [
@@ -401,21 +520,11 @@ async function loadBTCMacro() {
     athEl.style.color = athPct > -20 ? 'var(--red)' : athPct > -50 ? 'var(--yellow)' : 'var(--green)';
     document.getElementById('btc-price-val').textContent = '$' + formatPrice(currentPrice);
     const crossEl = document.getElementById('btc-cross');
-    if (dma50 && dma200) {
-      crossEl.textContent = dma50 > dma200 ? '🟡 GOLDEN' : '💀 DEATH';
-      crossEl.style.color = dma50 > dma200 ? 'var(--yellow)' : 'var(--red)';
-    }
+    if (dma50 && dma200) { crossEl.textContent = dma50 > dma200 ? '🟡 GOLDEN' : '💀 DEATH'; crossEl.style.color = dma50 > dma200 ? 'var(--yellow)' : 'var(--red)'; }
     const mayerEl = document.getElementById('btc-mayer');
-    if (mayer) {
-      mayerEl.textContent = mayer.toFixed(2);
-      mayerEl.style.color = mayer > 2.4 ? 'var(--red)' : mayer < 1 ? 'var(--green)' : 'var(--yellow)';
-    }
+    if (mayer) { mayerEl.textContent = mayer.toFixed(2); mayerEl.style.color = mayer > 2.4 ? 'var(--red)' : mayer < 1 ? 'var(--green)' : 'var(--yellow)'; }
     const rsiEl = document.getElementById('btc-rsi90');
-    if (rsi90) {
-      rsiEl.textContent = rsi90.toFixed(0);
-      rsiEl.style.color = rsi90 > 70 ? 'var(--red)' : rsi90 < 35 ? 'var(--green)' : 'var(--yellow)';
-      document.getElementById('btc-rsi-sub').textContent = rsi90 > 70 ? 'ПРЕГРЯЛО' : rsi90 < 35 ? 'OVERSOLD' : 'НЕУТРАЛЕН';
-    }
+    if (rsi90) { rsiEl.textContent = rsi90.toFixed(0); rsiEl.style.color = rsi90 > 70 ? 'var(--red)' : rsi90 < 35 ? 'var(--green)' : 'var(--yellow)'; document.getElementById('btc-rsi-sub').textContent = rsi90 > 70 ? 'ПРЕГРЯЛО' : rsi90 < 35 ? 'OVERSOLD' : 'НЕУТРАЛЕН'; }
     updateSeasonBadge(dma50, dma200, mayer, rsi90, athPct);
   } catch(e) { console.error('BTC Macro error:', e); }
 }
@@ -478,6 +587,26 @@ async function fetchOIDelta(symbol) {
   } catch(e) { return 0; }
 }
 
+async function fetchLiqLevels(symbol) {
+  try {
+    const sym = symbol.replace('USDT','');
+    const d = await cgFetch(`/api/futures/liquidation/aggregated-heatmap/model1?symbol=${sym}&range=3d`);
+    if (!d.data) return null; return d.data;
+  } catch(e) { return null; }
+}
+
+async function getLiqNearPrice(symbol, price) {
+  if (liqCache[symbol] && liqCache[symbol].ts > Date.now() - 300000) return liqCache[symbol].levels;
+  const data = await fetchLiqLevels(symbol); if (!data) return null;
+  const levels = data.y || []; const liqData = data.liq || [];
+  const combined = levels.map((p, i) => ({ price: parseFloat(p), amount: Array.isArray(liqData[i]) ? liqData[i].reduce((a,b) => a + parseFloat(b||0), 0) : parseFloat(liqData[i]||0) })).filter(l => l.amount > 0);
+  combined.sort((a,b) => b.amount - a.amount);
+  const top20 = combined.slice(0, 20);
+  const above = top20.filter(l => l.price > price).sort((a,b) => a.price - b.price).slice(0,2);
+  const below = top20.filter(l => l.price < price).sort((a,b) => b.price - a.price).slice(0,2);
+  const result = {above, below}; liqCache[symbol] = {levels: result, ts: Date.now()}; return result;
+}
+
 const geckoIdMap = {
   'BTCUSDT':'bitcoin','ETHUSDT':'ethereum','SOLUSDT':'solana','BNBUSDT':'binancecoin','XRPUSDT':'ripple',
   'DOGEUSDT':'dogecoin','ADAUSDT':'cardano','AVAXUSDT':'avalanche-2','LINKUSDT':'chainlink','DOTUSDT':'polkadot',
@@ -522,7 +651,6 @@ async function fetchCoinData(symbol) {
     const shortPct = 100 - longPct;
     const oi = oiR.openInterest ? parseFloat(oiR.openInterest)*price : 0;
     const sym = symbol.replace('USDT','');
-    // 🔔 OI ОБРЪЩАНЕ: сравни предишния знак с новия
     let oiFlip = null;
     const prevDelta = oiPrevMap[symbol];
     if (prevDelta !== undefined && Math.abs(oiDelta) > 0.1) {
@@ -617,9 +745,6 @@ function detectTop(coin) {
   return score >= 4;
 }
 
-// ============ 🎯 SETUP QUALITY ТОЧКОВА СИСТЕМА ============
-// ЛОНГ точки: Funding<0%, Long%<45%, OI Δ15M>+2%, Сигнал=LONG, GOLDEN X, Дъно детектор
-// ШОРТ точки: Funding>0.08%, Long%>70%, OI пада при pump, Сигнал=SHORT, DEATH X, Връх детектор
 function calcSetupQuality(coin) {
   const sig = calcSignal(coin);
   let longPts = 0, shortPts = 0;
@@ -631,7 +756,7 @@ function calcSetupQuality(coin) {
   if (detectBottom(coin)) longPts++;
   if (coin.funding > 0.08) shortPts++;
   if (coin.longPct > 70) shortPts++;
-  if (coin.chg24 > 5 && coin.oiDelta < 0) shortPts++; // OI пада при pump
+  if (coin.chg24 > 5 && coin.oiDelta < 0) shortPts++;
   if (sig.signal === 'SHORT') shortPts++;
   if (coin.goldenCross === false) shortPts++;
   if (detectTop(coin)) shortPts++;
@@ -676,9 +801,7 @@ function formatOIDelta(delta) {
   return `<span style="color:${delta>0?'var(--green)':'var(--red)'}">${delta>0?'▲':'▼'}${Math.abs(delta).toFixed(2)}%</span>`;
 }
 
-function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=BINANCE:${symbol}.P`; }
-
-function renderCard(coin, idx) {
+function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=BINANCE:${symbol}.P`; } function renderCard(coin, idx) {
   const sig = calcSignal(coin); const manip = isManipulable(coin);
   const isBottom = detectBottom(coin); const isTop = detectTop(coin);
   const setup = calcSetupQuality(coin);
@@ -705,7 +828,6 @@ function renderCard(coin, idx) {
   if (coin.oiDelta > 2) tags.push(`<span class="tag tag-oi-up">OI↑ ${coin.oiDelta.toFixed(1)}%</span>`);
   if (coin.oiDelta < -2) tags.push(`<span class="tag tag-oi-down">OI↓ ${Math.abs(coin.oiDelta).toFixed(1)}%</span>`);
   const detectorBanner = isBottom ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>` : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding.toFixed(3)}% · L/S>${coin.longPct.toFixed(0)}% · OI↓</div>` : '';
-  // 🎯 SETUP QUALITY банер с точки
   let setupBanner = '';
   if (setup.label) {
     const ptClass = setup.grade==='setup' ? (setup.side==='long'?'on-l':'on-s') : 'on-w';
@@ -772,6 +894,9 @@ function setFilter(filter, el) {
   document.querySelectorAll('.tab').forEach(t => t.className='tab');
   el.className = `tab active-${filter}`;
   document.getElementById('search-input').value = ''; searchQuery = '';
+  const banner = document.getElementById('filter200-banner');
+  if (filter === 'filter200') { banner.classList.add('active'); loadFilter200(); return; }
+  else { banner.classList.remove('active'); }
   renderList(); loadLiqLevels(); loadWalls();
 }
 
@@ -811,9 +936,7 @@ function renderList() {
     else if (currentFilter !== 'all') filtered = allCoins.filter(c => calcSignal(c).signal.toLowerCase() === currentFilter);
   }
   filtered.sort((a,b) => {
-    // 🔔 OI обръщане винаги най-горе
     if (a.oiFlip && !b.oiFlip) return -1; if (b.oiFlip && !a.oiFlip) return 1;
-    // 🎯 SETUP QUALITY: по-висок резултат по-нагоре
     const sqA = calcSetupQuality(a), sqB = calcSetupQuality(b);
     if (sqA.grade==='setup' && sqB.grade!=='setup') return -1;
     if (sqB.grade==='setup' && sqA.grade!=='setup') return 1;
@@ -861,10 +984,11 @@ async function loadAll() {
     const now = new Date();
     document.getElementById('last-update').textContent = `ОБНОВЕНО: ${now.toLocaleTimeString('bg')} · AUTO 30s · ${allCoins.length} МОНЕТИ`;
     loadBTCMacro(); loadAthAtlAsync(); loadKlinesAsync();
+    loadCryptoMarketRow(); loadMacroRow();
   } catch(e) { document.getElementById('main-content').innerHTML = `<div class="error-msg">ГРЕШКА ПРИ ЗАРЕЖДАНЕ<br>${e.message}</div>`; }
 }
 
-function startAutoRefresh() { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = setInterval(loadAll, 30000); }
+function startAutoRefresh() { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = setInterval(() => { loadAll(); loadCryptoMarketRow(); loadMacroRow(); }, 30000); }
 loadAll(); startAutoRefresh();
 
 function calcLiquidationPrice(entryPrice, avgPrice, totalSize, leverage, side) {
@@ -887,7 +1011,6 @@ function calcDCALevels(entryPrice, side) {
     const liqPrice=calcLiquidationPrice(entryPrice,avgPrice,totalUSDT,DCA_LEVERAGE,side);
     steps.push({step:i+1,label:`DCA ${i+1}`,addAmount,totalUSDT,levelPrice,avgPrice,liqPrice,safeOrder:side==='long'?liqPrice*1.02:liqPrice*0.98,pctFromEntry:drop*100});
   });
-  // 🔧 DCA 3 КОРЕКЦИЯ: -35% от цената на DCA 2 (не от входната цена). Огледално за SHORT: +35% от DCA 2.
   const dca3Amount=DCA_ENTRY*8;
   const dca3Price=side==='long'?dca2LevelPrice*(1-0.35):dca2LevelPrice*(1+0.35);
   totalUSDT+=dca3Amount; totalQty+=dca3Amount/dca3Price;
