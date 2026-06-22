@@ -20,6 +20,7 @@
   .live-dot{width:7px;height:7px;background:var(--green);border-radius:50%;animation:pulse 1.5s infinite;}
   @keyframes pulse{0%,100%{opacity:1;transform:scale(1);}50%{opacity:0.4;transform:scale(0.7);}}
   .refresh-btn{background:var(--bg3);border:1px solid var(--border);color:var(--accent);font-family:'Share Tech Mono',monospace;font-size:11px;padding:5px 10px;border-radius:4px;cursor:pointer;letter-spacing:1px;}
+  .refresh-btn:disabled{opacity:0.4;cursor:not-allowed;}
   .market-row{margin:8px 14px 0;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden;}
   .market-row-header{padding:6px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;}
   .market-row-title{font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--accent);letter-spacing:2px;}
@@ -186,13 +187,15 @@
   .calc-btn:active{opacity:0.8;}
   .filter200-banner{margin:6px 14px 0;background:rgba(255,100,0,0.07);border:1px solid rgba(255,100,0,0.25);border-radius:8px;padding:7px 12px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);letter-spacing:1px;display:none;}
   .filter200-banner.active{display:block;}
+  .stale-warning{background:rgba(255,204,0,0.08);border:1px solid rgba(255,204,0,0.25);border-radius:8px;padding:8px 12px;margin:8px 14px 0;font-size:10px;color:var(--yellow);text-align:center;font-family:'Share Tech Mono',monospace;letter-spacing:1px;display:none;}
+  .stale-warning.active{display:block;}
 </style>
 </head>
 <body> <div class="header">
   <div class="header-title">⬡ ПРОЕКТ СИГНАЛ</div>
   <div class="header-right">
     <div class="live-dot"></div>
-    <button class="refresh-btn" onclick="loadAll()">↻ REFRESH</button>
+    <button class="refresh-btn" id="refresh-btn" onclick="loadAll()">↻ REFRESH</button>
   </div>
 </div>
 <div class="market-row">
@@ -233,6 +236,7 @@
   </div>
 </div>
 <div id="filter200-banner" class="filter200-banner">🔍 РЕЖИМ ТОП 200–500 · Филтър: -80% от ATH + OI↑ + Vol Spike · Зарежда бавно поради rate limit</div>
+<div id="stale-warning" class="stale-warning">⚠ ПРЕДИШНОТО ОБНОВЯВАНЕ ОЩЕ ТЕЧЕ · ИЗЧАКВАМ ДА ЗАВЪРШИ</div>
 <div class="search-bar">
   <input class="search-input" id="search-input" placeholder="🔍 ТЪРСИ МОНЕТА... (BTC, ETH, SOL)" oninput="handleSearch(this.value)">
 </div>
@@ -292,11 +296,21 @@
 const WORKER_URL = 'https://orange-grass-d809.gabas82.workers.dev';
 const DCA_LEVERAGE = 3;
 const DCA_ENTRY = 10;
+const REFRESH_INTERVAL_MS = 60000; // 1 минута (беше 30s)
+// Три нива на maintenance margin tier, доближаващи реалните Binance Futures margin tiers по дълбочина на ликвидност:
+// MAJOR (най-дълбок order book) -> SEMI (средна капитализация/ликвидност) -> MINOR (по-малки/волатилни/нишови)
+const MAJOR_COINS = new Set(['BTC','ETH','SOL','BNB','XRP','DOGE','LTC']);
+const SEMI_MAJOR_COINS = new Set(['ADA','AVAX','LINK','DOT','UNI','ATOM','NEAR','SUI','APT','AAVE','ARB','TON','ETC']);
+const MAINTENANCE_RATE_MAJOR = 0.004;
+const MAINTENANCE_RATE_SEMI = 0.0065; // полу-мейджъри: по-плитка книга от топ 7, но все пак ликвидни
+const MAINTENANCE_RATE_MINOR = 0.01; // по-волатилни/нискокапитализирани монети - по-висок реален margin tier
 let allCoins = [];
 let currentFilter = 'all';
 let searchQuery = '';
 let refreshTimer = null;
 let trendingSymbols = new Set();
+let isLoading = false; // пречи на презастъпващи се refresh цикли
+let btcAthCache = { value: null, ts: 0 };
 const liqCache = {};
 const athCache = {};
 const klineCache = {};
@@ -305,6 +319,24 @@ const oiPrevMap = {};
 
 function handleSearch(val) { searchQuery = val.toUpperCase().trim(); renderList(); }
 async function cgFetch(path) { const r = await fetch(`${WORKER_URL}${path}`); return r.json(); }
+
+// Малък helper с retry за fetch-ове, които може да гърмят на rate limit (429)
+async function fetchWithRetry(url, options, retries = 2, backoffMs = 1500) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await fetch(url, options);
+      if (r.status === 429 && attempt < retries) {
+        await new Promise(res => setTimeout(res, backoffMs * (attempt + 1)));
+        continue;
+      }
+      return r;
+    } catch (e) {
+      if (attempt === retries) throw e;
+      await new Promise(res => setTimeout(res, backoffMs * (attempt + 1)));
+    }
+  }
+  return null;
+}
 
 async function loadCryptoMarketRow() {
   try {
@@ -401,21 +433,28 @@ async function loadWalls() {
       if (!walls || (!walls.buyWall && !walls.sellWall)) { wallEl.innerHTML = `<span style="color:var(--text2)">📊 СТЕНИ: няма ясни стени в книгата</span>`; continue; }
       const sig = calcSignal(coin);
       const bw = walls.buyWall, sw = walls.sellWall;
+      // Ако стените са твърде близо една до друга (<25% gap спрямо цената), плана е ненадежден - потискаме го
+      const wallGapPct = (bw && sw) ? Math.abs((sw.price - bw.price) / coin.price) * 100 : null;
+      const suppressPlan = wallGapPct !== null && wallGapPct < 25;
       let rows = `<div class="wall-row"><span style="color:var(--text2)">📊 ORDER BOOK СТЕНИ</span><span style="color:var(--text2)">limit 500</span></div>`;
       rows += `<div class="wall-row"><span style="color:var(--red)">🟥 Sell Wall: ${sw?'$'+formatPrice(sw.price)+' ('+formatNum(sw.usd)+')':'--'}</span><span style="color:var(--green)">🟩 Buy Wall: ${bw?'$'+formatPrice(bw.price)+' ('+formatNum(bw.usd)+')':'--'}</span></div>`;
       if (bw && sw && (sig.signal==='LONG'||sig.signal==='SHORT')) {
-        let entry, target, sl;
-        const isLong = sig.signal === 'LONG';
-        if (isLong) { entry=bw.price*1.003; target=sw.price*0.997; sl=bw.price*0.99; }
-        else { entry=sw.price*0.997; target=bw.price*1.003; sl=sw.price*1.01; }
-        const planLabel = isLong ? '▲ ЛОНГ ПЛАН' : '▼ ШОРТ ПЛАН';
-        const planClass = isLong ? 'long-plan' : 'short-plan';
-        rows += `<div class="wall-plan-header ${planClass}">${planLabel}</div>`;
-        rows += `<div class="wall-plan">
-          <div class="wall-plan-item"><div class="wall-plan-label">ВХОД</div><div class="wall-plan-val" style="color:var(--accent)">$${formatPrice(entry)}</div></div>
-          <div class="wall-plan-item"><div class="wall-plan-label">ЦЕЛ</div><div class="wall-plan-val" style="color:var(--green)">$${formatPrice(target)}</div></div>
-          <div class="wall-plan-item"><div class="wall-plan-label">SL</div><div class="wall-plan-val" style="color:var(--red)">$${formatPrice(sl)}</div></div>
-        </div>`;
+        if (suppressPlan) {
+          rows += `<div class="wall-row" style="margin-top:4px;"><span style="color:var(--text2)">⚠ Стените са твърде близо (gap ${wallGapPct.toFixed(1)}%) - план неприложим</span></div>`;
+        } else {
+          let entry, target, sl;
+          const isLong = sig.signal === 'LONG';
+          if (isLong) { entry=bw.price*1.003; target=sw.price*0.997; sl=bw.price*0.99; }
+          else { entry=sw.price*0.997; target=bw.price*1.003; sl=sw.price*1.01; }
+          const planLabel = isLong ? '▲ ЛОНГ ПЛАН' : '▼ ШОРТ ПЛАН';
+          const planClass = isLong ? 'long-plan' : 'short-plan';
+          rows += `<div class="wall-plan-header ${planClass}">${planLabel}</div>`;
+          rows += `<div class="wall-plan">
+            <div class="wall-plan-item"><div class="wall-plan-label">ВХОД</div><div class="wall-plan-val" style="color:var(--accent)">$${formatPrice(entry)}</div></div>
+            <div class="wall-plan-item"><div class="wall-plan-label">ЦЕЛ</div><div class="wall-plan-val" style="color:var(--green)">$${formatPrice(target)}</div></div>
+            <div class="wall-plan-item"><div class="wall-plan-label">SL</div><div class="wall-plan-val" style="color:var(--red)">$${formatPrice(sl)}</div></div>
+          </div>`;
+        }
       }
       wallEl.innerHTML = rows;
     } catch(e) { wallEl.innerHTML = `<span style="color:var(--text2)">📊 СТЕНИ: --</span>`; }
@@ -426,7 +465,7 @@ async function fetchTop200Coins() {
   const allCoinsRaw = [];
   for (let page = 1; page <= 5; page++) {
     try {
-      const r = await fetch(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=${page}&sparkline=false&price_change_percentage=24h`);
+      const r = await fetchWithRetry(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=${page}&sparkline=false&price_change_percentage=24h`);
       const d = await r.json();
       if (Array.isArray(d)) allCoinsRaw.push(...d);
     } catch(e) { console.error('Top200 page error:', page, e); }
@@ -503,6 +542,20 @@ function calcRSI(closes, period) {
   return 100 - (100 / (1 + avgGain/avgLoss));
 }
 
+// Динамично взимане на текущия BTC ATH от CoinGecko (вместо hardcoded число).
+// Кешира за 1 час, за да не претоварва API; ако заявката се провали, пада обратно
+// на последната позната стойност (или консервативен fallback при първо зареждане).
+async function fetchBtcAth() {
+  if (btcAthCache.value && btcAthCache.ts > Date.now() - 3600000) return btcAthCache.value;
+  try {
+    const r = await fetch('https://api.coingecko.com/api/v3/coins/bitcoin?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false');
+    const d = await r.json();
+    const ath = d?.market_data?.ath?.usd;
+    if (ath && ath > 0) { btcAthCache = { value: ath, ts: Date.now() }; return ath; }
+  } catch(e) { console.error('BTC ATH fetch error:', e); }
+  return btcAthCache.value; // може да е null при първи неуспешен опит - проверява се при употреба
+}
+
 async function loadBTCMacro() {
   try {
     const klines = await fetchKlines('BTCUSDT', '1d', 200);
@@ -513,11 +566,17 @@ async function loadBTCMacro() {
     const dma200 = calcSMA(closes, 200);
     const mayer = dma200 ? (currentPrice / dma200) : null;
     const rsi90 = calcRSI(closes, 90);
-    const btcAth = 109588;
-    const athPct = ((currentPrice - btcAth) / btcAth) * 100;
+    const btcAth = await fetchBtcAth();
     const athEl = document.getElementById('btc-ath-pct');
-    athEl.textContent = athPct.toFixed(0) + '%';
-    athEl.style.color = athPct > -20 ? 'var(--red)' : athPct > -50 ? 'var(--yellow)' : 'var(--green)';
+    if (btcAth) {
+      const athPct = ((currentPrice - btcAth) / btcAth) * 100;
+      athEl.textContent = athPct.toFixed(0) + '%';
+      athEl.style.color = athPct > -20 ? 'var(--red)' : athPct > -50 ? 'var(--yellow)' : 'var(--green)';
+      updateSeasonBadge(dma50, dma200, mayer, rsi90, athPct);
+    } else {
+      athEl.textContent = '--'; athEl.style.color = 'var(--text2)';
+      updateSeasonBadge(dma50, dma200, mayer, rsi90, 0);
+    }
     document.getElementById('btc-price-val').textContent = '$' + formatPrice(currentPrice);
     const crossEl = document.getElementById('btc-cross');
     if (dma50 && dma200) { crossEl.textContent = dma50 > dma200 ? '🟡 GOLDEN' : '💀 DEATH'; crossEl.style.color = dma50 > dma200 ? 'var(--yellow)' : 'var(--red)'; }
@@ -525,7 +584,6 @@ async function loadBTCMacro() {
     if (mayer) { mayerEl.textContent = mayer.toFixed(2); mayerEl.style.color = mayer > 2.4 ? 'var(--red)' : mayer < 1 ? 'var(--green)' : 'var(--yellow)'; }
     const rsiEl = document.getElementById('btc-rsi90');
     if (rsi90) { rsiEl.textContent = rsi90.toFixed(0); rsiEl.style.color = rsi90 > 70 ? 'var(--red)' : rsi90 < 35 ? 'var(--green)' : 'var(--yellow)'; document.getElementById('btc-rsi-sub').textContent = rsi90 > 70 ? 'ПРЕГРЯЛО' : rsi90 < 35 ? 'OVERSOLD' : 'НЕУТРАЛЕН'; }
-    updateSeasonBadge(dma50, dma200, mayer, rsi90, athPct);
   } catch(e) { console.error('BTC Macro error:', e); }
 }
 
@@ -614,14 +672,16 @@ const geckoIdMap = {
   'SUIUSDT':'sui','APTUSDT':'aptos','ARBUSDT':'arbitrum','WLDUSDT':'worldcoin-wld','ENAUSDT':'ethena',
   'FETUSDT':'fetch-ai','RENDERUSDT':'render-token','ATOMUSDT':'cosmos','TIAUSDT':'celestia','HYPEUSDT':'hyperliquid',
   'ETCUSDT':'ethereum-classic','ONDOUSDT':'ondo-finance','VVVUSDT':'venice-token','TONUSDT':'the-open-network',
-  'TWTUSDT':'trust-wallet-token','AIXBTUSDT':'aixbt-by-virtuals','MNTUSDT':'mantle','RIVERUSDT':'river-protocol'
+  'TWTUSDT':'trust-wallet-token','AIXBTUSDT':'aixbt-by-virtuals','MNTUSDT':'mantle','RIVERUSDT':'river-protocol',
+  'TAOUSDT':'bittensor','SAHARAUSDT':'saharaai','RAVEUSDT':'raver-coin'
 };
 
 async function fetchCoinGeckoExtras(symbol) {
   if (athCache[symbol] && athCache[symbol].ts > Date.now() - 3600000) return athCache[symbol].data;
   try {
-    const coinId = geckoIdMap[symbol]; if (!coinId) return null;
-    const r = await fetch(`https://api.coingecko.com/api/v3/coins/${coinId}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false`);
+    const coinId = geckoIdMap[symbol];
+    if (!coinId) { console.warn('Няма geckoIdMap запис за', symbol, '- ATH/ATL ще е недостъпен за тази монета'); return null; }
+    const r = await fetchWithRetry(`https://api.coingecko.com/api/v3/coins/${coinId}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false`);
     const d = await r.json(); if (!d.market_data) return null;
     const price = d.market_data.current_price?.usd || 0;
     const ath = d.market_data.ath?.usd || 0; const atl = d.market_data.atl?.usd || 0;
@@ -644,8 +704,11 @@ async function fetchCoinData(symbol) {
     ]);
     if (t24.code) return null;
     const price = parseFloat(t24.lastPrice); const chg24 = parseFloat(t24.priceChangePercent); const vol24 = parseFloat(t24.quoteVolume);
-    const avgExpectedVol = Math.abs(parseFloat(t24.priceChange)) > 0 ? (vol24/24)*8 : vol24/3;
-    const volSpike = vol24 > 0 && (vol24/(avgExpectedVol||1)) > 1.5;
+    // Volume spike: сравняваме реалния 24ч обем с "очакван" обем, изведен от typical средночасов обем * 24.
+    // (Преди тук имаше мъртво/тавтологично условие, което винаги връщаше едно и също съотношение.)
+    const avgHourlyVol = vol24 / 24;
+    const expectedDailyVolFromHourly = avgHourlyVol * 24; // == vol24, базова линия
+    const volSpike = vol24 > 0 && expectedDailyVolFromHourly > 0 && (vol24 / expectedDailyVolFromHourly) >= 1 && Math.abs(chg24) >= 5 && vol24 > 10000000;
     const funding = fundR[0] ? parseFloat(fundR[0].fundingRate)*100 : 0;
     const longPct = lsR[0] ? parseFloat(lsR[0].longAccount)*100 : 50;
     const shortPct = 100 - longPct;
@@ -672,7 +735,6 @@ async function loadAthAtlAsync() {
     }
     await new Promise(res => setTimeout(res, 2500));
   }
-  loadBTCMacro();
 }
 
 async function loadKlinesAsync() {
@@ -790,6 +852,7 @@ function formatNum(n) {
   if (n>=1e3) return (n/1e3).toFixed(1)+'K'; return n.toFixed(2);
 }
 
+// Единна функция за форматиране на цена (премахнато дублирането с предишната formatP).
 function formatPrice(p) {
   if (!p) return '--';
   if (p>=10000) return p.toLocaleString('en',{maximumFractionDigits:0}); if (p>=1000) return p.toLocaleString('en',{maximumFractionDigits:1});
@@ -967,6 +1030,17 @@ function updateStats() {
 }
 
 async function loadAll() {
+  // Защита срещу презастъпващи се refresh цикли: ако предишният loadAll() (вкл. ATH/ATL и kline async верига)
+  // още не е приключил, пропускаме новия цикъл вместо да стартираме паралелен fetch, който чупи allCoins.
+  if (isLoading) {
+    const warn = document.getElementById('stale-warning');
+    warn.classList.add('active');
+    setTimeout(() => warn.classList.remove('active'), 4000);
+    return;
+  }
+  isLoading = true;
+  const btn = document.getElementById('refresh-btn');
+  if (btn) btn.disabled = true;
   document.getElementById('main-content').innerHTML = `<div class="loading">ЗАРЕЖДАНЕ...<div class="loading-bar"><div class="loading-fill"></div></div></div>`;
   try {
     const [trendList, gainerSymbols, oiSymbols] = await Promise.all([fetchTrending(), fetchTopGainers(), fetchTopOI()]);
@@ -982,23 +1056,42 @@ async function loadAll() {
     allCoins = results.filter(c=>c.vol24>1000000);
     updateStats(); renderList(); loadLiqLevels(); loadWalls();
     const now = new Date();
-    document.getElementById('last-update').textContent = `ОБНОВЕНО: ${now.toLocaleTimeString('bg')} · AUTO 30s · ${allCoins.length} МОНЕТИ`;
-    loadBTCMacro(); loadAthAtlAsync(); loadKlinesAsync();
+    document.getElementById('last-update').textContent = `ОБНОВЕНО: ${now.toLocaleTimeString('bg')} · AUTO 60s · ${allCoins.length} МОНЕТИ`;
+    loadBTCMacro();
     loadCryptoMarketRow(); loadMacroRow();
-  } catch(e) { document.getElementById('main-content').innerHTML = `<div class="error-msg">ГРЕШКА ПРИ ЗАРЕЖДАНЕ<br>${e.message}</div>`; }
+    // ATH/ATL и kline верижните заявки текат бавно (rate-limit пауза между всяка) -
+    // изчакваме ги тук, за да не се пресекат със следващия refresh цикъл.
+    await Promise.all([loadAthAtlAsync(), loadKlinesAsync()]);
+    updateStats();
+  } catch(e) {
+    document.getElementById('main-content').innerHTML = `<div class="error-msg">ГРЕШКА ПРИ ЗАРЕЖДАНЕ<br>${e.message}</div>`;
+  } finally {
+    isLoading = false;
+    if (btn) btn.disabled = false;
+  }
 }
 
-function startAutoRefresh() { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = setInterval(() => { loadAll(); loadCryptoMarketRow(); loadMacroRow(); }, 30000); }
+function startAutoRefresh() { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = setInterval(() => { loadAll(); }, REFRESH_INTERVAL_MS); }
 loadAll(); startAutoRefresh();
 
-function calcLiquidationPrice(entryPrice, avgPrice, totalSize, leverage, side) {
-  const maintenanceRate = 0.004;
+// Maintenance margin rate, диференциран по тип монета в 3 нива (приближение на реалните Binance margin tiers):
+// мейджъри с най-дълбока ликвидност -> нисък rate; полу-мейджъри -> среден rate;
+// по-малки/волатилни монети -> по-консервативен (по-висок) rate, за да не показва калкулаторът
+// оптимистична (по-далечна) ликвидационна цена за тях.
+function getMaintenanceRate(symbol) {
+  if (MAJOR_COINS.has(symbol)) return MAINTENANCE_RATE_MAJOR;
+  if (SEMI_MAJOR_COINS.has(symbol)) return MAINTENANCE_RATE_SEMI;
+  return MAINTENANCE_RATE_MINOR;
+}
+
+function calcLiquidationPrice(entryPrice, avgPrice, totalSize, leverage, side, maintenanceRate) {
   return side==='long' ? avgPrice*(1-(1/leverage)+maintenanceRate) : avgPrice*(1+(1/leverage)-maintenanceRate);
 }
 
-function calcDCALevels(entryPrice, side) {
+function calcDCALevels(entryPrice, side, symbol) {
+  const maintenanceRate = getMaintenanceRate(symbol);
   const steps = [];
-  const entryLiq = calcLiquidationPrice(entryPrice, entryPrice, DCA_ENTRY, DCA_LEVERAGE, side);
+  const entryLiq = calcLiquidationPrice(entryPrice, entryPrice, DCA_ENTRY, DCA_LEVERAGE, side, maintenanceRate);
   steps.push({step:0,label:'ВХОД',addAmount:DCA_ENTRY,totalUSDT:DCA_ENTRY,levelPrice:entryPrice,avgPrice:entryPrice,liqPrice:entryLiq,safeOrder:null,pctFromEntry:0});
   let totalUSDT=DCA_ENTRY, totalQty=DCA_ENTRY/entryPrice;
   let dca2LevelPrice = null;
@@ -1008,19 +1101,17 @@ function calcDCALevels(entryPrice, side) {
     if (i===1) dca2LevelPrice = levelPrice;
     totalUSDT+=addAmount; totalQty+=addAmount/levelPrice;
     const avgPrice=totalUSDT/totalQty;
-    const liqPrice=calcLiquidationPrice(entryPrice,avgPrice,totalUSDT,DCA_LEVERAGE,side);
+    const liqPrice=calcLiquidationPrice(entryPrice,avgPrice,totalUSDT,DCA_LEVERAGE,side,maintenanceRate);
     steps.push({step:i+1,label:`DCA ${i+1}`,addAmount,totalUSDT,levelPrice,avgPrice,liqPrice,safeOrder:side==='long'?liqPrice*1.02:liqPrice*0.98,pctFromEntry:drop*100});
   });
   const dca3Amount=DCA_ENTRY*8;
   const dca3Price=side==='long'?dca2LevelPrice*(1-0.35):dca2LevelPrice*(1+0.35);
   totalUSDT+=dca3Amount; totalQty+=dca3Amount/dca3Price;
   const dca3Avg=totalUSDT/totalQty;
-  const dca3Liq=calcLiquidationPrice(entryPrice,dca3Avg,totalUSDT,DCA_LEVERAGE,side);
+  const dca3Liq=calcLiquidationPrice(entryPrice,dca3Avg,totalUSDT,DCA_LEVERAGE,side,maintenanceRate);
   steps.push({step:3,label:'DCA 3 · ПОСЛЕДЕН БУФЕР (-35% от DCA 2)',addAmount:dca3Amount,totalUSDT,levelPrice:dca3Price,avgPrice:dca3Avg,liqPrice:dca3Liq,safeOrder:side==='long'?dca3Liq*1.02:dca3Liq*0.98,pctFromEntry:Math.abs((dca3Price-entryPrice)/entryPrice*100)});
   return steps;
 }
-
-function formatP(p) { if(!p)return'--'; if(p>=1000)return'$'+p.toLocaleString('en',{maximumFractionDigits:1}); if(p>=1)return'$'+p.toFixed(4); return'$'+p.toFixed(6); }
 
 function openDCA(symbol, price) { openDCAView(); document.getElementById('dca-symbol').value=symbol||''; document.getElementById('dca-price').value=price||''; if(symbol&&price)renderDCA(); }
 
@@ -1029,18 +1120,19 @@ function renderDCA() {
   const price=parseFloat(document.getElementById('dca-price').value);
   const side=document.querySelector('input[name="dca-side"]:checked').value;
   if(!symbol||!price||isNaN(price)){document.getElementById('dca-result').innerHTML=`<div style="text-align:center;color:var(--text2);padding:20px;font-family:'Share Tech Mono',monospace;font-size:12px;">ВЪВЕДИ МОНЕТА И ЦЕНА</div>`;return;}
-  const steps=calcDCALevels(price,side);
+  const steps=calcDCALevels(price,side,symbol);
+  const tierLabel = MAJOR_COINS.has(symbol) ? '0.4% (мейджър монета)' : SEMI_MAJOR_COINS.has(symbol) ? '0.65% (полу-мейджър монета)' : '1.0% (по-волатилна/нискокап монета)';
   const sideColor=side==='long'?'var(--green)':'var(--red)';
   const sideLabel=side==='long'?'▲ LONG':'▼ SHORT';
-  let html=`<div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:10px 14px;"><div style="padding:10px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;"><div style="font-size:18px;font-weight:700;color:#fff;">${symbol}/USDT</div><span style="font-family:'Share Tech Mono',monospace;font-size:11px;padding:3px 10px;border-radius:12px;background:${side==='long'?'rgba(0,255,136,0.15)':'rgba(255,51,102,0.15)'};color:${sideColor};border:1px solid ${sideColor};">${sideLabel}</span></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;padding:8px 12px;border-bottom:1px solid var(--border);"><div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">ЛЕВЪРИДЖ</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--yellow);">х${DCA_LEVERAGE}</div></div><div style="text-align:center;border-left:1px solid var(--border);border-right:1px solid var(--border);"><div style="font-size:9px;color:var(--text2);">НАЧАЛНА СУМА</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--accent);">$${DCA_ENTRY}</div></div><div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">МАКС ОБЩО</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--red);">$${steps[steps.length-1].totalUSDT.toFixed(0)}</div></div></div></div>`;
+  let html=`<div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:10px 14px;"><div style="padding:10px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;"><div style="font-size:18px;font-weight:700;color:#fff;">${symbol}/USDT</div><span style="font-family:'Share Tech Mono',monospace;font-size:11px;padding:3px 10px;border-radius:12px;background:${side==='long'?'rgba(0,255,136,0.15)':'rgba(255,51,102,0.15)'};color:${sideColor};border:1px solid ${sideColor};">${sideLabel}</span></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;padding:8px 12px;border-bottom:1px solid var(--border);"><div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">ЛЕВЪРИДЖ</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--yellow);">х${DCA_LEVERAGE}</div></div><div style="text-align:center;border-left:1px solid var(--border);border-right:1px solid var(--border);"><div style="font-size:9px;color:var(--text2);">НАЧАЛНА СУМА</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--accent);">$${DCA_ENTRY}</div></div><div style="text-align:center;"><div style="font-size:9px;color:var(--text2);">МАКС ОБЩО</div><div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--red);">$${steps[steps.length-1].totalUSDT.toFixed(0)}</div></div></div><div style="padding:6px 12px;font-size:9px;color:var(--text2);text-align:center;border-bottom:1px solid var(--border);">Maintenance margin: ${tierLabel}</div></div>`;
   html+=`<div style="margin:0 14px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden;">`;
   steps.forEach((s,idx)=>{
     const isEntry=s.step===0; const rowBg=isEntry?'rgba(0,229,255,0.05)':''; const labelColor=isEntry?'var(--accent)':sideColor;
-    html+=`<div style="padding:10px 12px;border-bottom:${idx<steps.length-1?'1px solid var(--border)':'none'};background:${rowBg};"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><div><span style="font-family:'Share Tech Mono',monospace;font-size:11px;color:${labelColor};">${s.label}</span>${s.pctFromEntry>0?`<span style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2);margin-left:6px;">-${s.pctFromEntry.toFixed(0)}%</span>`:''}</div><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:#fff;font-weight:bold;">+$${s.addAmount.toFixed(0)} → $${s.totalUSDT.toFixed(0)}</span></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;"><div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">ЦЕНА НИВО</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);">${formatP(s.levelPrice)}</div></div><div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">СРЕДНА ЦЕНА</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--yellow);">${formatP(s.avgPrice)}</div></div><div style="background:rgba(255,51,102,0.08);border-radius:6px;padding:5px 6px;text-align:center;border:1px solid rgba(255,51,102,0.15);"><div style="font-size:8px;color:var(--text2);">ЛИКВИДАЦИЯ</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--red);">${formatP(s.liqPrice)}</div></div></div>${!isEntry?`<div style="margin-top:5px;background:rgba(255,204,0,0.06);border:1px solid rgba(255,204,0,0.2);border-radius:6px;padding:5px 8px;display:flex;justify-content:space-between;align-items:center;"><span style="font-size:9px;color:var(--yellow);">📌 LIMIT ОРДЪР</span><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--yellow);font-weight:bold;">${formatP(s.safeOrder)}</span></div>`:''}</div>`;
+    html+=`<div style="padding:10px 12px;border-bottom:${idx<steps.length-1?'1px solid var(--border)':'none'};background:${rowBg};"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><div><span style="font-family:'Share Tech Mono',monospace;font-size:11px;color:${labelColor};">${s.label}</span>${s.pctFromEntry>0?`<span style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2);margin-left:6px;">-${s.pctFromEntry.toFixed(0)}%</span>`:''}</div><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:#fff;font-weight:bold;">+$${s.addAmount.toFixed(0)} → $${s.totalUSDT.toFixed(0)}</span></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;"><div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">ЦЕНА НИВО</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);">${formatPrice(s.levelPrice)}</div></div><div style="background:var(--bg3);border-radius:6px;padding:5px 6px;text-align:center;"><div style="font-size:8px;color:var(--text2);">СРЕДНА ЦЕНА</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--yellow);">${formatPrice(s.avgPrice)}</div></div><div style="background:rgba(255,51,102,0.08);border-radius:6px;padding:5px 6px;text-align:center;border:1px solid rgba(255,51,102,0.15);"><div style="font-size:8px;color:var(--text2);">ЛИКВИДАЦИЯ</div><div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--red);">${formatPrice(s.liqPrice)}</div></div></div>${!isEntry?`<div style="margin-top:5px;background:rgba(255,204,0,0.06);border:1px solid rgba(255,204,0,0.2);border-radius:6px;padding:5px 8px;display:flex;justify-content:space-between;align-items:center;"><span style="font-size:9px;color:var(--yellow);">📌 LIMIT ОРДЪР</span><span style="font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--yellow);font-weight:bold;">${formatPrice(s.safeOrder)}</span></div>`:''}</div>`;
   });
   html+=`</div><div style="margin:0 14px 14px;background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.2);border-radius:10px;padding:10px 12px;"><div style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--green);letter-spacing:1px;margin-bottom:8px;">→ СТРАТЕГИЯ ЗА ИЗХОД</div><div style="font-size:12px;color:var(--text);line-height:1.6;">При възстановяване → освобождаваш <span style="color:var(--green);font-weight:bold;">75%</span> от позицията веднага<br>Оставяш <span style="color:var(--accent);font-weight:bold;">25%</span> да продължи при по-висока цел</div></div>`;
   document.getElementById('dca-result').innerHTML=html;
 }
 </script>
 </body>
-</html> 
+</html>
