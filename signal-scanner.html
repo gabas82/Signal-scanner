@@ -435,7 +435,9 @@ async function loadWalls() {
       const bw = walls.buyWall, sw = walls.sellWall;
       // Ако стените са твърде близо една до друга (<25% gap спрямо цената), плана е ненадежден - потискаме го
       const wallGapPct = (bw && sw) ? Math.abs((sw.price - bw.price) / coin.price) * 100 : null;
-      const suppressPlan = wallGapPct !== null && wallGapPct < 25;
+      // Стените обикновено са на 1-5% от цената при нормална книга - праг от 25% беше нереалистично висок
+      // и потушаваше плана почти винаги. 1.5% означава entry/target/SL вече се преплитат.
+      const suppressPlan = wallGapPct !== null && wallGapPct < 1.5;
       let rows = `<div class="wall-row"><span style="color:var(--text2)">📊 ORDER BOOK СТЕНИ</span><span style="color:var(--text2)">limit 500</span></div>`;
       rows += `<div class="wall-row"><span style="color:var(--red)">🟥 Sell Wall: ${sw?'$'+formatPrice(sw.price)+' ('+formatNum(sw.usd)+')':'--'}</span><span style="color:var(--green)">🟩 Buy Wall: ${bw?'$'+formatPrice(bw.price)+' ('+formatNum(bw.usd)+')':'--'}</span></div>`;
       if (bw && sw && (sig.signal==='LONG'||sig.signal==='SHORT')) {
