@@ -1,0 +1,12 @@
+{
+  "name": "signal-scanner",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Signal scanner tool + unit tests за чистата логика (сигнали, DCA, форматиране).",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.9"
+  }
+}
