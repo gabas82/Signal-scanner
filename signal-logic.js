@@ -67,6 +67,32 @@ function calcSignal(coin) {
   return {signal:'NEUTRAL',ls,ss};
 }
 
+// Оценява дали близък голям ликвидационен клъстер (от вече показвания в
+// "🔴 ЛИК НИВА" CoinGlass heatmap) действа като "магнит" за цената — честа
+// пазарна интуиция е, че цената се тегли към зони с натрупани ликвидации.
+// above/below: масиви {price, amount}, каквито връща getLiqNearPrice() -
+// above = зони НАД текущата цена (предимно шорт ликвидации, дърпат нагоре),
+// below = зони ПОД текущата цена (предимно лонг ликвидации, дърпат надолу).
+// Сигналът се брои само ако едната страна ясно доминира (>=1.5x) И най-близката
+// ѝ зона е достатъчно близо (<=8% от цената), за да е реалистично "достижима".
+function calcLiquidityBias(above, below, price) {
+  const sumAmt = arr => (arr || []).reduce((s, l) => s + (l.amount || 0), 0);
+  const nearestPct = l => (l && price) ? Math.abs((l.price - price) / price) * 100 : Infinity;
+  const aboveAmt = sumAmt(above), belowAmt = sumAmt(below);
+  const nearestAbovePct = nearestPct(above && above[0]);
+  const nearestBelowPct = nearestPct(below && below[0]);
+  const NEAR_THRESHOLD_PCT = 8;
+  const DOMINANCE_RATIO = 1.5;
+  if (aboveAmt <= 0 && belowAmt <= 0) return { bias: 'neutral', aboveAmt, belowAmt };
+  if (aboveAmt >= belowAmt * DOMINANCE_RATIO && nearestAbovePct <= NEAR_THRESHOLD_PCT) {
+    return { bias: 'long', aboveAmt, belowAmt };
+  }
+  if (belowAmt >= aboveAmt * DOMINANCE_RATIO && nearestBelowPct <= NEAR_THRESHOLD_PCT) {
+    return { bias: 'short', aboveAmt, belowAmt };
+  }
+  return { bias: 'neutral', aboveAmt, belowAmt };
+}
+
 function calcSetupQuality(coin) {
   const sig = calcSignal(coin);
   let longPts = 0, shortPts = 0;
@@ -76,12 +102,14 @@ function calcSetupQuality(coin) {
   if (sig.signal === 'LONG') longPts++;
   if (coin.goldenCross === true) longPts++;
   if (detectBottom(coin)) longPts++;
+  if (coin.liqBias === 'long') longPts++;
   if (coin.funding > 0.08) shortPts++;
   if (coin.longPct > 70) shortPts++;
   if (coin.chg24 > 5 && coin.oiDelta < 0) shortPts++;
   if (sig.signal === 'SHORT') shortPts++;
   if (coin.goldenCross === false) shortPts++;
   if (detectTop(coin)) shortPts++;
+  if (coin.liqBias === 'short') shortPts++;
   const pts = Math.max(longPts, shortPts);
   const side = longPts >= shortPts ? 'long' : 'short';
   if (pts >= 4) return {grade:'setup', side, pts, label: side==='long' ? '🟢 ЛОНГ SETUP' : '🔴 ШОРТ SETUP'};
@@ -155,7 +183,7 @@ if (typeof module !== 'undefined' && module.exports) {
     DCA_LEVERAGE, DCA_ENTRY, MAJOR_COINS, SEMI_MAJOR_COINS,
     MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
     SYMBOL_MAP, fixSymbol, calcSMA, calcRSI, detectBottom, detectTop,
-    calcSignal, calcSetupQuality, isManipulable, formatNum, formatPrice,
+    calcSignal, calcSetupQuality, calcLiquidityBias, isManipulable, formatNum, formatPrice,
     formatOIDelta, getMaintenanceRate, calcLiquidationPrice, calcDCALevels
   };
 }

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   calcSMA, calcRSI, detectBottom, detectTop, calcSignal, calcSetupQuality,
-  isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
+  calcLiquidityBias, isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
   DCA_ENTRY, DCA_LEVERAGE
@@ -106,6 +106,50 @@ describe('calcSetupQuality', () => {
     const sq = calcSetupQuality(coin);
     expect(sq.grade).toBe('setup');
     expect(sq.side).toBe('long');
+  });
+  it('coin.liqBias="long" добавя точка към дългата страна', () => {
+    const without = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40, oiDelta: 3 }));
+    const withBias = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40, oiDelta: 3, liqBias: 'long' }));
+    expect(withBias.pts).toBe(without.pts + 1);
+    expect(withBias.side).toBe('long');
+  });
+  it('coin.liqBias="short" добавя точка към късата страна', () => {
+    const without = calcSetupQuality(baseCoin({ funding: 0.1, longPct: 75 }));
+    const withBias = calcSetupQuality(baseCoin({ funding: 0.1, longPct: 75, liqBias: 'short' }));
+    expect(withBias.pts).toBe(without.pts + 1);
+    expect(withBias.side).toBe('short');
+  });
+  it('coin.liqBias="neutral" (или липсващ) не добавя точки', () => {
+    const base = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40 }));
+    const neutral = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40, liqBias: 'neutral' }));
+    expect(neutral.pts).toBe(base.pts);
+  });
+});
+
+describe('calcLiquidityBias', () => {
+  it('връща neutral, когато няма никакви ликвидационни данни', () => {
+    expect(calcLiquidityBias([], [], 100).bias).toBe('neutral');
+    expect(calcLiquidityBias(null, null, 100).bias).toBe('neutral');
+  });
+  it('връща "long", когато над цената има доминираща и близка ликвидационна зона', () => {
+    const above = [{ price: 104, amount: 1000000 }];
+    const below = [{ price: 90, amount: 100000 }];
+    expect(calcLiquidityBias(above, below, 100).bias).toBe('long');
+  });
+  it('връща "short", когато под цената има доминираща и близка ликвидационна зона', () => {
+    const above = [{ price: 110, amount: 100000 }];
+    const below = [{ price: 97, amount: 1000000 }];
+    expect(calcLiquidityBias(above, below, 100).bias).toBe('short');
+  });
+  it('връща neutral, ако доминиращата зона е твърде далеч от цената (>8%)', () => {
+    const above = [{ price: 115, amount: 1000000 }]; // 15% над цената
+    const below = [{ price: 90, amount: 100000 }];
+    expect(calcLiquidityBias(above, below, 100).bias).toBe('neutral');
+  });
+  it('връща neutral, когато двете страни са сравними по големина (без ясна доминация)', () => {
+    const above = [{ price: 103, amount: 100000 }];
+    const below = [{ price: 97, amount: 90000 }];
+    expect(calcLiquidityBias(above, below, 100).bias).toBe('neutral');
   });
 });
 
