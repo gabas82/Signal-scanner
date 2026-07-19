@@ -61,6 +61,7 @@ function calcSignal(coin) {
   if (coin.funding < -0.01) ls += 1; else if (coin.funding > 0.08) ss += 2; else if (coin.funding > 0.05) ss += 1; else if (coin.funding > 0.03) ss += 1;
   if (coin.vol24 > 1000000000) ls += 1; else if (coin.vol24 > 500000000) ls += 1;
   if (coin.isTrending && coin.chg24 > 0) ls += 1; if (coin.isTrending && coin.chg24 < 0) ss += 1;
+  if (coin.liqBias === 'long') ls += 1; if (coin.liqBias === 'short') ss += 1;
   if (coin.funding > 0.06 && Math.abs(coin.longPct - 50) < 15) return {signal:'SQUEEZE',ls,ss};
   if (ls >= 3) return {signal:'LONG',ls,ss}; if (ss >= 3) return {signal:'SHORT',ls,ss};
   if (ls >= 2 && ls > ss) return {signal:'LONG',ls,ss}; if (ss >= 2 && ss > ls) return {signal:'SHORT',ls,ss};

@@ -910,6 +910,12 @@ function renderList() {
     else if (currentFilter !== 'all') filtered = allCoins.filter(c => calcSignal(c).signal.toLowerCase() === currentFilter);
   }
   filtered.sort((a,b) => {
+    // Екстремен резултат (ls или ss >= 7) излиза най-отгоре, над всичко останало -
+    // толкова силно изразен сигнал по посока е по-важен дори от oiFlip/setup/детектор.
+    const sa=calcSignal(a), sb=calcSignal(b);
+    const EXTREME_SCORE = 7;
+    const aExtreme = Math.max(sa.ls,sa.ss) >= EXTREME_SCORE, bExtreme = Math.max(sb.ls,sb.ss) >= EXTREME_SCORE;
+    if (aExtreme && !bExtreme) return -1; if (bExtreme && !aExtreme) return 1;
     if (a.oiFlip && !b.oiFlip) return -1; if (b.oiFlip && !a.oiFlip) return 1;
     const sqA = calcSetupQuality(a), sqB = calcSetupQuality(b);
     if (sqA.grade==='setup' && sqB.grade!=='setup') return -1;
@@ -917,7 +923,6 @@ function renderList() {
     if (sqA.grade==='setup' && sqB.grade==='setup' && sqB.pts !== sqA.pts) return sqB.pts - sqA.pts;
     const aD=detectBottom(a)||detectTop(a), bD=detectBottom(b)||detectTop(b);
     if (aD&&!bD) return -1; if (bD&&!aD) return 1;
-    const sa=calcSignal(a), sb=calcSignal(b);
     if (sa.signal==='SQUEEZE'&&sb.signal!=='SQUEEZE') return -1; if (sb.signal==='SQUEEZE'&&sa.signal!=='SQUEEZE') return 1;
     const sA=Math.max(sa.ls,sa.ss), sB=Math.max(sb.ls,sb.ss);
     if (sB!==sA) return sB-sA; return Math.abs(b.chg24)-Math.abs(a.chg24);
