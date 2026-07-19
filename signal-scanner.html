@@ -791,9 +791,9 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
   let setupBanner = '';
   if (setup.label) {
     const ptClass = setup.grade==='setup' ? (setup.side==='long'?'on-l':'on-s') : 'on-w';
-    const ptsHtml = Array.from({length:6},(_,i)=>`<div class="setup-pt ${i<setup.pts?ptClass:''}"></div>`).join('');
+    const ptsHtml = Array.from({length:7},(_,i)=>`<div class="setup-pt ${i<setup.pts?ptClass:''}"></div>`).join('');
     const bClass = setup.grade==='setup' ? (setup.side==='long'?'setup-long':'setup-short') : 'setup-watch';
-    setupBanner = `<div class="setup-banner ${bClass}"><span>${setup.label} · ${setup.pts}/6 точки</span><div class="setup-pts">${ptsHtml}</div></div>`;
+    setupBanner = `<div class="setup-banner ${bClass}"><span>${setup.label} · ${setup.pts}/7 точки</span><div class="setup-pts">${ptsHtml}</div></div>`;
   }
   const detectorClass = (isBottom ? ' detector-bottom' : isTop ? ' detector-top' : '') + (coin.oiFlip ? ' oi-flip' : '');
   let athBarHtml = coin.pctFromAth !== null
@@ -867,8 +867,15 @@ function openDCAView() {
   document.getElementById('dca-view').style.display = 'block';
 }
 
-async function loadLiqLevels() {
+// След зареждане на ликвидационните нива за всяка видима монета, изчислява дали
+// има близък доминиращ ликвидационен клъстер (calcLiquidityBias) и го записва
+// върху coin.liqBias, за да участва в SETUP QUALITY score-а (calcSetupQuality).
+// Ако за поне една монета това промени резултата, списъкът се пре-рендира
+// ЕДИН път (refreshed=true пази от безкраен цикъл), а loadLiqLevels(true) веднага
+// след това връща вече кешираните "ЛИК НИВА" от liqCache без нов fetch.
+async function loadLiqLevels(refreshed) {
   const visible = document.querySelectorAll('.coin-card');
+  let biasChanged = false;
   for (const card of visible) {
     const liqEl = card.querySelector('[id^="liq-"]'); if (!liqEl) continue;
     const sym = liqEl.id.replace('liq-','');
@@ -880,8 +887,15 @@ async function loadLiqLevels() {
       const aboveHtml = levels.above.length > 0 ? levels.above.map(l=>`<span style="color:var(--red)">▲$${formatPrice(l.price)}</span>`).join(' ') : '<span style="color:var(--text2)">--</span>';
       const belowHtml = levels.below.length > 0 ? levels.below.map(l=>`<span style="color:var(--green)">▼$${formatPrice(l.price)}</span>`).join(' ') : '<span style="color:var(--text2)">--</span>';
       liqEl.innerHTML = `<div style="width:100%;display:flex;justify-content:space-between;"><div><span style="color:var(--text2);font-size:9px;">ЛИК↑ </span>${aboveHtml}</div><div><span style="color:var(--text2);font-size:9px;">ЛИК↓ </span>${belowHtml}</div></div>`;
+      const coin = allCoins.find(c => c.fullSymbol === sym);
+      if (coin) {
+        const bias = calcLiquidityBias(levels.above, levels.below, coin.price).bias;
+        if (coin.liqBias !== bias) { coin.liqBias = bias; biasChanged = true; }
+      }
     } catch(e) { liqEl.innerHTML = `<span style="color:var(--text2);font-size:10px;">--</span>`; }
   }
+  if (biasChanged && !refreshed) { renderList(); loadLiqLevels(true); loadWalls(); }
+  updateStats();
 }
 
 function renderList() {
