@@ -296,6 +296,14 @@
 <script>
 const WORKER_URL = 'https://orange-grass-d809.gabas82.workers.dev';
 const REFRESH_INTERVAL_MS = 60000; // 1 минута (беше 30s)
+// Реалният таван на ls/ss в calcSignal (виж signal-logic.js): chg24 до +3, L/S% до +2,
+// funding до +2 (само за ss - за ls макс е +1), vol24 +1 (само за ls), isTrending +1,
+// ликвидационен уклон +1. Прагът "екстремен резултат" за сортиране най-отгоре е
+// процент от този таван, а не хардкоднато число, за да си остане принципно обвързан
+// с реалната скала дори ако тежестите на факторите се променят занапред.
+const MAX_SIGNAL_SCORE = 9;
+const EXTREME_SCORE_PCT = 0.8;
+const EXTREME_SCORE = Math.round(MAX_SIGNAL_SCORE * EXTREME_SCORE_PCT);
 let allCoins = [];
 let currentFilter = 'all';
 let searchQuery = '';
@@ -910,10 +918,10 @@ function renderList() {
     else if (currentFilter !== 'all') filtered = allCoins.filter(c => calcSignal(c).signal.toLowerCase() === currentFilter);
   }
   filtered.sort((a,b) => {
-    // Екстремен резултат (ls или ss >= 7) излиза най-отгоре, над всичко останало -
-    // толкова силно изразен сигнал по посока е по-важен дори от oiFlip/setup/детектор.
+    // Екстремен резултат (ls или ss >= EXTREME_SCORE, ~80% от реалния таван) излиза
+    // най-отгоре, над всичко останало - толкова силно изразен сигнал по посока е
+    // по-важен дори от oiFlip/setup/детектор.
     const sa=calcSignal(a), sb=calcSignal(b);
-    const EXTREME_SCORE = 7;
     const aExtreme = Math.max(sa.ls,sa.ss) >= EXTREME_SCORE, bExtreme = Math.max(sb.ls,sb.ss) >= EXTREME_SCORE;
     if (aExtreme && !bExtreme) return -1; if (bExtreme && !aExtreme) return 1;
     if (a.oiFlip && !b.oiFlip) return -1; if (b.oiFlip && !a.oiFlip) return 1;
