@@ -93,6 +93,23 @@ describe('calcSignal', () => {
   it('връща NEUTRAL, когато нищо не е изразено', () => {
     expect(calcSignal(baseCoin()).signal).toBe('NEUTRAL');
   });
+  it('coin.liqBias="long" добавя точка към ls, без да променя ss', () => {
+    const without = calcSignal(baseCoin({ chg24: 3 }));
+    const withBias = calcSignal(baseCoin({ chg24: 3, liqBias: 'long' }));
+    expect(withBias.ls).toBe(without.ls + 1);
+    expect(withBias.ss).toBe(without.ss);
+  });
+  it('coin.liqBias="short" добавя точка към ss, без да променя ls', () => {
+    const without = calcSignal(baseCoin({ chg24: -3 }));
+    const withBias = calcSignal(baseCoin({ chg24: -3, liqBias: 'short' }));
+    expect(withBias.ss).toBe(without.ss + 1);
+    expect(withBias.ls).toBe(without.ls);
+  });
+  it('coin.liqBias="neutral" (или липсващ) не променя резултата', () => {
+    const without = calcSignal(baseCoin({ chg24: 3 }));
+    const neutral = calcSignal(baseCoin({ chg24: 3, liqBias: 'neutral' }));
+    expect(neutral).toEqual(without);
+  });
 });
 
 describe('calcSetupQuality', () => {
@@ -107,22 +124,31 @@ describe('calcSetupQuality', () => {
     expect(sq.grade).toBe('setup');
     expect(sq.side).toBe('long');
   });
-  it('coin.liqBias="long" добавя точка към дългата страна', () => {
-    const without = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40, oiDelta: 3 }));
-    const withBias = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40, oiDelta: 3, liqBias: 'long' }));
+  it('coin.liqBias="long" добавя директна точка към дългата страна (когато сигналът вече е LONG независимо от uклона)', () => {
+    // chg24:12 сам по себе си вече дава сигнал LONG (ls>=3), затова liqBias тук
+    // добавя само своята директна точка в calcSetupQuality, без да променя sig.signal.
+    const without = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40, oiDelta: 3, chg24: 12 }));
+    const withBias = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40, oiDelta: 3, chg24: 12, liqBias: 'long' }));
     expect(withBias.pts).toBe(without.pts + 1);
     expect(withBias.side).toBe('long');
   });
-  it('coin.liqBias="short" добавя точка към късата страна', () => {
-    const without = calcSetupQuality(baseCoin({ funding: 0.1, longPct: 75 }));
-    const withBias = calcSetupQuality(baseCoin({ funding: 0.1, longPct: 75, liqBias: 'short' }));
+  it('coin.liqBias="short" добавя директна точка към късата страна (когато сигналът вече е SHORT независимо от uклона)', () => {
+    const without = calcSetupQuality(baseCoin({ funding: 0.1, longPct: 75, chg24: -12 }));
+    const withBias = calcSetupQuality(baseCoin({ funding: 0.1, longPct: 75, chg24: -12, liqBias: 'short' }));
     expect(withBias.pts).toBe(without.pts + 1);
     expect(withBias.side).toBe('short');
   });
   it('coin.liqBias="neutral" (или липсващ) не добавя точки', () => {
-    const base = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40 }));
-    const neutral = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40, liqBias: 'neutral' }));
+    const base = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40, chg24: 12 }));
+    const neutral = calcSetupQuality(baseCoin({ funding: -0.02, longPct: 40, chg24: 12, liqBias: 'neutral' }));
     expect(neutral.pts).toBe(base.pts);
+  });
+  it('coin.liqBias може да допринесе двойно, ако сам обръща и calcSignal посоката (директна точка + sig.signal LONG)', () => {
+    // funding<-0.01 сам дава само ls=1 (сигнал остава NEUTRAL); liqBias="long" го качва
+    // на ls=2 (сигнал вече LONG) - т.е. добавя и директната си точка, и точката за sig.signal==='LONG'.
+    const without = calcSetupQuality(baseCoin({ funding: -0.02 }));
+    const withBias = calcSetupQuality(baseCoin({ funding: -0.02, liqBias: 'long' }));
+    expect(withBias.pts).toBe(without.pts + 2);
   });
 });
 
