@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   calcSMA, calcRSI, detectBottom, detectTop, calcSignal, calcSetupQuality,
-  calcLiquidityBias, isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
+  calcLiquidityBias, calcWallBias, isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
   DCA_ENTRY, DCA_LEVERAGE
@@ -176,6 +176,36 @@ describe('calcLiquidityBias', () => {
     const above = [{ price: 103, amount: 100000 }];
     const below = [{ price: 97, amount: 90000 }];
     expect(calcLiquidityBias(above, below, 100).bias).toBe('neutral');
+  });
+});
+
+describe('calcWallBias', () => {
+  it('връща neutral, когато няма никакви стени', () => {
+    expect(calcWallBias(null, null, 100).bias).toBe('neutral');
+  });
+  it('връща "long", когато Buy Wall (подкрепа) доминира и е близо под цената', () => {
+    const buyWall = { price: 96, usd: 1000000 };
+    const sellWall = { price: 110, usd: 100000 };
+    expect(calcWallBias(buyWall, sellWall, 100).bias).toBe('long');
+  });
+  it('връща "short", когато Sell Wall (съпротива) доминира и е близо над цената', () => {
+    const buyWall = { price: 90, usd: 100000 };
+    const sellWall = { price: 103, usd: 1000000 };
+    expect(calcWallBias(buyWall, sellWall, 100).bias).toBe('short');
+  });
+  it('връща neutral, ако доминиращата стена е твърде далеч от цената (>8%)', () => {
+    const buyWall = { price: 85, usd: 1000000 }; // 15% под цената
+    const sellWall = { price: 110, usd: 100000 };
+    expect(calcWallBias(buyWall, sellWall, 100).bias).toBe('neutral');
+  });
+  it('връща neutral, когато двете стени са сравними по големина (без ясна доминация)', () => {
+    const buyWall = { price: 97, usd: 100000 };
+    const sellWall = { price: 103, usd: 90000 };
+    expect(calcWallBias(buyWall, sellWall, 100).bias).toBe('neutral');
+  });
+  it('работи и с една-единствена стена (другата липсва)', () => {
+    const buyWall = { price: 98, usd: 500000 };
+    expect(calcWallBias(buyWall, null, 100).bias).toBe('long');
   });
 });
 
