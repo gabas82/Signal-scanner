@@ -94,6 +94,30 @@ function calcLiquidityBias(above, below, price) {
   return { bias: 'neutral', aboveAmt, belowAmt };
 }
 
+// Наклон от вече работещите (безплатни) Binance order book "стени" - алтернатива
+// на calcLiquidityBias(), тъй като CoinGlass liquidation heatmap-ът се оказа
+// заключен зад по-висок платен план (CoinGlass връща {"code":"401","msg":"Upgrade
+// plan"}) и никога не връща реални данни. ВАЖНО: логиката тук е ОБРАТНА на
+// calcLiquidityBias - стена е подкрепа/съпротива (repel), не ликвидационен магнит
+// (attract): голяма и близка Buy Wall (подкрепа) под цената -> бичи наклон;
+// голяма и близка Sell Wall (съпротива) над цената -> мечи наклон.
+// buyWall/sellWall: {price, usd} или null/undefined, каквито връща fetchOrderBookWalls().
+function calcWallBias(buyWall, sellWall, price) {
+  const nearestPct = w => (w && price) ? Math.abs((w.price - price) / price) * 100 : Infinity;
+  const buyAmt = buyWall ? (buyWall.usd || 0) : 0;
+  const sellAmt = sellWall ? (sellWall.usd || 0) : 0;
+  const NEAR_THRESHOLD_PCT = 8;
+  const DOMINANCE_RATIO = 1.5;
+  if (buyAmt <= 0 && sellAmt <= 0) return { bias: 'neutral', buyAmt, sellAmt };
+  if (buyAmt >= sellAmt * DOMINANCE_RATIO && nearestPct(buyWall) <= NEAR_THRESHOLD_PCT) {
+    return { bias: 'long', buyAmt, sellAmt };
+  }
+  if (sellAmt >= buyAmt * DOMINANCE_RATIO && nearestPct(sellWall) <= NEAR_THRESHOLD_PCT) {
+    return { bias: 'short', buyAmt, sellAmt };
+  }
+  return { bias: 'neutral', buyAmt, sellAmt };
+}
+
 function calcSetupQuality(coin) {
   const sig = calcSignal(coin);
   let longPts = 0, shortPts = 0;
@@ -184,7 +208,7 @@ if (typeof module !== 'undefined' && module.exports) {
     DCA_LEVERAGE, DCA_ENTRY, MAJOR_COINS, SEMI_MAJOR_COINS,
     MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
     SYMBOL_MAP, fixSymbol, calcSMA, calcRSI, detectBottom, detectTop,
-    calcSignal, calcSetupQuality, calcLiquidityBias, isManipulable, formatNum, formatPrice,
+    calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, isManipulable, formatNum, formatPrice,
     formatOIDelta, getMaintenanceRate, calcLiquidationPrice, calcDCALevels
   };
 }

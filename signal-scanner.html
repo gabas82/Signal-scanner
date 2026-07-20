@@ -422,8 +422,16 @@ async function loadMacroRow() {
   } catch(e) { return null; }
 }
 
-async function loadWalls() {
+// След зареждане на order book стените за всяка видима монета, изчислява
+// наклона от тях (calcWallBias) и го записва върху coin.liqBias, за да участва
+// в SETUP QUALITY / calcSignal - заместител на CoinGlass ликвидационната карта,
+// която се оказа заключена зад платен план (виж calcWallBias за детайли).
+// Ако за поне една монета това промени резултата, списъкът се пре-рендира
+// ЕДИН път (refreshed=true пази от безкраен цикъл), а loadWalls(true)/
+// loadLiqLevels() веднага след това връщат вече кешираните данни без нов fetch.
+async function loadWalls(refreshed) {
   const visible = document.querySelectorAll('.coin-card');
+  let biasChanged = false;
   for (const card of visible) {
     const wallEl = card.querySelector('[id^="wall-"]'); if (!wallEl) continue;
     const sym = wallEl.id.replace('wall-','');
@@ -433,6 +441,8 @@ async function loadWalls() {
       if (!walls || (!walls.buyWall && !walls.sellWall)) { wallEl.innerHTML = `<span style="color:var(--text2)">📊 СТЕНИ: няма ясни стени в книгата</span>`; continue; }
       const sig = calcSignal(coin);
       const bw = walls.buyWall, sw = walls.sellWall;
+      const wallBias = calcWallBias(bw, sw, coin.price).bias;
+      if (coin.liqBias !== wallBias) { coin.liqBias = wallBias; biasChanged = true; }
       // Ако стените са твърде близо една до друга (<25% gap спрямо цената), плана е ненадежден - потискаме го
       const wallGapPct = (bw && sw) ? Math.abs((sw.price - bw.price) / coin.price) * 100 : null;
       // Стените обикновено са на 1-5% от цената при нормална книга - праг от 25% беше нереалистично висок
@@ -461,6 +471,8 @@ async function loadWalls() {
       wallEl.innerHTML = rows;
     } catch(e) { wallEl.innerHTML = `<span style="color:var(--text2)">📊 СТЕНИ: --</span>`; }
   }
+  if (biasChanged && !refreshed) { renderList(); loadWalls(true); loadLiqLevels(); }
+  updateStats();
 }
 
 async function fetchTop200Coins() {
