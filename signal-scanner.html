@@ -119,6 +119,7 @@
   .tag-flip-down{background:rgba(255,51,102,0.25);color:var(--red);border:1px solid var(--red);font-weight:bold;animation:flipPulse 1.5s infinite;}
   .tag-flush{background:rgba(0,255,136,0.2);color:var(--green);border:1px solid var(--green);font-weight:bold;}
   .tag-base{background:rgba(0,229,255,0.15);color:var(--accent);border:1px solid rgba(0,229,255,0.4);font-weight:bold;}
+  .tag-top-base{background:rgba(255,215,0,0.2);color:#ffd700;border:1px solid #ffd700;font-weight:bold;}
   .tag-squeeze2{background:rgba(168,85,247,0.2);color:var(--purple);border:1px solid var(--purple);font-weight:bold;}
   .tag-shift{background:rgba(255,100,0,0.2);color:var(--orange);border:1px solid var(--orange);font-weight:bold;}
   .tag-impulse-long{background:rgba(0,255,136,0.15);color:var(--green);border:1px solid rgba(0,255,136,0.4);font-weight:bold;}
@@ -689,10 +690,11 @@ async function loadCapitulation() {
       const htfExtreme = rsi4h!=null && rsi1d!=null && rsi4h<35 && rsi1d<35;
       const flush = calcFlushSignal(c15, htfExtreme);
       const base = calcBaseSignal(c1h, htfExtreme);
+      const baseStrength = base ? calcBaseDivergenceStrength(c1h) : { score: 0, priceDropPct: 0, rsiGain: 0 };
       const squeeze = calcSqueezeSignal(c5);
       const shift = calcShiftSignal(c1h);
       const impulse = calcImpulseSignal(c1h, flush);
-      coin.capSignals = { flush, base, squeeze, shift, impulseLong: impulse.long, impulseShort: impulse.short };
+      coin.capSignals = { flush, base, baseStrength, squeeze, shift, impulseLong: impulse.long, impulseShort: impulse.short };
 
       // WARMING Gate - преизползва СЪЩИТЕ вече изтеглени 15м/1ч/4ч свещи, без нов fetch.
       const bigVol4h = calc4HBigVolume(c4h);
@@ -754,6 +756,22 @@ async function loadCapitulation() {
     await new Promise(res => setTimeout(res, 150));
   }
   if (results.length === 0) { content.innerHTML = `<div class="no-results">НЯМА АКТИВНИ CAPITULATION/WARMING СИГНАЛИ В МОМЕНТА</div>`; return; }
+
+  // BASE монетите ("направило дъно, но с отслабващ момент - вероятно предстои втори,
+  // по-нисък под") се качват най-отгоре, ранжирани по силата на скритата дивергенция.
+  // Първите (до) 3 получават "TOP N ДЪНО" бадж - виж renderCard().
+  results.sort((a, b) => {
+    const aBase = !!a.capSignals?.base, bBase = !!b.capSignals?.base;
+    if (aBase && bBase) return (b.capSignals.baseStrength?.score || 0) - (a.capSignals.baseStrength?.score || 0);
+    if (aBase !== bBase) return aBase ? -1 : 1;
+    return 0;
+  });
+  let baseRank = 0;
+  for (const c of results) {
+    if (c.capSignals?.base && baseRank < 3) { baseRank++; c._topBaseRank = baseRank; }
+    else { c._topBaseRank = null; }
+  }
+
   const html = results.map((c,i) => renderCard(c,i)).join('');
   content.innerHTML = `<div style="padding:8px 14px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);">🔥 ${results.length} МОНЕТИ С АКТИВЕН CAPITULATION/WARMING СИГНАЛ</div><div class="coins-list">${html}</div>`;
   loadLiqLevels(); loadWalls();
@@ -1039,6 +1057,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
   if (coin.oiFlip === 'down') tags.push(`<span class="tag tag-flip-down">🔔 OI ОБРЪЩАНЕ ▼</span>`);
   if (coin.capSignals?.flush) tags.push(`<span class="tag tag-flush">💥 FLUSH</span>`);
   if (coin.capSignals?.base) tags.push(`<span class="tag tag-base">🔵 BASE</span>`);
+  if (coin._topBaseRank) tags.push(`<span class="tag tag-top-base">🏆 TOP ${coin._topBaseRank} ДЪНО</span>`);
   if (coin.capSignals?.squeeze) tags.push(`<span class="tag tag-squeeze2">🟣 SQUEEZE</span>`);
   if (coin.capSignals?.shift) tags.push(`<span class="tag tag-shift">🟠 SHIFT</span>`);
   if (coin.capSignals?.impulseLong) tags.push(`<span class="tag tag-impulse-long">🟢 IMPULSE L</span>`);

@@ -141,6 +141,25 @@ function calcBaseSignal(candles, htfExtreme, opts = {}) {
   return bullDiv && volDry && smallRange && rsiRecover && htfFilter;
 }
 
+// Сила на "скритата" bullish дивергенция зад BASE сигнала - колкото по-голяма, толкова
+// по-убедителен е моделът "втори, по-нисък под, но с отслабващ низходящ момент" (RSI
+// расте докато цената пада). Само за РАНЖИРАНЕ на вече активни BASE монети - не заменя
+// самия calcBaseSignal boolean gate.
+function calcBaseDivergenceStrength(candles, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14;
+  const n = candles.length;
+  if (n < rsiLen + 11) return { score: 0, priceDropPct: 0, rsiGain: 0 };
+  const closes = candles.map(c => c.close);
+  const lows = candles.map(c => c.low);
+  const rsiSeries = calcRSISeries(closes, rsiLen);
+  const rsi = rsiSeries[n - 1], rsi10 = rsiSeries[n - 11];
+  const lowNow = lows[n - 1], lowThen = lows[n - 11];
+  if (rsi == null || rsi10 == null || lowThen <= 0) return { score: 0, priceDropPct: 0, rsiGain: 0 };
+  const priceDropPct = Math.max(0, (lowThen - lowNow) / lowThen * 100);
+  const rsiGain = Math.max(0, rsi - rsi10);
+  return { score: priceDropPct + rsiGain, priceDropPct, rsiGain };
+}
+
 // SQUEEZE: бичи свещ + вол spike (сама сила като FLUSH прага) + RSI над 40 - типично
 // кратък шорт-скуийз изблик.
 function calcSqueezeSignal(candles, opts = {}) {
@@ -538,7 +557,7 @@ if (typeof module !== 'undefined' && module.exports) {
     MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
     SYMBOL_MAP, fixSymbol, calcSMA, calcRSI, detectBottom, detectTop,
     calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
-    calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
+    calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcBaseDivergenceStrength, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
     calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
     calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
     isManipulable, formatNum, formatPrice,
