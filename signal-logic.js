@@ -277,6 +277,90 @@ function calcDumpCascade(candles, opts = {}) {
   return { active: redCount >= dumpMinCount, redCount };
 }
 
+// Обемно-претеглен посочен натиск (сума на (close-open)*volume) над последните `len`
+// свещи - положителен => купувачите доминират по обем, отрицателен => продавачите.
+function calcVolumePressure(candles, len) {
+  const n = candles.length;
+  if (n < len) return { press: 0, biasLong: false, biasShort: false };
+  let press = 0;
+  for (let i = n - len; i < n; i++) {
+    const c = candles[i];
+    press += (c.close - c.open) * c.volume;
+  }
+  return { press, biasLong: press > 0, biasShort: press < 0 };
+}
+
+// 15м контекст за "MM WARMING→IMPULSE": обемен spike + растящ обем (warmBars
+// последователни свещи) + ATR компресия => отваря ARM прозорец за entry на по-нисък TF.
+function calcWarmingContext(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, atrLen = opts.atrLen ?? 14;
+  const warmVolX = opts.warmVolX ?? 1.6, warmBars = opts.warmBars ?? 3;
+  const useComp = opts.useComp ?? true, atrPctMax = opts.atrPctMax ?? 1.2;
+  const pressLen = opts.pressLen ?? 6;
+  const n = candles.length;
+  const minLen = Math.max(volLen, atrLen, pressLen) + warmBars + 1;
+  if (n < minLen) return { warming: false, biasLong: false, biasShort: false, volX: null, atrPct: null };
+
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const atr = calcATR(candles, atrLen);
+  const last = candles[n - 1];
+  if (volMA == null || atr == null) return { warming: false, biasLong: false, biasShort: false, volX: null, atrPct: null };
+
+  const volX = volMA > 0 ? last.volume / volMA : 0;
+  const atrPct = (atr / last.close) * 100;
+  const compOK = !useComp || atrPct <= atrPctMax;
+
+  let riseCount = 0;
+  for (let i = 0; i < warmBars; i++) {
+    const cur = candles[n - 1 - i];
+    const prev = candles[n - 2 - i];
+    if (cur.volume > prev.volume) riseCount++;
+  }
+  const volRise = riseCount >= (warmBars - 1);
+
+  const { biasLong, biasShort } = calcVolumePressure(candles, pressLen);
+  const warming = volX >= warmVolX && volRise && compOK;
+  return { warming, biasLong, biasShort, volX, atrPct };
+}
+
+// 5м impulse entry: обемен spike + голямо тяло + пробив на предходния high/low.
+function calcEntryImpulse(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20;
+  const impVolX = opts.impVolX ?? 2.2;
+  const bodyPctMin = opts.bodyPctMin ?? 0.55;
+  const n = candles.length;
+  if (n < volLen + 2) return { impulseUp: false, impulseDn: false, volX: null, bodyPct: null };
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  if (volMA == null) return { impulseUp: false, impulseDn: false, volX: null, bodyPct: null };
+  const last = candles[n - 1], prev = candles[n - 2];
+  const range = Math.max(last.high - last.low, 1e-9);
+  const bodyPct = Math.abs(last.close - last.open) / range;
+  const volX = volMA > 0 ? last.volume / volMA : 0;
+  const impulseVolOK = volX >= impVolX;
+  const impulseBodyOK = bodyPct >= bodyPctMin;
+  const impulseUp = impulseVolOK && impulseBodyOK && last.close > prev.high && last.close > last.open;
+  const impulseDn = impulseVolOK && impulseBodyOK && last.close < prev.low && last.close < last.open;
+  return { impulseUp, impulseDn, volX, bodyPct };
+}
+
+// "MM x25" - по-безопасен/по-тесен вход: EMA тренд филтър + анти-спайк проверка
+// (обемът/диапазонът да НЕ е екстремен, за разлика от impulse entry-то).
+function calcMMx25Entry(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, atrLen = opts.atrLen ?? 14, emaLen = opts.emaLen ?? 20;
+  const proxyVolX = opts.proxyVolX ?? 2.5, proxyATRX = opts.proxyATRX ?? 1.8;
+  const n = candles.length;
+  const minLen = Math.max(volLen, atrLen, emaLen) + 1;
+  if (n < minLen) return { long: false, short: false, ema: null };
+  const emaSeries = calcEMASeries(candles.map(c => c.close), emaLen);
+  const ema = emaSeries[n - 1];
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const atr = calcATR(candles, atrLen);
+  const last = candles[n - 1];
+  if (ema == null || volMA == null || atr == null) return { long: false, short: false, ema: null };
+  const proxyOK = last.volume <= volMA * proxyVolX && (last.high - last.low) <= atr * proxyATRX;
+  return { long: last.close > ema && proxyOK, short: last.close < ema && proxyOK, ema, proxyOK };
+}
+
 function detectBottom(coin) {
   let score = 0;
   if (Math.abs(coin.funding) < 0.03) score++;
@@ -456,6 +540,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
     calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
     calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
+    calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
     isManipulable, formatNum, formatPrice,
     formatOIDelta, getMaintenanceRate, calcLiquidationPrice, calcDCALevels
   };

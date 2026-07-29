@@ -4,6 +4,7 @@ import {
   calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
   calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
   calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
+  calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
   isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
@@ -597,5 +598,131 @@ describe('calcDumpCascade', () => {
     const r = calcDumpCascade([redCandle(false), redCandle(false), redCandle(true)]);
     expect(r.active).toBe(false);
     expect(r.redCount).toBe(1);
+  });
+});
+
+describe('calcVolumePressure', () => {
+  it('връща biasLong при доминиращ обем на зелени свещи', () => {
+    const candles = [
+      { open: 100, high: 100.2, low: 99.9, close: 100.1, volume: 1000 },
+      { open: 100.1, high: 100.3, low: 100, close: 100.2, volume: 1000 },
+    ];
+    const r = calcVolumePressure(candles, 2);
+    expect(r.press).toBeGreaterThan(0);
+    expect(r.biasLong).toBe(true);
+    expect(r.biasShort).toBe(false);
+  });
+  it('връща biasShort при доминиращ обем на червени свещи', () => {
+    const candles = [
+      { open: 100.1, high: 100.2, low: 99.9, close: 100, volume: 1000 },
+      { open: 100.2, high: 100.3, low: 100, close: 100.1, volume: 1000 },
+    ];
+    const r = calcVolumePressure(candles, 2);
+    expect(r.biasShort).toBe(true);
+    expect(r.biasLong).toBe(false);
+  });
+  it('връща biasLong:false и biasShort:false при недостатъчно свещи', () => {
+    const r = calcVolumePressure([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }], 5);
+    expect(r.biasLong).toBe(false);
+    expect(r.biasShort).toBe(false);
+  });
+});
+
+describe('calcWarmingContext', () => {
+  function buildCtx(direction) {
+    const flat = () => (direction === 'up'
+      ? { open: 100, high: 100.1, low: 99.9, close: 100, volume: 1000 }
+      : { open: 100, high: 100.1, low: 99.9, close: 100, volume: 1000 });
+    const base = Array.from({ length: 18 }, flat);
+    const step = direction === 'up' ? 0.1 : -0.1;
+    let px = 100;
+    const rising = [1000, 1000, 1200, 1500, 1900, 3000].map((vol) => {
+      const open = px, close = px + step;
+      px = close;
+      const high = Math.max(open, close) + 0.05, low = Math.min(open, close) - 0.05;
+      return { open, high, low, close, volume: vol };
+    });
+    return [...base, ...rising];
+  }
+  it('връща warming:true и biasLong:true при обемен spike + растящ обем + компресия (up)', () => {
+    const r = calcWarmingContext(buildCtx('up'));
+    expect(r.warming).toBe(true);
+    expect(r.biasLong).toBe(true);
+    expect(r.biasShort).toBe(false);
+  });
+  it('връща warming:true и biasShort:true при аналогичен сетъп надолу', () => {
+    const r = calcWarmingContext(buildCtx('down'));
+    expect(r.warming).toBe(true);
+    expect(r.biasShort).toBe(true);
+  });
+  it('връща warming:false при недостатъчно свещи', () => {
+    expect(calcWarmingContext([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }]).warming).toBe(false);
+  });
+  it('връща warming:false без обемен spike (плосък обем)', () => {
+    const flat = Array.from({ length: 24 }, () => ({ open: 100, high: 100.1, low: 99.9, close: 100.05, volume: 1000 }));
+    expect(calcWarmingContext(flat).warming).toBe(false);
+  });
+  it('връща warming:false ако диапазонът не е компресиран (ATR% над прага)', () => {
+    const candles = buildCtx('up');
+    candles[candles.length - 1] = { open: 90, high: 115, low: 85, close: 110, volume: 3000 };
+    expect(calcWarmingContext(candles).warming).toBe(false);
+  });
+});
+
+describe('calcEntryImpulse', () => {
+  function buildImpulse(direction, lastVol) {
+    const flat = () => ({ open: 100, high: 100.1, low: 99.9, close: 100, volume: 1000 });
+    const base = Array.from({ length: 21 }, flat);
+    const last = direction === 'up'
+      ? { open: 100, high: 102, low: 99.9, close: 101.8, volume: lastVol }
+      : { open: 100, high: 100.1, low: 98, close: 98.2, volume: lastVol };
+    return [...base, last];
+  }
+  it('връща impulseUp:true при обемен spike + голямо тяло + пробив на предходния high', () => {
+    const r = calcEntryImpulse(buildImpulse('up', 3000));
+    expect(r.impulseUp).toBe(true);
+    expect(r.impulseDn).toBe(false);
+  });
+  it('връща impulseDn:true при аналогичен пробив надолу', () => {
+    const r = calcEntryImpulse(buildImpulse('down', 3000));
+    expect(r.impulseDn).toBe(true);
+  });
+  it('връща impulseUp:false без обемен spike', () => {
+    expect(calcEntryImpulse(buildImpulse('up', 1000)).impulseUp).toBe(false);
+  });
+  it('връща impulseUp:false при недостатъчно свещи', () => {
+    expect(calcEntryImpulse([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }]).impulseUp).toBe(false);
+  });
+});
+
+describe('calcMMx25Entry', () => {
+  function buildTrend(direction, spike) {
+    const n = 21;
+    const step = direction === 'up' ? 0.1 : -0.1;
+    return Array.from({ length: n }, (_, i) => {
+      const close = 100 + i * step;
+      const open = 100 + (i - 1) * step;
+      const isLast = i === n - 1;
+      const range = isLast && spike ? 5 : 0.1;
+      const volume = isLast && spike ? 5000 : 1000;
+      return { open, high: Math.max(open, close) + range / 2, low: Math.min(open, close) - range / 2, close, volume };
+    });
+  }
+  it('връща long:true при възходящ тренд над EMA без спайк в обема/диапазона', () => {
+    const r = calcMMx25Entry(buildTrend('up', false));
+    expect(r.long).toBe(true);
+    expect(r.short).toBe(false);
+  });
+  it('връща short:true при низходящ тренд под EMA без спайк', () => {
+    const r = calcMMx25Entry(buildTrend('down', false));
+    expect(r.short).toBe(true);
+  });
+  it('връща long:false при анти-спайк проверка неуспешна (екстремен обем/диапазон)', () => {
+    expect(calcMMx25Entry(buildTrend('up', true)).long).toBe(false);
+  });
+  it('връща long:false и short:false при недостатъчно свещи', () => {
+    const r = calcMMx25Entry([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }]);
+    expect(r.long).toBe(false);
+    expect(r.short).toBe(false);
   });
 });
