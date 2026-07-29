@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   calcSMA, calcRSI, detectBottom, detectTop, calcSignal, calcSetupQuality,
   calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
-  calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
+  calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcBaseDivergenceStrength, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
   calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
   calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
   isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
@@ -430,6 +430,41 @@ describe('calcFlushSignal', () => {
   });
   it('връща false при недостатъчно свещи', () => {
     expect(calcFlushSignal(buildDecliningCandles(5), true)).toBe(false);
+  });
+});
+
+describe('calcBaseDivergenceStrength', () => {
+  function candlesWithLows(lowAt15, lowAt25) {
+    return Array.from({ length: 26 }, (_, i) => {
+      const low = i === 15 ? lowAt15 : i === 25 ? lowAt25 : 100;
+      return { open: 100, high: 100.5, low, close: 100 };
+    });
+  }
+  // V-образни closes: спад до дъно на индекс 13, после възход - RSI на индекс25 >> RSI на индекс15.
+  function candlesVShapeCloses() {
+    return Array.from({ length: 26 }, (_, i) => {
+      const close = i <= 13 ? 100 - i : 87 + (i - 13);
+      return { open: close, high: close + 0.5, low: close - 0.5, close };
+    });
+  }
+  it('връща нулев score при недостатъчно свещи', () => {
+    expect(calcBaseDivergenceStrength([{ open: 1, high: 1, low: 1, close: 1 }])).toEqual({ score: 0, priceDropPct: 0, rsiGain: 0 });
+  });
+  it('по-голям спад на нисколто дава по-голям priceDropPct', () => {
+    const big = calcBaseDivergenceStrength(candlesWithLows(100, 80));
+    const small = calcBaseDivergenceStrength(candlesWithLows(100, 95));
+    expect(big.priceDropPct).toBeCloseTo(20);
+    expect(small.priceDropPct).toBeCloseTo(5);
+    expect(big.score).toBeGreaterThan(small.score);
+  });
+  it('връща priceDropPct:0, ако последното ниско НЕ е по-ниско от предходното (без дивергенция)', () => {
+    const r = calcBaseDivergenceStrength(candlesWithLows(80, 100));
+    expect(r.priceDropPct).toBe(0);
+  });
+  it('улавя растящ RSI въпреки по-ниските нива на цената (скрита bullish дивергенция)', () => {
+    const r = calcBaseDivergenceStrength(candlesVShapeCloses());
+    expect(r.rsiGain).toBeGreaterThan(50);
+    expect(r.score).toBeGreaterThan(0);
   });
 });
 
