@@ -15,6 +15,28 @@ const MAINTENANCE_RATE_MINOR = 0.01; // по-волатилни/нискокап
 const SYMBOL_MAP = {'MATIC':'POL','TIAO':'TIA'};
 function fixSymbol(s) { return (SYMBOL_MAP[s] || s) + 'USDT'; }
 
+// Пресъздава логиката на потребителски Pine Script индикатор "Mario – ALT Radar
+// Symbols" в JS: 4 условия (BTC.D пада / TOTAL3 расте / OTHERS расте / ALT-BTC
+// расте спрямо своя 5-дневен SMA), сборувани в резултат 0-4, който определя
+// PRESSURE/EXPANSION/SEASON нивото. SMA(null) означава недостатъчно история
+// (все още) - условието просто не се брои, вместо да гърми.
+function calcAltRadarScore(btcD, total3, others, altBtc, btcDSma, total3Sma, othersSma, altBtcSma) {
+  let score = 0;
+  if (btcDSma != null && btcD < btcDSma) score++;
+  if (total3Sma != null && total3 > total3Sma) score++;
+  if (othersSma != null && others > othersSma) score++;
+  if (altBtcSma != null && altBtc > altBtcSma) score++;
+  return score;
+}
+
+function calcAltRadarSignal(score, pressureMin, expansionMin, seasonMin) {
+  const pMin = pressureMin ?? 2, eMin = expansionMin ?? 3, sMin = seasonMin ?? 4;
+  if (score >= sMin) return 'season';
+  if (score >= eMin) return 'expansion';
+  if (score >= pMin) return 'pressure';
+  return 'none';
+}
+
 function calcSMA(closes, period) {
   if (closes.length < period) return null;
   return closes.slice(-period).reduce((a,b) => a+b, 0) / period;
@@ -208,7 +230,7 @@ if (typeof module !== 'undefined' && module.exports) {
     DCA_LEVERAGE, DCA_ENTRY, MAJOR_COINS, SEMI_MAJOR_COINS,
     MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
     SYMBOL_MAP, fixSymbol, calcSMA, calcRSI, detectBottom, detectTop,
-    calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, isManipulable, formatNum, formatPrice,
+    calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal, isManipulable, formatNum, formatPrice,
     formatOIDelta, getMaintenanceRate, calcLiquidationPrice, calcDCALevels
   };
 }
