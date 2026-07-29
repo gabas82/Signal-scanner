@@ -47,6 +47,10 @@
   .season-bear{background:rgba(255,51,102,0.15);color:var(--red);border:1px solid rgba(255,51,102,0.4);}
   .season-neutral{background:rgba(255,204,0,0.15);color:var(--yellow);border:1px solid rgba(255,204,0,0.4);}
   .season-loading{background:rgba(74,85,104,0.3);color:var(--text2);border:1px solid var(--border);}
+  .alt-radar-none{background:rgba(74,85,104,0.3);color:var(--text2);border:1px solid var(--border);}
+  .alt-radar-pressure{background:rgba(255,204,0,0.15);color:var(--yellow);border:1px solid rgba(255,204,0,0.4);}
+  .alt-radar-expansion{background:rgba(0,255,136,0.15);color:var(--green);border:1px solid rgba(0,255,136,0.4);}
+  .alt-radar-season{background:rgba(0,255,136,0.25);color:#7cff00;border:1px solid #7cff00;}
   .btc-macro-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:0;}
   .btc-macro-item{text-align:center;padding:8px 4px;border-right:1px solid var(--border);}
   .btc-macro-item:last-child{border-right:none;}
@@ -235,6 +239,18 @@
     <div class="btc-macro-item"><div class="btc-macro-label">RSI 90D</div><div class="btc-macro-value" id="btc-rsi90" style="color:var(--text2)">--</div><div class="btc-macro-sub" id="btc-rsi-sub">--</div></div>
   </div>
 </div>
+<div class="btc-macro" id="alt-radar-panel">
+  <div class="btc-macro-header">
+    <div class="btc-macro-title">🔭 ALT RADAR</div>
+    <div class="alt-radar-badge alt-radar-none" id="alt-radar-badge">⏳ ЗАРЕЖДАНЕ</div>
+  </div>
+  <div class="btc-macro-grid">
+    <div class="btc-macro-item"><div class="btc-macro-label">BTC.D</div><div class="btc-macro-value" id="alt-btcd-val" style="color:var(--text2)">--</div><div class="btc-macro-sub" id="alt-btcd-sma">SMA5: --</div></div>
+    <div class="btc-macro-item"><div class="btc-macro-label">TOTAL3</div><div class="btc-macro-value" id="alt-total3-val" style="color:var(--text2)">--</div><div class="btc-macro-sub" id="alt-total3-sma">SMA5: --</div></div>
+    <div class="btc-macro-item"><div class="btc-macro-label">OTHERS</div><div class="btc-macro-value" id="alt-others-val" style="color:var(--text2)">--</div><div class="btc-macro-sub" id="alt-others-sma">SMA5: --</div></div>
+    <div class="btc-macro-item"><div class="btc-macro-label">ALT/BTC</div><div class="btc-macro-value" id="alt-ratio-val" style="color:var(--text2)">--</div><div class="btc-macro-sub" id="alt-radar-days">-- дни история</div></div>
+  </div>
+</div>
 <div id="filter200-banner" class="filter200-banner">🔍 РЕЖИМ ТОП 200–500 · Филтър: -80% от ATH + OI↑ + Vol Spike · Зарежда бавно поради rate limit</div>
 <div id="stale-warning" class="stale-warning">⚠ ПРЕДИШНОТО ОБНОВЯВАНЕ ОЩЕ ТЕЧЕ · ИЗЧАКВАМ ДА ЗАВЪРШИ</div>
 <div class="search-bar">
@@ -338,6 +354,71 @@ async function fetchWithRetry(url, options, retries = 2, backoffMs = 1500) {
   return null;
 }
 
+// Пресъздава личния Pine Script индикатор "Mario – ALT Radar Symbols" (BTC.D
+// пада / TOTAL3 расте / OTHERS расте / ALT-BTC расте спрямо своя 5-дневен SMA).
+// Няма безплатен CoinGecko endpoint за историческа глобална пазарна капитализация
+// (платен endpoint), затова записваме по 1 стойност на календарен ден в
+// localStorage - след ~5 дни редовна употреба се натрупва истински 5-дневен SMA,
+// огледален на индикатора. calcSMA/calcAltRadarScore/calcAltRadarSignal са в
+// signal-logic.js и се тестват отделно.
+const ALT_RADAR_HIST_KEY = 'signal_alt_radar_daily_v1';
+function getAltRadarHistory() {
+  try { return JSON.parse(localStorage.getItem(ALT_RADAR_HIST_KEY) || '[]'); } catch(e) { return []; }
+}
+function saveAltRadarHistory(hist) {
+  try { localStorage.setItem(ALT_RADAR_HIST_KEY, JSON.stringify(hist)); } catch(e) {}
+}
+function recordAltRadarSample(btcD, total3, others, altBtc) {
+  const todayKey = new Date().toISOString().split('T')[0];
+  const hist = getAltRadarHistory();
+  const sample = { date: todayKey, btcD, total3, others, altBtc };
+  if (hist.length && hist[hist.length-1].date === todayKey) hist[hist.length-1] = sample;
+  else hist.push(sample);
+  const trimmed = hist.slice(-40); // пазим ~40 дни, достатъчно за SMA(5) с голям запас
+  saveAltRadarHistory(trimmed);
+  return trimmed;
+}
+async function fetchTop10MarketCap() {
+  try {
+    const r = await fetch('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1');
+    const d = await r.json();
+    if (!Array.isArray(d)) return null;
+    return d.reduce((s,c) => s + (c.market_cap||0), 0);
+  } catch(e) { return null; }
+}
+async function loadAltRadar(btcD, total3, btcMcap) {
+  try {
+    const top10 = await fetchTop10MarketCap();
+    if (top10 == null) return;
+    const totalMcap = btcMcap / (btcD/100);
+    const others = totalMcap - top10;
+    const altBtc = total3 / btcMcap;
+    const hist = recordAltRadarSample(btcD, total3, others, altBtc);
+    const days = hist.length;
+    const btcDSma = calcSMA(hist.map(h=>h.btcD), 5);
+    const total3Sma = calcSMA(hist.map(h=>h.total3), 5);
+    const othersSma = calcSMA(hist.map(h=>h.others), 5);
+    const altBtcSma = calcSMA(hist.map(h=>h.altBtc), 5);
+    const score = calcAltRadarScore(btcD, total3, others, altBtc, btcDSma, total3Sma, othersSma, altBtcSma);
+    const signal = days < 5 ? 'none' : calcAltRadarSignal(score);
+    const el = id => document.getElementById(id);
+    el('alt-btcd-val').textContent = btcD.toFixed(1)+'%';
+    el('alt-btcd-sma').textContent = btcDSma!=null ? 'SMA5: '+btcDSma.toFixed(1)+'%' : 'SMA5: --';
+    el('alt-total3-val').textContent = '$'+formatNum(total3);
+    el('alt-total3-sma').textContent = total3Sma!=null ? 'SMA5: $'+formatNum(total3Sma) : 'SMA5: --';
+    el('alt-others-val').textContent = '$'+formatNum(others);
+    el('alt-others-sma').textContent = othersSma!=null ? 'SMA5: $'+formatNum(othersSma) : 'SMA5: --';
+    el('alt-ratio-val').textContent = altBtc.toFixed(4);
+    el('alt-radar-days').textContent = days+'/5 дни история';
+    const badge = el('alt-radar-badge');
+    if (days < 5) { badge.textContent = '⏳ НАТРУПВА ИСТОРИЯ ('+days+'/5)'; badge.className = 'alt-radar-badge alt-radar-none'; }
+    else if (signal === 'season') { badge.textContent = '🚀 ALT SEASON ('+score+'/4)'; badge.className = 'alt-radar-badge alt-radar-season'; }
+    else if (signal === 'expansion') { badge.textContent = '📈 ALT EXPANSION ('+score+'/4)'; badge.className = 'alt-radar-badge alt-radar-expansion'; }
+    else if (signal === 'pressure') { badge.textContent = '⚡ ALT PRESSURE ('+score+'/4)'; badge.className = 'alt-radar-badge alt-radar-pressure'; }
+    else { badge.textContent = '— НЕУТРАЛЕН ('+score+'/4)'; badge.className = 'alt-radar-badge alt-radar-none'; }
+  } catch(e) { console.error('ALT Radar error:', e); }
+}
+
 async function loadCryptoMarketRow() {
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/global');
@@ -356,6 +437,7 @@ async function loadCryptoMarketRow() {
       if (ethD != null) { el('mkt-ethd').textContent = ethD.toFixed(1)+'%'; el('mkt-ethd-chg').textContent = 'доминанс'; }
       if (totalMcap) { el('mkt-mcap').textContent = '$'+formatNum(totalMcap); const chgEl=el('mkt-mcap-chg'); chgEl.textContent=(mcapChg>=0?'+':'')+mcapChg.toFixed(1)+'%'; chgEl.style.color=mcapChg>=0?'var(--green)':'var(--red)'; }
       if (altMcap) { el('mkt-alt').textContent = '$'+formatNum(altMcap); el('mkt-alt-chg').textContent = 'без BTC+ETH'; }
+      if (btcD != null && totalMcap && btcMcap) loadAltRadar(btcD, altMcap, btcMcap);
     }
     const fg = await fetch('https://api.alternative.me/fng/?limit=1');
     const fgd = await fg.json();

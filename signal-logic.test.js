@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   calcSMA, calcRSI, detectBottom, detectTop, calcSignal, calcSetupQuality,
-  calcLiquidityBias, calcWallBias, isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
+  calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal, isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
   DCA_ENTRY, DCA_LEVERAGE
@@ -305,5 +305,42 @@ describe('calcDCALevels', () => {
     const minorSteps = calcDCALevels(100, 'long', 'SOMEMEME');
     // По-висок maintenance rate при minor -> по-висока (по-близка до входа) ликвидационна цена за LONG
     expect(minorSteps[0].liqPrice).toBeGreaterThan(majorSteps[0].liqPrice);
+  });
+});
+
+describe('calcAltRadarScore', () => {
+  it('връща 0, когато нито едно условие не е изпълнено (или няма SMA история)', () => {
+    expect(calcAltRadarScore(55, 100, 50, 1, null, null, null, null)).toBe(0);
+  });
+  it('брои btc_d<sma условието (BTC доминансът пада)', () => {
+    expect(calcAltRadarScore(54, 100, 50, 1, 55, null, null, null)).toBe(1);
+    expect(calcAltRadarScore(56, 100, 50, 1, 55, null, null, null)).toBe(0);
+  });
+  it('брои total3>sma условието (ALT пазарна капитализация расте)', () => {
+    expect(calcAltRadarScore(55, 105, 50, 1, null, 100, null, null)).toBe(1);
+    expect(calcAltRadarScore(55, 95, 50, 1, null, 100, null, null)).toBe(0);
+  });
+  it('брои всичките 4 условия, когато всички са изпълнени', () => {
+    expect(calcAltRadarScore(54, 105, 55, 1.1, 55, 100, 50, 1)).toBe(4);
+  });
+});
+
+describe('calcAltRadarSignal', () => {
+  it('връща "none" при резултат под прага за pressure', () => {
+    expect(calcAltRadarSignal(1, 2, 3, 4)).toBe('none');
+    expect(calcAltRadarSignal(0)).toBe('none');
+  });
+  it('връща "pressure" при резултат >= pressureMin, но < expansionMin', () => {
+    expect(calcAltRadarSignal(2, 2, 3, 4)).toBe('pressure');
+  });
+  it('връща "expansion" при резултат >= expansionMin, но < seasonMin', () => {
+    expect(calcAltRadarSignal(3, 2, 3, 4)).toBe('expansion');
+  });
+  it('връща "season" при резултат >= seasonMin', () => {
+    expect(calcAltRadarSignal(4, 2, 3, 4)).toBe('season');
+  });
+  it('ползва подразбиращи се прагове 2/3/4, ако не са подадени', () => {
+    expect(calcAltRadarSignal(4)).toBe('season');
+    expect(calcAltRadarSignal(2)).toBe('pressure');
   });
 });
