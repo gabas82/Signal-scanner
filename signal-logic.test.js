@@ -3,6 +3,7 @@ import {
   calcSMA, calcRSI, detectBottom, detectTop, calcSignal, calcSetupQuality,
   calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
   calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
+  calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
   isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
@@ -494,5 +495,107 @@ describe('calcImpulseSignal', () => {
   });
   it('връща {long:false,short:false} при недостатъчно свещи', () => {
     expect(calcImpulseSignal([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }], false)).toEqual({ long: false, short: false });
+  });
+});
+
+describe('calcTrueRangeSeries', () => {
+  it('първата свещ използва само high-low', () => {
+    expect(calcTrueRangeSeries([{ open: 100, high: 105, low: 95, close: 100 }])).toEqual([10]);
+  });
+  it('улавя гап извън диапазона на текущата свещ (по-голям от high-low)', () => {
+    const candles = [
+      { open: 100, high: 100, low: 100, close: 100 },
+      { open: 96, high: 99, low: 95, close: 96 }, // gap надолу: |95-100|=5 > (99-95)=4
+    ];
+    expect(calcTrueRangeSeries(candles)[1]).toBeCloseTo(5);
+  });
+});
+
+describe('calcATR', () => {
+  it('връща null при недостатъчно свещи', () => {
+    expect(calcATR([{ open: 1, high: 2, low: 1, close: 1.5 }], 5)).toBeNull();
+  });
+  it('изчислява средния true range за периода', () => {
+    const candles = Array.from({ length: 5 }, () => ({ open: 100, high: 102, low: 98, close: 100 }));
+    expect(calcATR(candles, 5)).toBeCloseTo(4);
+  });
+});
+
+describe('calcWarmingTier', () => {
+  function baseWithLast(vol, direction) {
+    const base = Array.from({ length: 20 }, () => ({ open: 100, high: 100.05, low: 99.95, close: 100, volume: 1000 }));
+    const last = direction === 'up'
+      ? { open: 99.9, high: 100.15, low: 99.85, close: 100.1, volume: vol }
+      : direction === 'down'
+      ? { open: 100.1, high: 100.15, low: 99.85, close: 99.9, volume: vol }
+      : { open: 100, high: 100.05, low: 99.95, close: 100, volume: vol };
+    return [...base, last];
+  }
+  it('връща tier "none" при нормален обем', () => {
+    expect(calcWarmingTier(baseWithLast(1000, 'up')).tier).toBe('none');
+  });
+  it('връща tier "warm" при ~1.7x обем', () => {
+    const r = calcWarmingTier(baseWithLast(1800, 'up'));
+    expect(r.tier).toBe('warm');
+    expect(r.direction).toBe('up');
+  });
+  it('връща tier "hot" при ~2.6x обем', () => {
+    const r = calcWarmingTier(baseWithLast(2800, 'down'));
+    expect(r.tier).toBe('hot');
+    expect(r.direction).toBe('down');
+  });
+  it('връща tier "super" при >=3x обем', () => {
+    expect(calcWarmingTier(baseWithLast(10000, 'up')).tier).toBe('super');
+  });
+  it('връща tier "none", ако диапазонът не е компресиран (ATR% над прага)', () => {
+    const base = Array.from({ length: 20 }, () => ({ open: 100, high: 100.05, low: 99.95, close: 100, volume: 1000 }));
+    const wideLast = { open: 90, high: 110, low: 85, close: 105, volume: 10000 };
+    expect(calcWarmingTier([...base, wideLast]).tier).toBe('none');
+  });
+  it('easeFactor<1 улеснява прага (Boost Window ефект)', () => {
+    const r = calcWarmingTier(baseWithLast(1200, 'up'), { easeFactor: 0.5 });
+    expect(r.tier).toBe('hot');
+  });
+});
+
+describe('calc4HBigVolume', () => {
+  function candles4h(lastVol, direction) {
+    const base = Array.from({ length: 20 }, () => ({ open: 100, high: 101, low: 99, close: 100, volume: 1000 }));
+    const last = direction === 'up'
+      ? { open: 100, high: 105, low: 99, close: 104, volume: lastVol }
+      : { open: 104, high: 105, low: 99, close: 100, volume: lastVol };
+    return [...base, last];
+  }
+  it('връща active:false при недостатъчно свещи', () => {
+    expect(calc4HBigVolume([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }]).active).toBe(false);
+  });
+  it('връща active:true при обемен spike + посока, независимо от компресия', () => {
+    const r = calc4HBigVolume(candles4h(50000, 'up'));
+    expect(r.active).toBe(true);
+    expect(r.direction).toBe('up');
+  });
+  it('връща active:false без обемен spike', () => {
+    expect(calc4HBigVolume(candles4h(1000, 'up')).active).toBe(false);
+  });
+});
+
+describe('calcDumpCascade', () => {
+  function redCandle(strong) {
+    return strong
+      ? { open: 100, high: 100.1, low: 90, close: 90.5 }
+      : { open: 100, high: 100.1, low: 99, close: 99.5 };
+  }
+  it('връща active:false при недостатъчно свещи', () => {
+    expect(calcDumpCascade([{ open: 1, high: 1, low: 1, close: 1 }]).active).toBe(false);
+  });
+  it('връща active:true при >=2 силно червени свещи от последните 3', () => {
+    const r = calcDumpCascade([redCandle(false), redCandle(true), redCandle(true)]);
+    expect(r.active).toBe(true);
+    expect(r.redCount).toBe(2);
+  });
+  it('връща active:false при само 1 силно червена свещ', () => {
+    const r = calcDumpCascade([redCandle(false), redCandle(false), redCandle(true)]);
+    expect(r.active).toBe(false);
+    expect(r.redCount).toBe(1);
   });
 });

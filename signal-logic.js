@@ -201,6 +201,82 @@ function calcImpulseSignal(candles, flushActive, opts = {}) {
   };
 }
 
+// ─── "Mario WARMING Gate + SUPER Override" (личен Pine Script индикатор) ─────
+// True Range / ATR (проста SMA версия, за консистентност с останалите
+// приближени индикатори в приложението - не истинската Wilder RMA).
+function calcTrueRangeSeries(candles) {
+  return candles.map((c, i) => {
+    if (i === 0) return c.high - c.low;
+    const prevClose = candles[i - 1].close;
+    return Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose));
+  });
+}
+function calcATR(candles, period) {
+  return calcSMA(calcTrueRangeSeries(candles), period);
+}
+
+// Оценява волуменния "warming" tier на последната свещ (1H по подразбиране в
+// оригинала): WARMING/HOT/SUPER спрямо обемната MA, само ако диапазонът е
+// компресиран (ATR% <= праг) - т.е. "затишие преди буря". easeFactor<1 обхваща
+// "Boost Window" ефекта (по-лесно задействане за няколко часа след голям 4Ч обем).
+function calcWarmingTier(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, atrLen = opts.atrLen ?? 20;
+  const atrPctMax = opts.atrPctMax ?? 0.75;
+  const useCompression = opts.useCompression ?? true;
+  const easeFactor = opts.easeFactor ?? 1;
+  const warm1 = (opts.warm1x ?? 1.5) * easeFactor;
+  const warm2 = (opts.warm2x ?? 2.0) * easeFactor;
+  const warm3 = (opts.warm3x ?? 3.0) * easeFactor;
+  const n = candles.length;
+  if (n < Math.max(volLen, atrLen) + 1) return { tier: 'none', volX: null, atrPct: null, direction: 'flat' };
+  const volumes = candles.map(c => c.volume);
+  const volMA = calcSMA(volumes, volLen);
+  const atr = calcATR(candles, atrLen);
+  const last = candles[n - 1];
+  if (volMA == null || atr == null) return { tier: 'none', volX: null, atrPct: null, direction: 'flat' };
+  const volX = volMA > 0 ? last.volume / volMA : 0;
+  const atrPct = (atr / last.close) * 100;
+  const compressOK = !useCompression || atrPct <= atrPctMax;
+  const direction = last.close > last.open ? 'up' : last.close < last.open ? 'down' : 'flat';
+  let tier = 'none';
+  if (compressOK && direction !== 'flat') {
+    if (volX >= warm3) tier = 'super';
+    else if (volX >= warm2) tier = 'hot';
+    else if (volX >= warm1) tier = 'warm';
+  }
+  return { tier, volX, atrPct, direction };
+}
+
+// 4Ч "голям обем" потвърждение - независимо от компресията, само посока + spike.
+function calc4HBigVolume(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, threshold = opts.threshold ?? 2.5;
+  const n = candles.length;
+  if (n < volLen + 1) return { active: false, direction: 'flat', volX: null };
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  if (volMA == null) return { active: false, direction: 'flat', volX: null };
+  const last = candles[n - 1];
+  const volX = volMA > 0 ? last.volume / volMA : 0;
+  const direction = last.close > last.open ? 'up' : last.close < last.open ? 'down' : 'flat';
+  return { active: volX >= threshold && direction !== 'flat', direction, volX };
+}
+
+// Dump Cascade (15м): брои "силно червени" свещи (тяло >= dumpBodyPctMin % от
+// диапазона) сред последните dumpBars - >= dumpMinCount означава каскаден срив.
+function calcDumpCascade(candles, opts = {}) {
+  const dumpBars = opts.dumpBars ?? 3, dumpMinCount = opts.dumpMinCount ?? 2;
+  const dumpBodyPctMin = opts.dumpBodyPctMin ?? 60;
+  const n = candles.length;
+  if (n < dumpBars) return { active: false, redCount: 0 };
+  let redCount = 0;
+  for (let i = n - dumpBars; i < n; i++) {
+    const c = candles[i];
+    const range = Math.max(c.high - c.low, 1e-9);
+    const bodyPct = (Math.abs(c.close - c.open) / range) * 100;
+    if (c.close < c.open && bodyPct >= dumpBodyPctMin) redCount++;
+  }
+  return { active: redCount >= dumpMinCount, redCount };
+}
+
 function detectBottom(coin) {
   let score = 0;
   if (Math.abs(coin.funding) < 0.03) score++;
@@ -379,6 +455,7 @@ if (typeof module !== 'undefined' && module.exports) {
     SYMBOL_MAP, fixSymbol, calcSMA, calcRSI, detectBottom, detectTop,
     calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
     calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
+    calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
     isManipulable, formatNum, formatPrice,
     formatOIDelta, getMaintenanceRate, calcLiquidationPrice, calcDCALevels
   };
