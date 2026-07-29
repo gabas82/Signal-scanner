@@ -54,6 +54,153 @@ function calcRSI(closes, period) {
   return 100 - (100 / (1 + avgGain/avgLoss));
 }
 
+// Масив от RSI стойности (същата проста average-gain/average-loss формула като
+// calcRSI, за консистентност) - по една на всяка позиция >= period, null преди
+// това. Нужен е за сигнали, които сравняват RSI на текущата спрямо по-стари свещи
+// (bullish divergence), не само последната стойност.
+function calcRSISeries(closes, period) {
+  const series = new Array(closes.length).fill(null);
+  for (let i = period; i < closes.length; i++) {
+    series[i] = calcRSI(closes.slice(0, i + 1), period);
+  }
+  return series;
+}
+
+// Масив от EMA стойности (стандартна експоненциална формула, seed-ната със SMA
+// на първите `period` затваряния) - нужен за crossover детекция (SHIFT сигнала).
+function calcEMASeries(closes, period) {
+  if (closes.length < period) return new Array(closes.length).fill(null);
+  const series = new Array(closes.length).fill(null);
+  const k = 2 / (period + 1);
+  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  series[period - 1] = ema;
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+    series[i] = ema;
+  }
+  return series;
+}
+
+// ─── "Mario – Capitulation Suite" (личен Pine Script индикатор на потребителя) ───
+// Пресъздава FLUSH/BASE/SQUEEZE/SHIFT/IMPULSE сигналите му в чист JS върху масив
+// от свещи {open,high,low,close,volume} (най-стара -> най-нова). "Cooldown"-ът от
+// оригинала (не повтаряй сигнал N свещи след предишния) е изпуснат нарочно - тук
+// само показваме дали условието е вярно на последната свещ, без anti-spam логика
+// за push известия, каквато TradingView алармите имат.
+
+// FLUSH: капитулационен flush - екстремно ниска RSI + вол spike + голям диапазон +
+// мечка свещ, филтрирано по HTF (4ч+1д RSI) oversold, за да не хваща шум.
+function calcFlushSignal(candles, htfExtreme, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, rsiFlushLevel = opts.rsiFlushLevel ?? 25;
+  const volLen = opts.volLen ?? 20, volFlushMult = opts.volFlushMult ?? 2.5;
+  const rangeLen = opts.rangeLen ?? 20, rangeMult = opts.rangeMult ?? 2.0;
+  const useHTFFilter = opts.useHTFFilter ?? true;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen, rangeLen) + 1) return false;
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  if (rsi == null || volMA == null || rangeMA == null) return false;
+  const last = candles[n - 1];
+  const volSpike = last.volume > volMA * volFlushMult;
+  const rangeSpike = (last.high - last.low) > rangeMA * rangeMult;
+  const bearCandle = last.close < last.open;
+  const htfFilter = useHTFFilter ? htfExtreme : true;
+  return rsi < rsiFlushLevel && volSpike && rangeSpike && bearCandle && htfFilter;
+}
+
+// BASE: скрита bullish дивергенция (цената прави по-ниско дъно, RSI прави по-високо
+// дъно) + сух обем + малък диапазон + RSI се възстановява над базовото ниво.
+function calcBaseSignal(candles, htfExtreme, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, rsiBaseLevel = opts.rsiBaseLevel ?? 35;
+  const volLen = opts.volLen ?? 20, volDryMult = opts.volDryMult ?? 0.8;
+  const rangeLen = opts.rangeLen ?? 20;
+  const useHTFFilter = opts.useHTFFilter ?? true;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen, rangeLen) + 11) return false;
+  const closes = candles.map(c => c.close);
+  const lows = candles.map(c => c.low);
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const rsiSeries = calcRSISeries(closes, rsiLen);
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  const rsi = rsiSeries[n - 1], rsi5 = rsiSeries[n - 6], rsi10 = rsiSeries[n - 11];
+  if (rsi == null || rsi5 == null || rsi10 == null || volMA == null || rangeMA == null) return false;
+  const priceLowerLow = lows[n - 1] < lows[n - 6] && lows[n - 6] < lows[n - 11];
+  const rsiHigherLow = rsi > rsi5 && rsi5 > rsi10;
+  const bullDiv = priceLowerLow && rsiHigherLow;
+  const last = candles[n - 1];
+  const volDry = last.volume < volMA * volDryMult;
+  const smallRange = (last.high - last.low) < rangeMA;
+  const rsiRecover = rsi > rsiBaseLevel;
+  const htfFilter = useHTFFilter ? htfExtreme : true;
+  return bullDiv && volDry && smallRange && rsiRecover && htfFilter;
+}
+
+// SQUEEZE: бичи свещ + вол spike (сама сила като FLUSH прага) + RSI над 40 - типично
+// кратък шорт-скуийз изблик.
+function calcSqueezeSignal(candles, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, volLen = opts.volLen ?? 20, volFlushMult = opts.volFlushMult ?? 2.5;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen) + 1) return false;
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const volMA = calcSMA(volumes, volLen);
+  if (rsi == null || volMA == null) return false;
+  const last = candles[n - 1];
+  const bullCandle = last.close > last.open;
+  const volSpike = last.volume > volMA * volFlushMult;
+  return bullCandle && volSpike && rsi > 40;
+}
+
+// SHIFT: бърз EMA пресича нагоре бавния EMA + RSI над 45 - смяна на тренда нагоре.
+function calcShiftSignal(candles, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
+  const n = candles.length;
+  if (n < emaSlowLen + 1) return false;
+  const closes = candles.map(c => c.close);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const emaFastSeries = calcEMASeries(closes, emaFastLen);
+  const emaSlowSeries = calcEMASeries(closes, emaSlowLen);
+  const fNow = emaFastSeries[n - 1], fPrev = emaFastSeries[n - 2];
+  const sNow = emaSlowSeries[n - 1], sPrev = emaSlowSeries[n - 2];
+  if (rsi == null || fNow == null || fPrev == null || sNow == null || sPrev == null) return false;
+  const crossover = fPrev <= sPrev && fNow > sNow;
+  return crossover && rsi > 45;
+}
+
+// IMPULSE LONG/SHORT: тясна предходна свещ (компресия) + вол build-up + пробив на
+// 10-свещния хай/лоу - ранен импулс в посока на пробива. Потиска се, ако FLUSH вече
+// е активен на същата свещ (за да не се двоят сигналите).
+function calcImpulseSignal(candles, flushActive, opts = {}) {
+  const volLen = opts.volLen ?? 20, volImpulseMult = opts.volImpulseMult ?? 1.8;
+  const rangeLen = opts.rangeLen ?? 20;
+  const n = candles.length;
+  if (n < Math.max(volLen, rangeLen, 10) + 2) return { long: false, short: false };
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  if (volMA == null || rangeMA == null) return { long: false, short: false };
+  const prev = candles[n - 2], last = candles[n - 1];
+  const tightRangePrev = (prev.high - prev.low) < rangeMA * 0.7;
+  const volBuild = last.volume > volMA * volImpulseMult;
+  const window = candles.slice(n - 11, n - 1);
+  const highest10 = Math.max(...window.map(c => c.high));
+  const lowest10 = Math.min(...window.map(c => c.low));
+  const breakHigh = last.close > highest10;
+  const breakLow = last.close < lowest10;
+  return {
+    long: tightRangePrev && volBuild && breakHigh && !flushActive,
+    short: tightRangePrev && volBuild && breakLow && !flushActive,
+  };
+}
+
 function detectBottom(coin) {
   let score = 0;
   if (Math.abs(coin.funding) < 0.03) score++;
@@ -230,7 +377,9 @@ if (typeof module !== 'undefined' && module.exports) {
     DCA_LEVERAGE, DCA_ENTRY, MAJOR_COINS, SEMI_MAJOR_COINS,
     MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
     SYMBOL_MAP, fixSymbol, calcSMA, calcRSI, detectBottom, detectTop,
-    calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal, isManipulable, formatNum, formatPrice,
+    calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
+    calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
+    isManipulable, formatNum, formatPrice,
     formatOIDelta, getMaintenanceRate, calcLiquidationPrice, calcDCALevels
   };
 }

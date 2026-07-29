@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   calcSMA, calcRSI, detectBottom, detectTop, calcSignal, calcSetupQuality,
-  calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal, isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
+  calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
+  calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
+  isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
   DCA_ENTRY, DCA_LEVERAGE
@@ -342,5 +344,155 @@ describe('calcAltRadarSignal', () => {
   it('ползва подразбиращи се прагове 2/3/4, ако не са подадени', () => {
     expect(calcAltRadarSignal(4)).toBe('season');
     expect(calcAltRadarSignal(2)).toBe('pressure');
+  });
+});
+
+describe('calcRSISeries', () => {
+  it('връща null преди период и съвпада с calcRSI на всяка валидна позиция', () => {
+    const closes = [10, 11, 12, 11, 13, 14, 12, 15, 16, 14];
+    const series = calcRSISeries(closes, 5);
+    expect(series[0]).toBeNull();
+    expect(series[4]).toBeNull();
+    for (let i = 5; i < closes.length; i++) {
+      expect(series[i]).toBeCloseTo(calcRSI(closes.slice(0, i + 1), 5));
+    }
+  });
+});
+
+describe('calcEMASeries', () => {
+  it('връща масив от null-ове, ако няма достатъчно данни', () => {
+    expect(calcEMASeries([1, 2], 5)).toEqual([null, null]);
+  });
+  it('първата стойност е SMA на първите `period` затваряния', () => {
+    const closes = [10, 20, 30, 40, 50, 60];
+    const series = calcEMASeries(closes, 3);
+    expect(series[2]).toBeCloseTo((10 + 20 + 30) / 3);
+  });
+  it('следва рекурсивната EMA формула за следващата позиция', () => {
+    const closes = [10, 20, 30, 40];
+    const series = calcEMASeries(closes, 3);
+    const k = 2 / 4;
+    const expected = 40 * k + series[2] * (1 - k);
+    expect(series[3]).toBeCloseTo(expected);
+  });
+});
+
+function buildDecliningCandles(n, startPrice = 200, step = 2) {
+  const candles = [];
+  let price = startPrice;
+  for (let i = 0; i < n; i++) {
+    const open = price, close = price - step;
+    candles.push({ open, high: open + 0.1, low: close - 0.1, close, volume: 1000 });
+    price = close;
+  }
+  return candles;
+}
+function buildRisingCandles(n, startPrice = 10, step = 2) {
+  const candles = [];
+  let price = startPrice;
+  for (let i = 0; i < n; i++) {
+    const open = price, close = price + step;
+    candles.push({ open, high: close + 0.1, low: open - 0.1, close, volume: 1000 });
+    price = close;
+  }
+  return candles;
+}
+
+describe('calcFlushSignal', () => {
+  it('връща true при екстремно ниска RSI + вол spike + range spike + мечка свещ + HTF oversold', () => {
+    const candles = buildDecliningCandles(25);
+    const last = candles[candles.length - 1];
+    const originalClose = last.close;
+    last.high = last.open + 0.1;
+    last.low = originalClose - 50;
+    last.close = last.low + 1;
+    last.volume = 100000;
+    expect(calcFlushSignal(candles, true)).toBe(true);
+  });
+  it('връща false, ако HTF филтърът не е в oversold', () => {
+    const candles = buildDecliningCandles(25);
+    const last = candles[candles.length - 1];
+    const originalClose = last.close;
+    last.high = last.open + 0.1;
+    last.low = originalClose - 50;
+    last.close = last.low + 1;
+    last.volume = 100000;
+    expect(calcFlushSignal(candles, false)).toBe(false);
+  });
+  it('връща false, ако не е свещ с достатъчно нисък RSI (възходящ пазар)', () => {
+    const candles = buildRisingCandles(25);
+    const last = candles[candles.length - 1];
+    last.volume = 100000;
+    last.high = last.close + 50;
+    expect(calcFlushSignal(candles, true)).toBe(false);
+  });
+  it('връща false при недостатъчно свещи', () => {
+    expect(calcFlushSignal(buildDecliningCandles(5), true)).toBe(false);
+  });
+});
+
+describe('calcSqueezeSignal', () => {
+  it('връща true при бичи свещ + вол spike + RSI>40', () => {
+    const candles = buildRisingCandles(25);
+    const last = candles[candles.length - 1];
+    last.volume = 100000; // голям spike
+    expect(calcSqueezeSignal(candles)).toBe(true);
+  });
+  it('връща false без вол spike', () => {
+    const candles = buildRisingCandles(25);
+    expect(calcSqueezeSignal(candles)).toBe(false);
+  });
+  it('връща false при мечка свещ', () => {
+    const candles = buildDecliningCandles(25);
+    const last = candles[candles.length - 1];
+    last.volume = 100000;
+    expect(calcSqueezeSignal(candles)).toBe(false);
+  });
+});
+
+describe('calcShiftSignal', () => {
+  it('връща true при EMA crossover нагоре + RSI>45', () => {
+    // Плоска база (fast EMA == slow EMA), после точно 1 свещ нагоре - fast EMA
+    // реагира по-бързо и се качва над slow EMA точно на последната свещ (fresh crossover).
+    const flat = Array.from({ length: 55 }, () => ({ open: 100, high: 100.5, low: 99.5, close: 100, volume: 1000 }));
+    const candles = [...flat, { open: 100, high: 105.5, low: 99.5, close: 105, volume: 1000 }];
+    expect(calcShiftSignal(candles)).toBe(true);
+  });
+  it('връща false без EMA crossover (плосък пазар)', () => {
+    const flat = Array.from({ length: 60 }, () => ({ open: 100, high: 100.5, low: 99.5, close: 100, volume: 1000 }));
+    expect(calcShiftSignal(flat)).toBe(false);
+  });
+});
+
+describe('calcImpulseSignal', () => {
+  it('връща long:true при компресия + вол build-up + пробив нагоре', () => {
+    const base = Array.from({ length: 22 }, () => ({ open: 100, high: 100.5, low: 99.5, close: 100, volume: 1000 }));
+    const tight = { open: 100, high: 100.1, low: 99.9, close: 100, volume: 1000 };
+    const breakout = { open: 100, high: 110, low: 99.9, close: 109, volume: 5000 };
+    const candles = [...base, tight, breakout];
+    const result = calcImpulseSignal(candles, false);
+    expect(result.long).toBe(true);
+    expect(result.short).toBe(false);
+  });
+  it('връща short:true при компресия + вол build-up + пробив надолу', () => {
+    const base = Array.from({ length: 22 }, () => ({ open: 100, high: 100.5, low: 99.5, close: 100, volume: 1000 }));
+    const tight = { open: 100, high: 100.1, low: 99.9, close: 100, volume: 1000 };
+    const breakout = { open: 100, high: 100.1, low: 90, close: 91, volume: 5000 };
+    const candles = [...base, tight, breakout];
+    const result = calcImpulseSignal(candles, false);
+    expect(result.short).toBe(true);
+    expect(result.long).toBe(false);
+  });
+  it('потиска се, ако flushActive=true', () => {
+    const base = Array.from({ length: 22 }, () => ({ open: 100, high: 100.5, low: 99.5, close: 100, volume: 1000 }));
+    const tight = { open: 100, high: 100.1, low: 99.9, close: 100, volume: 1000 };
+    const breakout = { open: 100, high: 110, low: 99.9, close: 109, volume: 5000 };
+    const candles = [...base, tight, breakout];
+    const result = calcImpulseSignal(candles, true);
+    expect(result.long).toBe(false);
+    expect(result.short).toBe(false);
+  });
+  it('връща {long:false,short:false} при недостатъчно свещи', () => {
+    expect(calcImpulseSignal([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }], false)).toEqual({ long: false, short: false });
   });
 });
