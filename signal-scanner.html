@@ -1105,7 +1105,7 @@ function updateStats() {
   if (btc) { const el=document.getElementById('stat-btc'); el.textContent=(btc.chg24>=0?'+':'')+btc.chg24.toFixed(1)+'%'; el.style.color=btc.chg24>=0?'var(--green)':'var(--red)'; }
 }
 
-async function loadAll() {
+async function loadAll(isAuto) {
   // Защита срещу презастъпващи се refresh цикли: ако предишният loadAll() (вкл. ATH/ATL и kline async верига)
   // още не е приключил, пропускаме новия цикъл вместо да стартираме паралелен fetch, който чупи allCoins.
   if (isLoading) {
@@ -1117,7 +1117,15 @@ async function loadAll() {
   isLoading = true;
   const btn = document.getElementById('refresh-btn');
   if (btn) btn.disabled = true;
-  document.getElementById('main-content').innerHTML = `<div class="loading">ЗАРЕЖДАНЕ...<div class="loading-bar"><div class="loading-fill"></div></div></div>`;
+  // "filter200"/"capitulation" имат собствени, скъпи lazy-load изгледи (loadFilter200/
+  // loadCapitulation), които НЕ минават през renderList(). При автоматично 60s опресняване
+  // не ги пипаме - renderList() не разпознава тези филтри и би показал "няма монети" (счупен
+  // изглед) вместо реалния резултат от последното сканиране. Ръчният REFRESH бутон обаче
+  // трябва да презарежда каквото гледаш в момента, затова той винаги минава isAuto=false.
+  const isSpecialTab = currentFilter === 'filter200' || currentFilter === 'capitulation';
+  if (!(isAuto && isSpecialTab)) {
+    document.getElementById('main-content').innerHTML = `<div class="loading">ЗАРЕЖДАНЕ...<div class="loading-bar"><div class="loading-fill"></div></div></div>`;
+  }
   try {
     const [trendList, gainerSymbols, oiSymbols] = await Promise.all([fetchTrending(), fetchTopGainers(), fetchTopOI()]);
     trendingSymbols = new Set(trendList);
@@ -1130,7 +1138,11 @@ async function loadAll() {
       results.push(...batchResults.filter(r=>r!==null));
     }
     allCoins = results.filter(c=>c.vol24>1000000);
-    updateStats(); renderList(); loadLiqLevels(); loadWalls();
+    updateStats();
+    if (currentFilter === 'filter200') { if (!isAuto) loadFilter200(); }
+    else if (currentFilter === 'capitulation') { if (!isAuto) loadCapitulation(); }
+    else { renderList(); }
+    loadLiqLevels(); loadWalls();
     const now = new Date();
     document.getElementById('last-update').textContent = `ОБНОВЕНО: ${now.toLocaleTimeString('bg')} · AUTO 60s · ${allCoins.length} МОНЕТИ`;
     loadBTCMacro();
@@ -1147,7 +1159,7 @@ async function loadAll() {
   }
 }
 
-function startAutoRefresh() { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = setInterval(() => { loadAll(); }, REFRESH_INTERVAL_MS); }
+function startAutoRefresh() { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = setInterval(() => { loadAll(true); }, REFRESH_INTERVAL_MS); }
 loadAll(); startAutoRefresh();
 
 function openDCA(symbol, price) { openDCAView(); document.getElementById('dca-symbol').value=symbol||''; document.getElementById('dca-price').value=price||''; if(symbol&&price)renderDCA(); }
