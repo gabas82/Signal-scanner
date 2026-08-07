@@ -332,6 +332,7 @@
 <script>
 const WORKER_URL = 'https://orange-grass-d809.gabas82.workers.dev';
 const REFRESH_INTERVAL_MS = 60000; // 1 минута (беше 30s)
+const CAPITULATION_KLINE_TTL_MS = 60000; // кратък кеш за CAPITULATION - виж fetchKlines()
 // Реалният таван на ls/ss в calcSignal (виж signal-logic.js): chg24 до +3, L/S% до +2,
 // funding до +2 (само за ss - за ls макс е +1), vol24 +1 (само за ls), isTrending +1,
 // ликвидационен уклон +1. Прагът "екстремен резултат" за сортиране най-отгоре е
@@ -342,12 +343,16 @@ const EXTREME_SCORE_PCT = 0.8;
 const EXTREME_SCORE = Math.round(MAX_SIGNAL_SCORE * EXTREME_SCORE_PCT);
 let allCoins = [];
 let currentFilter = 'all';
+// filter200/capitulation имат собствени изгледи (loadFilter200/loadCapitulation),
+// които НЕ минават през renderList() - тя не ги разпознава и би показала "няма
+// монети" върху резултатите им. Всяко място, което обмисля да вика renderList()
+// "отстрани" (auto-refresh, промяна на wall bias и т.н.), трябва да провери това първо.
+function isSpecialTab() { return currentFilter === 'filter200' || currentFilter === 'capitulation'; }
 let searchQuery = '';
 let refreshTimer = null;
 let trendingSymbols = new Set();
 let isLoading = false; // пречи на презастъпващи се refresh цикли
 let btcAthCache = { value: null, ts: 0 };
-const liqCache = {};
 const athCache = {};
 const klineCache = {};
 const wallCache = {};
@@ -528,9 +533,11 @@ async function loadMacroRow() {
 // наклона от тях (calcWallBias) и го записва върху coin.liqBias, за да участва
 // в SETUP QUALITY / calcSignal - заместител на CoinGlass ликвидационната карта,
 // която се оказа заключена зад платен план (виж calcWallBias за детайли).
-// Ако за поне една монета това промени резултата, списъкът се пре-рендира
-// ЕДИН път (refreshed=true пази от безкраен цикъл), а loadWalls(true)/
-// loadLiqLevels() веднага след това връщат вече кешираните данни без нов fetch.
+// Ако за поне една монета това промени резултата, списъкът се пре-рендира ЕДИН
+// път (refreshed=true пази от безкраен цикъл) - НО само ако сме на обикновен
+// изглед: на filter200/capitulation renderList() би заменил резултатите с "няма
+// монети" (виж isSpecialTab()), затова там просто пропускаме пре-рендера - при
+// следващото ръчно сканиране на таба score-ът ще се отрази вече актуален.
 async function loadWalls(refreshed) {
   const visible = document.querySelectorAll('.coin-card');
   let biasChanged = false;
@@ -573,7 +580,7 @@ async function loadWalls(refreshed) {
       wallEl.innerHTML = rows;
     } catch(e) { wallEl.innerHTML = `<span style="color:var(--text2)">📊 СТЕНИ: --</span>`; }
   }
-  if (biasChanged && !refreshed) { renderList(); loadWalls(true); loadLiqLevels(); }
+  if (biasChanged && !refreshed && !isSpecialTab()) { renderList(); loadWalls(true); }
   updateStats();
 }
 
@@ -615,7 +622,7 @@ async function loadFilter200() {
   if (results.length === 0) { content.innerHTML = `<div class="no-results">НЯМА МОНЕТИ С ВСИЧКИ ФИЛТРИ (-80% ATH + OI↑ + VOL SPIKE)</div>`; return; }
   const html = results.map((c, i) => renderCard(c, i)).join('');
   content.innerHTML = `<div style="padding:8px 14px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);">📊 ${results.length} МОНЕТИ · -80% ATH + OI↑ + VOL SPIKE</div><div class="coins-list">${html}</div>`;
-  loadLiqLevels(); loadWalls();
+  loadWalls();
 }
 
 function klinesToCandles(klines) {
@@ -677,11 +684,11 @@ async function loadCapitulation() {
   for (const coin of allCoins) {
     try {
       const [k15, k5, k1h, k4h, k1d] = await Promise.all([
-        fetchKlines(coin.fullSymbol, '15m', 40),
-        fetchKlines(coin.fullSymbol, '5m', 40),
-        fetchKlines(coin.fullSymbol, '1h', 60),
-        fetchKlines(coin.fullSymbol, '4h', 20),
-        fetchKlines(coin.fullSymbol, '1d', 20),
+        fetchKlines(coin.fullSymbol, '15m', 40, CAPITULATION_KLINE_TTL_MS),
+        fetchKlines(coin.fullSymbol, '5m', 40, CAPITULATION_KLINE_TTL_MS),
+        fetchKlines(coin.fullSymbol, '1h', 60, CAPITULATION_KLINE_TTL_MS),
+        fetchKlines(coin.fullSymbol, '4h', 20, CAPITULATION_KLINE_TTL_MS),
+        fetchKlines(coin.fullSymbol, '1d', 20, CAPITULATION_KLINE_TTL_MS),
       ]);
       const c15 = klinesToCandles(k15), c5 = klinesToCandles(k5), c1h = klinesToCandles(k1h);
       const c4h = klinesToCandles(k4h), c1d = klinesToCandles(k1d);
@@ -774,7 +781,7 @@ async function loadCapitulation() {
 
   const html = results.map((c,i) => renderCard(c,i)).join('');
   content.innerHTML = `<div style="padding:8px 14px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);">🔥 ${results.length} МОНЕТИ С АКТИВЕН CAPITULATION/WARMING СИГНАЛ</div><div class="coins-list">${html}</div>`;
-  loadLiqLevels(); loadWalls();
+  loadWalls();
 }
 
 const BASE_SYMBOLS = [
@@ -788,9 +795,13 @@ const BASE_SYMBOLS = [
   'SAHARAUSDT','RAVEUSDT'
 ];
 
-async function fetchKlines(symbol, interval, limit) {
+// maxAgeMs по подразбиране е 1ч - подходящо за бавни/дневни данни (BTC macro, golden
+// cross). CAPITULATION таба обаче чете 5м/15м свещи за WARMING/MM сигналите - 1ч кеш
+// там би показвал сигнали, изчислени от свещ до 60 мин стара, въпреки че табът е
+// нарочно "сканирай сега" (не се auto-refresh-ва). Затова подава свой, много по-кратък TTL.
+async function fetchKlines(symbol, interval, limit, maxAgeMs = 3600000) {
   const key = `${symbol}_${interval}_${limit}`;
-  if (klineCache[key] && klineCache[key].ts > Date.now() - 3600000) return klineCache[key].data;
+  if (klineCache[key] && klineCache[key].ts > Date.now() - maxAgeMs) return klineCache[key].data;
   try {
     const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
     const data = await r.json(); klineCache[key] = {data, ts: Date.now()}; return data;
@@ -900,25 +911,12 @@ async function fetchOIDelta(symbol) {
   } catch(e) { return 0; }
 }
 
-async function fetchLiqLevels(symbol) {
-  try {
-    const sym = symbol.replace('USDT','');
-    const d = await cgFetch(`/api/futures/liquidation/aggregated-heatmap/model1?symbol=${sym}&range=3d`);
-    if (!d.data) return null; return d.data;
-  } catch(e) { return null; }
-}
-
-async function getLiqNearPrice(symbol, price) {
-  if (liqCache[symbol] && liqCache[symbol].ts > Date.now() - 300000) return liqCache[symbol].levels;
-  const data = await fetchLiqLevels(symbol); if (!data) return null;
-  const levels = data.y || []; const liqData = data.liq || [];
-  const combined = levels.map((p, i) => ({ price: parseFloat(p), amount: Array.isArray(liqData[i]) ? liqData[i].reduce((a,b) => a + parseFloat(b||0), 0) : parseFloat(liqData[i]||0) })).filter(l => l.amount > 0);
-  combined.sort((a,b) => b.amount - a.amount);
-  const top20 = combined.slice(0, 20);
-  const above = top20.filter(l => l.price > price).sort((a,b) => a.price - b.price).slice(0,2);
-  const below = top20.filter(l => l.price < price).sort((a,b) => b.price - a.price).slice(0,2);
-  const result = {above, below}; liqCache[symbol] = {levels: result, ts: Date.now()}; return result;
-}
+// CoinGlass ликвидационната карта е трайно недостъпна с текущия план (401
+// "Upgrade plan" - потвърдено директно от CoinGlass), затова целият stack около
+// нея (fetchLiqLevels/getLiqNearPrice/loadLiqLevels/liqCache/"ЛИК НИВА" секцията)
+// е премахнат - гарантирано никога не връщаше данни, а само хабеше по една
+// заявка на видима монета при всяко зареждане. calcWallBias/loadWalls() вече
+// покрива тази роля в SETUP QUALITY score-а през безплатната Binance книга.
 
 const geckoIdMap = {
   'BTCUSDT':'bitcoin','ETHUSDT':'ethereum','SOLUSDT':'solana','BNBUSDT':'binancecoin','XRPUSDT':'ripple',
@@ -1129,9 +1127,6 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
       </div>
       <div class="ls-bar-wrap"><div class="ls-bar-fill" style="width:${coin.longPct}%"></div></div>
     </div>
-    <div class="liq-section" id="liq-${coin.fullSymbol}" style="padding:6px 12px;border-top:1px solid var(--border);display:flex;justify-content:space-between;font-family:'Share Tech Mono',monospace;font-size:10px;">
-      <span style="color:var(--text2)">🔴 ЛИК НИВА: зареждане...</span>
-    </div>
     <div class="wall-section" id="wall-${coin.fullSymbol}">
       <span style="color:var(--text2)">📊 СТЕНИ: зареждане...</span>
     </div>
@@ -1156,7 +1151,7 @@ function setFilter(filter, el) {
   if (filter === 'filter200') { banner.classList.add('active'); loadFilter200(); return; }
   else { banner.classList.remove('active'); }
   if (filter === 'capitulation') { loadCapitulation(); return; }
-  renderList(); loadLiqLevels(); loadWalls();
+  renderList(); loadWalls();
 }
 
 function openDCAView() {
@@ -1164,37 +1159,6 @@ function openDCAView() {
   document.querySelector('[data-tab="dca"]').className = 'tab active-dca';
   document.getElementById('scanner-view').style.display = 'none';
   document.getElementById('dca-view').style.display = 'block';
-}
-
-// След зареждане на ликвидационните нива за всяка видима монета, изчислява дали
-// има близък доминиращ ликвидационен клъстер (calcLiquidityBias) и го записва
-// върху coin.liqBias, за да участва в SETUP QUALITY score-а (calcSetupQuality).
-// Ако за поне една монета това промени резултата, списъкът се пре-рендира
-// ЕДИН път (refreshed=true пази от безкраен цикъл), а loadLiqLevels(true) веднага
-// след това връща вече кешираните "ЛИК НИВА" от liqCache без нов fetch.
-async function loadLiqLevels(refreshed) {
-  const visible = document.querySelectorAll('.coin-card');
-  let biasChanged = false;
-  for (const card of visible) {
-    const liqEl = card.querySelector('[id^="liq-"]'); if (!liqEl) continue;
-    const sym = liqEl.id.replace('liq-','');
-    const priceEl = card.querySelector('.coin-price'); if (!priceEl) continue;
-    const price = parseFloat(priceEl.textContent.replace('$','').replace(',',''));
-    try {
-      const levels = await getLiqNearPrice(sym, price);
-      if (!levels) { liqEl.innerHTML = `<span style="color:var(--text2);font-size:10px;">🔴 ЛИК: няма данни</span>`; continue; }
-      const aboveHtml = levels.above.length > 0 ? levels.above.map(l=>`<span style="color:var(--red)">▲$${formatPrice(l.price)}</span>`).join(' ') : '<span style="color:var(--text2)">--</span>';
-      const belowHtml = levels.below.length > 0 ? levels.below.map(l=>`<span style="color:var(--green)">▼$${formatPrice(l.price)}</span>`).join(' ') : '<span style="color:var(--text2)">--</span>';
-      liqEl.innerHTML = `<div style="width:100%;display:flex;justify-content:space-between;"><div><span style="color:var(--text2);font-size:9px;">ЛИК↑ </span>${aboveHtml}</div><div><span style="color:var(--text2);font-size:9px;">ЛИК↓ </span>${belowHtml}</div></div>`;
-      const coin = allCoins.find(c => c.fullSymbol === sym);
-      if (coin) {
-        const bias = calcLiquidityBias(levels.above, levels.below, coin.price).bias;
-        if (coin.liqBias !== bias) { coin.liqBias = bias; biasChanged = true; }
-      }
-    } catch(e) { liqEl.innerHTML = `<span style="color:var(--text2);font-size:10px;">--</span>`; }
-  }
-  if (biasChanged && !refreshed) { renderList(); loadLiqLevels(true); loadWalls(); }
-  updateStats();
 }
 
 function renderList() {
@@ -1256,13 +1220,10 @@ async function loadAll(isAuto) {
   isLoading = true;
   const btn = document.getElementById('refresh-btn');
   if (btn) btn.disabled = true;
-  // "filter200"/"capitulation" имат собствени, скъпи lazy-load изгледи (loadFilter200/
-  // loadCapitulation), които НЕ минават през renderList(). При автоматично 60s опресняване
-  // не ги пипаме - renderList() не разпознава тези филтри и би показал "няма монети" (счупен
-  // изглед) вместо реалния резултат от последното сканиране. Ръчният REFRESH бутон обаче
-  // трябва да презарежда каквото гледаш в момента, затова той винаги минава isAuto=false.
-  const isSpecialTab = currentFilter === 'filter200' || currentFilter === 'capitulation';
-  if (!(isAuto && isSpecialTab)) {
+  // При автоматично 60s опресняване не пипаме filter200/capitulation (виж isSpecialTab()) -
+  // Ръчният REFRESH бутон обаче трябва да презарежда каквото гледаш в момента, затова той
+  // винаги минава isAuto=false.
+  if (!(isAuto && isSpecialTab())) {
     document.getElementById('main-content').innerHTML = `<div class="loading">ЗАРЕЖДАНЕ...<div class="loading-bar"><div class="loading-fill"></div></div></div>`;
   }
   try {
@@ -1281,7 +1242,7 @@ async function loadAll(isAuto) {
     if (currentFilter === 'filter200') { if (!isAuto) loadFilter200(); }
     else if (currentFilter === 'capitulation') { if (!isAuto) loadCapitulation(); }
     else { renderList(); }
-    loadLiqLevels(); loadWalls();
+    loadWalls();
     const now = new Date();
     document.getElementById('last-update').textContent = `ОБНОВЕНО: ${now.toLocaleTimeString('bg')} · AUTO 60s · ${allCoins.length} МОНЕТИ`;
     loadBTCMacro();
