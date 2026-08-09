@@ -122,6 +122,10 @@
   .tag-top-base{background:rgba(255,215,0,0.2);color:#ffd700;border:1px solid #ffd700;font-weight:bold;}
   .tag-squeeze2{background:rgba(168,85,247,0.2);color:var(--purple);border:1px solid var(--purple);font-weight:bold;}
   .tag-shift{background:rgba(255,100,0,0.2);color:var(--orange);border:1px solid var(--orange);font-weight:bold;}
+  .tag-blowoff{background:rgba(255,51,102,0.2);color:var(--red);border:1px solid var(--red);font-weight:bold;}
+  .tag-distribution{background:rgba(255,100,0,0.15);color:var(--orange);border:1px solid rgba(255,100,0,0.4);font-weight:bold;}
+  .tag-dumpsqueeze{background:rgba(168,85,247,0.2);color:var(--purple);border:1px solid var(--purple);font-weight:bold;}
+  .tag-shiftdown{background:rgba(255,100,0,0.2);color:var(--orange);border:1px solid var(--orange);font-weight:bold;}
   .tag-impulse-long{background:rgba(0,255,136,0.15);color:var(--green);border:1px solid rgba(0,255,136,0.4);font-weight:bold;}
   .tag-impulse-short{background:rgba(255,51,102,0.15);color:var(--red);border:1px solid rgba(255,51,102,0.4);font-weight:bold;}
   .tag-warm-up,.tag-warm-down{background:rgba(68,136,255,0.15);color:var(--blue);border:1px solid rgba(68,136,255,0.4);}
@@ -719,13 +723,23 @@ async function loadCapitulation() {
       const rsi4h = c4h.length ? calcRSI(c4h.map(x=>x.close), 14) : null;
       const rsi1d = c1d.length ? calcRSI(c1d.map(x=>x.close), 14) : null;
       const htfExtreme = rsi4h!=null && rsi1d!=null && rsi4h<35 && rsi1d<35;
+      const htfOverbought = rsi4h!=null && rsi1d!=null && rsi4h>65 && rsi1d>65;
       const flush = calcFlushSignal(c15, htfExtreme);
       const base = calcBaseSignal(c1h, htfExtreme);
       const baseStrength = base ? calcBaseDivergenceStrength(c1h) : { score: 0, priceDropPct: 0, rsiGain: 0 };
       const squeeze = calcSqueezeSignal(c5);
       const shift = calcShiftSignal(c1h);
       const impulse = calcImpulseSignal(c1h, flush);
-      coin.capSignals = { flush, base, baseStrength, squeeze, shift, impulseLong: impulse.long, impulseShort: impulse.short };
+      // Огледални "връх" версии на FLUSH/BASE/SQUEEZE/SHIFT - прегрят пазар вместо
+      // подценен, за да могат DCA известията да следят и двете крайности.
+      const blowoff = calcBlowoffSignal(c15, htfOverbought);
+      const distribution = calcDistributionSignal(c1h, htfOverbought);
+      const dumpSqueeze = calcDumpSqueezeSignal(c5);
+      const shiftDown = calcShiftDownSignal(c1h);
+      coin.capSignals = {
+        flush, base, baseStrength, squeeze, shift, impulseLong: impulse.long, impulseShort: impulse.short,
+        blowoff, distribution, dumpSqueeze, shiftDown,
+      };
 
       // WARMING Gate - преизползва СЪЩИТЕ вече изтеглени 15м/1ч/4ч свещи, без нов fetch.
       const bigVol4h = calc4HBigVolume(c4h);
@@ -803,7 +817,8 @@ async function loadCapitulation() {
       if (flush || base || squeeze || shift || impulse.long || impulse.short
           || warmTier !== 'none' || superDownDump || coin.warmSignals.bigVol4hUp || coin.warmSignals.bigVol4hDown
           || mmLong || mmShort || mmX25Long || mmX25Short
-          || early.long || early.short || buildUpConfirmLong || buildUpConfirmShort || preImpulseLong || preImpulseShort) {
+          || early.long || early.short || buildUpConfirmLong || buildUpConfirmShort || preImpulseLong || preImpulseShort
+          || blowoff || distribution || dumpSqueeze || shiftDown) {
         results.push(coin);
       }
     } catch(e) { coin.capSignals = null; coin.warmSignals = null; coin.mmSignals = null; coin.buildUpSignals = null; }
@@ -1107,6 +1122,10 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
   if (coin.capSignals?.shift) tags.push(`<span class="tag tag-shift">🟠 SHIFT</span>`);
   if (coin.capSignals?.impulseLong) tags.push(`<span class="tag tag-impulse-long">🟢 IMPULSE L</span>`);
   if (coin.capSignals?.impulseShort) tags.push(`<span class="tag tag-impulse-short">🔴 IMPULSE S</span>`);
+  if (coin.capSignals?.blowoff) tags.push(`<span class="tag tag-blowoff">🔥 BLOWOFF</span>`);
+  if (coin.capSignals?.distribution) tags.push(`<span class="tag tag-distribution">🟠 DISTRIBUTION</span>`);
+  if (coin.capSignals?.dumpSqueeze) tags.push(`<span class="tag tag-dumpsqueeze">🟣 DUMP SQUEEZE</span>`);
+  if (coin.capSignals?.shiftDown) tags.push(`<span class="tag tag-shiftdown">🟠 SHIFT ▼</span>`);
   if (coin.warmSignals?.tier === 'warm') tags.push(`<span class="tag tag-warm-${coin.warmSignals.direction}">🔵 WARMING ${coin.warmSignals.direction==='up'?'▲':'▼'}</span>`);
   if (coin.warmSignals?.tier === 'hot') tags.push(`<span class="tag tag-hot-${coin.warmSignals.direction}">🟠 HOT ${coin.warmSignals.direction==='up'?'▲':'▼'}</span>`);
   if (coin.warmSignals?.tier === 'super') tags.push(`<span class="tag tag-super-${coin.warmSignals.direction}">${coin.warmSignals.direction==='up'?'🟢':'🔴'} SUPER ${coin.warmSignals.direction==='up'?'▲':'▼'}</span>`);
