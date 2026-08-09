@@ -144,6 +144,10 @@
   .tag-buildup-confirm-short{background:rgba(255,51,102,0.2);color:var(--red);border:1px solid var(--red);font-weight:bold;}
   .tag-buildup-preimpulse-long{background:rgba(0,255,136,0.35);color:#00ff88;border:1px solid #00ff88;font-weight:bold;animation:flipPulse 1.5s infinite;}
   .tag-buildup-preimpulse-short{background:rgba(128,0,0,0.35);color:#ff6b6b;border:1px solid #800000;font-weight:bold;animation:flipPulse 1.5s infinite;}
+  .tag-mmosc-long{background:rgba(0,255,136,0.25);color:var(--green);border:1px solid var(--green);font-weight:bold;}
+  .tag-mmosc-short{background:rgba(255,51,102,0.25);color:var(--red);border:1px solid var(--red);font-weight:bold;}
+  .tag-mmosc-relong{background:rgba(0,255,136,0.12);color:var(--green);border:1px solid rgba(0,255,136,0.4);}
+  .tag-mmosc-reshort{background:rgba(255,51,102,0.12);color:var(--red);border:1px solid rgba(255,51,102,0.4);}
   @keyframes flipPulse{0%,100%{opacity:1;}50%{opacity:0.5;}}
   .coin-right{text-align:right;}
   .coin-price{font-family:'Share Tech Mono',monospace;font-size:15px;color:#fff;font-weight:bold;}
@@ -705,6 +709,26 @@ function markBuildUpArmed(symbol) {
   buildUpCooldownState[symbol] = { at: Date.now() };
 }
 
+// "MM-OSC Entry Companion" - осцилатор на 5м (същия TF като MM входовете).
+// BEST ENTRY при пресичане на прага; RE-ENTRY, ако в рамките на прозорец от
+// предходен вход осцилаторът се е върнал в неутралната зона (истински pullback)
+// преди повторно пресичане в СЪЩАТА посока. cooldownBars(20)/reWindow(18) от
+// оригинала преведени в реално време на база 5м свещи (20*5м=100мин, 18*5м=90мин).
+const mmOscState = {}; // symbol -> {dir, windowUntil, sawPullback, cooldown:{long:{at},short:{at}}}
+const MMOSC_REWINDOW_MIN = 90;
+const MMOSC_COOLDOWN_MIN = 100;
+
+function mmOscCanFire(symbol, dir) {
+  const s = mmOscState[symbol]?.cooldown?.[dir];
+  if (!s) return true;
+  return (Date.now() - s.at) >= MMOSC_COOLDOWN_MIN * 60000;
+}
+function markMMOscFired(symbol, dir) {
+  if (!mmOscState[symbol]) mmOscState[symbol] = {};
+  if (!mmOscState[symbol].cooldown) mmOscState[symbol].cooldown = {};
+  mmOscState[symbol].cooldown[dir] = { at: Date.now() };
+}
+
 async function loadCapitulation() {
   const content = document.getElementById('main-content');
   content.innerHTML = `<div class="loading">СКАНИРАНЕ ЗА CAPITULATION/WARMING СИГНАЛИ...<br><span style="font-size:10px;color:var(--text2)">Проверява ${allCoins.length} монети (15м/5м/1ч/4ч/1д свещи)</span><div class="loading-bar"><div class="loading-fill"></div></div></div>`;
@@ -814,14 +838,32 @@ async function loadCapitulation() {
         preImpulseLong, preImpulseShort,
       };
 
+      // MM-OSC Entry Companion - преизползва СЪЩИТЕ 5м свещи, без нов fetch.
+      const oscEntry = calcMMOscEntry(c5);
+      const oscS = mmOscState[coin.fullSymbol] || {};
+      const oscInWindow = !!oscS.windowUntil && Date.now() < oscS.windowUntil;
+      if (oscInWindow && oscS.dir === 1 && calcMMOscPullbackZone(oscEntry.osc, 1)) oscS.sawPullback = true;
+      if (oscInWindow && oscS.dir === -1 && calcMMOscPullbackZone(oscEntry.osc, -1)) oscS.sawPullback = true;
+      const oscRawLong = oscEntry.long && mmOscCanFire(coin.fullSymbol, 'long');
+      const oscRawShort = oscEntry.short && mmOscCanFire(coin.fullSymbol, 'short');
+      const oscReLong = oscRawLong && oscInWindow && oscS.dir === 1 && oscS.sawPullback;
+      const oscReShort = oscRawShort && oscInWindow && oscS.dir === -1 && oscS.sawPullback;
+      const oscBestLong = oscRawLong && !oscReLong;
+      const oscBestShort = oscRawShort && !oscReShort;
+      if (oscRawLong) { markMMOscFired(coin.fullSymbol, 'long'); oscS.dir = 1; oscS.windowUntil = Date.now() + MMOSC_REWINDOW_MIN * 60000; oscS.sawPullback = false; }
+      if (oscRawShort) { markMMOscFired(coin.fullSymbol, 'short'); oscS.dir = -1; oscS.windowUntil = Date.now() + MMOSC_REWINDOW_MIN * 60000; oscS.sawPullback = false; }
+      mmOscState[coin.fullSymbol] = oscS;
+      coin.mmOscSignals = { bestLong: oscBestLong, bestShort: oscBestShort, reLong: oscReLong, reShort: oscReShort };
+
       if (flush || base || squeeze || shift || impulse.long || impulse.short
           || warmTier !== 'none' || superDownDump || coin.warmSignals.bigVol4hUp || coin.warmSignals.bigVol4hDown
           || mmLong || mmShort || mmX25Long || mmX25Short
           || early.long || early.short || buildUpConfirmLong || buildUpConfirmShort || preImpulseLong || preImpulseShort
-          || blowoff || distribution || dumpSqueeze || shiftDown) {
+          || blowoff || distribution || dumpSqueeze || shiftDown
+          || oscBestLong || oscBestShort || oscReLong || oscReShort) {
         results.push(coin);
       }
-    } catch(e) { coin.capSignals = null; coin.warmSignals = null; coin.mmSignals = null; coin.buildUpSignals = null; }
+    } catch(e) { coin.capSignals = null; coin.warmSignals = null; coin.mmSignals = null; coin.buildUpSignals = null; coin.mmOscSignals = null; }
     await new Promise(res => setTimeout(res, 150));
   }
   if (results.length === 0) { content.innerHTML = `<div class="no-results">НЯМА АКТИВНИ CAPITULATION/WARMING СИГНАЛИ В МОМЕНТА</div>`; return; }
@@ -1142,6 +1184,10 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
   if (coin.buildUpSignals?.confirmShort) tags.push(`<span class="tag tag-buildup-confirm-short">🔴 BUILD-UP CONFIRMED ▼</span>`);
   if (coin.buildUpSignals?.preImpulseLong) tags.push(`<span class="tag tag-buildup-preimpulse-long">🚀 PRE-IMPULSE ▲</span>`);
   if (coin.buildUpSignals?.preImpulseShort) tags.push(`<span class="tag tag-buildup-preimpulse-short">💥 PRE-IMPULSE ▼</span>`);
+  if (coin.mmOscSignals?.bestLong) tags.push(`<span class="tag tag-mmosc-long">🟢▲ MM-OSC BEST LONG</span>`);
+  if (coin.mmOscSignals?.bestShort) tags.push(`<span class="tag tag-mmosc-short">🔴▼ MM-OSC BEST SHORT</span>`);
+  if (coin.mmOscSignals?.reLong) tags.push(`<span class="tag tag-mmosc-relong">🟢△ MM-OSC RE-LONG</span>`);
+  if (coin.mmOscSignals?.reShort) tags.push(`<span class="tag tag-mmosc-reshort">🔴▽ MM-OSC RE-SHORT</span>`);
   if (isBottom) tags.push(`<span class="tag tag-bottom">🟢 ДЪНО</span>`);
   if (isTop) tags.push(`<span class="tag tag-top">🔴 ВРЪХ</span>`);
   if (coin.pctFromAtl !== null && coin.pctFromAtl < 100) tags.push(`<span class="tag tag-atl">🟢 БЛИЗО ATL</span>`);
