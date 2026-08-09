@@ -7,6 +7,7 @@ import {
   calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
   calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
   calcSmoothedATR, calcBuildUpEarly, calcEmaTrendFilter, calc4hTwoBarTrend, calcATRExpansion,
+  calcMMOscValue, calcMMOscEntry, calcMMOscPullbackZone,
   isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
@@ -951,5 +952,60 @@ describe('calcShiftDownSignal', () => {
   it('връща false без EMA crossunder (плосък пазар)', () => {
     const flat = Array.from({ length: 60 }, () => ({ open: 100, high: 100.5, low: 99.5, close: 100, volume: 1000 }));
     expect(calcShiftDownSignal(flat)).toBe(false);
+  });
+});
+
+describe('calcMMOscValue', () => {
+  it('връща ~50 (неутрален) при плосък пазар', () => {
+    const flat = Array.from({ length: 55 }, () => ({ open: 100, high: 100.2, low: 99.8, close: 100, volume: 1000 }));
+    expect(calcMMOscValue(flat)).toBeCloseTo(50, 1);
+  });
+  it('връща стойност над 50 при силен бичи натиск/моментум', () => {
+    const flat = Array.from({ length: 55 }, () => ({ open: 100, high: 100.2, low: 99.8, close: 100, volume: 1000 }));
+    const breakout = { open: 100, high: 106, low: 99.9, close: 105, volume: 5000 };
+    expect(calcMMOscValue([...flat, breakout])).toBeGreaterThan(90);
+  });
+  it('връща null при недостатъчно свещи', () => {
+    expect(calcMMOscValue(Array.from({ length: 10 }, () => ({ open: 1, high: 1, low: 1, close: 1, volume: 1 })))).toBeNull();
+  });
+});
+
+describe('calcMMOscEntry', () => {
+  function buildFlat(n = 55) {
+    return Array.from({ length: n }, () => ({ open: 100, high: 100.2, low: 99.8, close: 100, volume: 1000 }));
+  }
+  it('връща long:true при бичи пробив (осцилаторът пресича нагоре прага + EMA режим нагоре + обем/тяло)', () => {
+    const breakout = { open: 100, high: 106, low: 99.9, close: 105, volume: 5000 };
+    const r = calcMMOscEntry([...buildFlat(), breakout]);
+    expect(r.long).toBe(true);
+    expect(r.short).toBe(false);
+  });
+  it('връща short:true при мечи пробив надолу', () => {
+    const breakdown = { open: 100, high: 100.1, low: 94, close: 95, volume: 5000 };
+    const r = calcMMOscEntry([...buildFlat(), breakdown]);
+    expect(r.short).toBe(true);
+  });
+  it('връща long:false без достатъчен обем/тяло, дори при пресичане на прага', () => {
+    const weakBreak = { open: 100, high: 100.3, low: 99.9, close: 100.1, volume: 1000 };
+    expect(calcMMOscEntry([...buildFlat(), weakBreak]).long).toBe(false);
+  });
+  it('връща long:false и short:false при недостатъчно свещи', () => {
+    const r = calcMMOscEntry(buildFlat(10));
+    expect(r.long).toBe(false);
+    expect(r.short).toBe(false);
+  });
+});
+
+describe('calcMMOscPullbackZone', () => {
+  it('връща true за long, ако осцилаторът е в неутралната зона (48-55)', () => {
+    expect(calcMMOscPullbackZone(50, 1)).toBe(true);
+    expect(calcMMOscPullbackZone(60, 1)).toBe(false);
+  });
+  it('връща true за short, ако осцилаторът е в огледалната зона (45-52)', () => {
+    expect(calcMMOscPullbackZone(50, -1)).toBe(true);
+    expect(calcMMOscPullbackZone(40, -1)).toBe(false);
+  });
+  it('връща false при null стойност', () => {
+    expect(calcMMOscPullbackZone(null, 1)).toBe(false);
   });
 });

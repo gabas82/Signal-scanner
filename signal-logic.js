@@ -717,6 +717,72 @@ function calcATRExpansion(candles, opts = {}) {
   return currentAtr > smoothedAtr;
 }
 
+// ─── "MM-OSC Entry Companion" (личен Pine Script индикатор) ─────────────────
+// Осцилатор 0-100: комбинира ценов натиск спрямо бързата EMA, едносвещен
+// моментум и обемен boost, всичко нормализирано през ATR и притиснато през
+// tanh (JS вградената Math.tanh). Прилага се на 5м (същия таймфрейм като MM
+// входовете, тъй като е "Entry Companion" към MM системата - не е зададен
+// изрично таймфрейм в оригинала, той е "текущия чарт").
+function calcMMOscValue(candles, opts = {}) {
+  const atrLen = opts.atrLen ?? 14, emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
+  const n = candles.length;
+  if (n < Math.max(atrLen, emaSlowLen) + 2) return null;
+  const closes = candles.map(c => c.close);
+  const emaFast = calcEMASeries(closes, emaFastLen)[n - 1];
+  const atr = calcATR(candles, atrLen);
+  if (emaFast == null || atr == null || atr === 0) return null;
+  const last = candles[n - 1], prev = candles[n - 2];
+  const pressure = (last.close - emaFast) / atr;
+  const momentum = (last.close - prev.close) / atr;
+  const raw = pressure * 0.85 + momentum * 0.85;
+  const osc = 50 + 50 * Math.tanh(raw);
+  return Math.max(0, Math.min(100, osc));
+}
+
+// "BEST ENTRY": осцилаторът пресича прага НАГОРЕ (long) или НАДОЛУ (short) +
+// EMA20/50 режим в същата посока + достатъчен обем/тяло на последната свещ.
+// Връща и `osc` стойността (нужна на orchestration слоя за RE-ENTRY pullback
+// проверката) - самата RE-ENTRY/cooldown/прозорец логика е stateful и живее
+// извън тази чиста функция (виж mmOscState в signal-scanner.html/worker.js).
+function calcMMOscEntry(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, volMin = opts.volMin ?? 1.2, bodyMin = opts.bodyMin ?? 0.55;
+  const entryUp = opts.entryUp ?? 55, entryDn = opts.entryDn ?? 45;
+  const emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
+  const n = candles.length;
+  const oscNow = calcMMOscValue(candles, opts);
+  const oscPrev = n > 1 ? calcMMOscValue(candles.slice(0, n - 1), opts) : null;
+  if (oscNow == null || oscPrev == null) return { long: false, short: false, osc: oscNow };
+  const closes = candles.map(c => c.close);
+  const emaF = calcEMASeries(closes, emaFastLen)[n - 1];
+  const emaS = calcEMASeries(closes, emaSlowLen)[n - 1];
+  if (emaF == null || emaS == null) return { long: false, short: false, osc: oscNow };
+  const regimeUp = emaF > emaS, regimeDown = emaF < emaS;
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const last = candles[n - 1];
+  const volX = volMA != null && volMA > 0 ? last.volume / volMA : 0;
+  const rng = Math.max(last.high - last.low, 1e-9);
+  const bodyPct = Math.abs(last.close - last.open) / rng;
+  const baseOK = volX >= volMin && bodyPct >= bodyMin;
+  const crossover = oscPrev <= entryUp && oscNow > entryUp;
+  const crossunder = oscPrev >= entryDn && oscNow < entryDn;
+  return {
+    long: baseOK && regimeUp && crossover,
+    short: baseOK && regimeDown && crossunder,
+    osc: oscNow,
+  };
+}
+
+// RE-ENTRY pullback зона: осцилаторът се е върнал в неутрална зона (48-55 за
+// long, огледално 45-52 за short) след предходен вход - "чист" ретест преди
+// евентуален повторен сигнал в СЪЩАТА посока в рамките на прозореца.
+function calcMMOscPullbackZone(osc, direction, opts = {}) {
+  const rePullLo = opts.rePullLo ?? 48, rePullHi = opts.rePullHi ?? 55;
+  if (osc == null) return false;
+  if (direction === 1) return osc >= rePullLo && osc <= rePullHi;
+  if (direction === -1) return osc <= (100 - rePullLo) && osc >= (100 - rePullHi);
+  return false;
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -730,6 +796,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
     calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
     calcSmoothedATR, calcBuildUpEarly, calcEmaTrendFilter, calc4hTwoBarTrend, calcATRExpansion,
+    calcMMOscValue, calcMMOscEntry, calcMMOscPullbackZone,
     isManipulable, formatNum, formatPrice,
     formatOIDelta, getMaintenanceRate, calcLiquidationPrice, calcDCALevels
   };
