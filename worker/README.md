@@ -1,6 +1,6 @@
 # Cloudflare Worker (orange-grass-d809) — setup
 
-Този Worker прави две неща: (1) прокси за Yahoo/football-data.org/api-sports.io/CoinGlass заявките на приложенията, и (2) на cron разписание следи личен watchlist за DCA нива и праща WhatsApp известие през CallMeBot.
+Този Worker прави две неща: (1) прокси за Yahoo/football-data.org/api-sports.io/CoinGlass заявките на приложенията, и (2) на cron разписание следи личен watchlist за DCA нива И/ИЛИ пазарни сигнали (WARMING/HOT/SUPER, MM LONG/SHORT/x25, FLUSH/BASE/SQUEEZE/SHIFT/IMPULSE) и праща WhatsApp известие през CallMeBot.
 
 `worker.js` **не съдържа никакви ключове в кода** — всички се четат от Worker Secrets, за да могат безопасно да стоят в публичния Signal-scanner repo.
 
@@ -40,12 +40,12 @@ Endpoint-ът, който Worker-ът ползва зад кулисите: `htt
 
 ```js
 const WATCHLIST = [
-  { symbol: 'BTCUSDT', entryPrice: 65000, side: 'long' },
-  { symbol: 'ETHUSDT', entryPrice: 3200, side: 'short' },
+  { symbol: 'BTCUSDT' },                                    // само пазарни сигнали
+  { symbol: 'ETHUSDT', entryPrice: 3200, side: 'short' },    // пазарни сигнали + DCA известия
 ];
 ```
 
-`symbol` е задължителен (Binance формат, с `USDT` накрая). `entryPrice`/`side` са нужни само ако искаш DCA известия за конкретна твоя позиция в тази монета — без тях записът засега не прави нищо (CAPITULATION/WARMING/MM пазарни известия за монети без позиция са фаза 2, все още не са включени тук).
+`symbol` е задължителен (Binance формат, с `USDT` накрая) — **всеки** запис автоматично се следи за пазарни сигнали (WARMING/HOT/SUPER, MM LONG/SHORT/x25, FLUSH/BASE/SQUEEZE/SHIFT/IMPULSE), независимо дали имаш позиция. `entryPrice`/`side` добавяш само ако искаш И DCA известия за конкретна твоя позиция в тази монета.
 
 ## 6. Добави Cron Trigger
 
@@ -53,11 +53,19 @@ Dashboard → orange-grass-d809 → **Settings → Triggers → Cron Triggers �
 
 ## Как работи
 
-На всяко cron изпълнение, за всеки запис от `WATCHLIST` с `entryPrice`+`side`:
+На всяко cron изпълнение:
+
+**DCA известия** (само за записи с `entryPrice`+`side`):
 1. Взима текущата цена от Binance.
 2. Изчислява DCA нивата (същата формула като DCA калкулатора в приложението — ВХОД / DCA1 (-24%) / DCA2 (-40%) / DCA3 (-35% от DCA2)).
 3. Ако цената е пресякла ниво, което не е било известено през последните 24ч, праща WhatsApp съобщение и пази маркер в KV за да не спамва повторно.
 
+**Пазарни сигнали** (за ВСЕКИ запис в watchlist-а, независимо от позиция):
+1. Изтегля 15м/5м/1ч/4ч/1д свещи от Binance за символа (същите timeframes като CAPITULATION таба в приложението).
+2. Изчислява FLUSH/BASE/SQUEEZE/SHIFT/IMPULSE (Capitulation Suite), WARMING/HOT/SUPER + 4Ч обем + Dump Cascade (WARMING Gate), и MM LONG/SHORT/x25 (MM WARMING→IMPULSE) — byte-identical логика с приложението.
+3. Cooldown/ARM състоянието (за да не спамва един и същ сигнал постоянно) се пази в KV между извикванията, по символ.
+4. Ако нещо ново се е задействало, праща едно консолидирано WhatsApp съобщение със списък на сигналите.
+
 ## Локални тестове
 
-Логиката (`calcDCALevels`, `checkDcaLevels`, `sendWhatsApp`) е тествана локално с Node (mock `fetch` + mock KV) - виж историята на промените, ако искаш да пуснеш проверката пак.
+Цялата логика (`calcDCALevels`, `checkDcaLevels`, `sendWhatsApp`, `scanSymbolSignals`, `checkMarketSignals`) е тествана локално с Node (mock `fetch` + mock KV), плюс diff-проверка байт-по-байт срещу оригиналните функции в `signal-logic.js` - виж историята на промените, ако искаш да пуснеш проверката пак.
