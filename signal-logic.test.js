@@ -5,6 +5,7 @@ import {
   calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcBaseDivergenceStrength, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
   calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
   calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
+  calcSmoothedATR, calcBuildUpEarly, calcEmaTrendFilter, calc4hTwoBarTrend, calcATRExpansion,
   isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
@@ -759,5 +760,105 @@ describe('calcMMx25Entry', () => {
     const r = calcMMx25Entry([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }]);
     expect(r.long).toBe(false);
     expect(r.short).toBe(false);
+  });
+});
+
+describe('calcBuildUpEarly', () => {
+  function buildCandles(n, direction) {
+    const candles = [];
+    let px = 100;
+    for (let i = 0; i < n; i++) {
+      const inEarly = i >= n - 6;
+      const open = px;
+      let close;
+      if (inEarly) close = direction === 'up' ? open + 0.05 : direction === 'down' ? open - 0.05 : open;
+      else close = open + (i % 2 === 0 ? 0.02 : -0.02);
+      const high = Math.max(open, close) + 0.05, low = Math.min(open, close) - 0.05;
+      candles.push({ open, high, low, close, volume: 1000 });
+      px = close;
+    }
+    return candles;
+  }
+  it('връща long:true при тих build-up нагоре (мнозинство бичи свещи + higher lows + компресия + стабилен обем)', () => {
+    const r = calcBuildUpEarly(buildCandles(30, 'up'));
+    expect(r.long).toBe(true);
+    expect(r.short).toBe(false);
+  });
+  it('връща short:true при аналогичен build-up надолу', () => {
+    const r = calcBuildUpEarly(buildCandles(30, 'down'));
+    expect(r.short).toBe(true);
+    expect(r.long).toBe(false);
+  });
+  it('връща long:false, ако обемът на последната свещ е пресъхнал под прага', () => {
+    const candles = buildCandles(30, 'up');
+    candles[candles.length - 1].volume = 100; // под volStableMult(0.8) * volMA
+    expect(calcBuildUpEarly(candles).long).toBe(false);
+  });
+  it('връща long:false и short:false при недостатъчно свещи', () => {
+    const r = calcBuildUpEarly(buildCandles(10, 'up'));
+    expect(r.long).toBe(false);
+    expect(r.short).toBe(false);
+  });
+});
+
+describe('calcEmaTrendFilter', () => {
+  function buildTrendCloses(n, direction) {
+    return Array.from({ length: n }, (_, i) => {
+      const close = direction === 'up' ? 100 + i * 0.5 : 100 - i * 0.5;
+      return { open: close, high: close + 0.1, low: close - 0.1, close, volume: 1000 };
+    });
+  }
+  it('връща bull:true при възходящ тренд (EMA fast > slow и расте)', () => {
+    const r = calcEmaTrendFilter(buildTrendCloses(12, 'up'), { fastLen: 5, slowLen: 10 });
+    expect(r.bull).toBe(true);
+    expect(r.bear).toBe(false);
+  });
+  it('връща bear:true при низходящ тренд', () => {
+    const r = calcEmaTrendFilter(buildTrendCloses(12, 'down'), { fastLen: 5, slowLen: 10 });
+    expect(r.bear).toBe(true);
+  });
+  it('връща bull:false и bear:false при недостатъчно свещи за slowLen', () => {
+    const r = calcEmaTrendFilter(buildTrendCloses(5, 'up'), { fastLen: 5, slowLen: 10 });
+    expect(r.bull).toBe(false);
+    expect(r.bear).toBe(false);
+  });
+});
+
+describe('calc4hTwoBarTrend', () => {
+  it('връща bull:true при 2 поредни бичи свещи', () => {
+    const candles = [
+      { open: 99, high: 100.2, low: 98.9, close: 100, volume: 1000 },
+      { open: 100, high: 101.2, low: 99.9, close: 101, volume: 1000 },
+    ];
+    expect(calc4hTwoBarTrend(candles).bull).toBe(true);
+  });
+  it('връща bull:false и bear:false при смесени свещи', () => {
+    const candles = [
+      { open: 99, high: 100.2, low: 98.9, close: 100, volume: 1000 },
+      { open: 101, high: 101.2, low: 99.9, close: 100.5, volume: 1000 },
+    ];
+    const r = calc4hTwoBarTrend(candles);
+    expect(r.bull).toBe(false);
+    expect(r.bear).toBe(false);
+  });
+  it('връща bull:false и bear:false при под 2 свещи', () => {
+    const r = calc4hTwoBarTrend([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }]);
+    expect(r.bull).toBe(false);
+    expect(r.bear).toBe(false);
+  });
+});
+
+describe('calcATRExpansion', () => {
+  it('връща true, ако диапазонът рязко се разширява на последната свещ', () => {
+    const base = Array.from({ length: 20 }, () => ({ open: 100, high: 100.1, low: 99.9, close: 100, volume: 1000 }));
+    const wideLast = { open: 100, high: 103, low: 97, close: 102, volume: 1000 };
+    expect(calcATRExpansion([...base, wideLast])).toBe(true);
+  });
+  it('връща false при постоянен диапазон (без разширяване)', () => {
+    const flat = Array.from({ length: 20 }, () => ({ open: 100, high: 100.1, low: 99.9, close: 100, volume: 1000 }));
+    expect(calcATRExpansion(flat)).toBe(false);
+  });
+  it('връща false при недостатъчно свещи', () => {
+    expect(calcATRExpansion([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }])).toBe(false);
   });
 });
