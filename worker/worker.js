@@ -519,6 +519,109 @@ function calcATRExpansion(candles, opts = {}) {
   return currentAtr > smoothedAtr;
 }
 
+// ─── "Mario – MM-OSC Entry Companion" ────────────────────────────────────
+function calcMMOscValue(candles, opts = {}) {
+  const atrLen = opts.atrLen ?? 14, emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
+  const n = candles.length;
+  if (n < Math.max(atrLen, emaSlowLen) + 2) return null;
+  const closes = candles.map(c => c.close);
+  const emaFast = calcEMASeries(closes, emaFastLen)[n - 1];
+  const atr = calcATR(candles, atrLen);
+  if (emaFast == null || atr == null || atr === 0) return null;
+  const last = candles[n - 1], prev = candles[n - 2];
+  const pressure = (last.close - emaFast) / atr;
+  const momentum = (last.close - prev.close) / atr;
+  const raw = pressure * 0.85 + momentum * 0.85;
+  const osc = 50 + 50 * Math.tanh(raw);
+  return Math.max(0, Math.min(100, osc));
+}
+
+function calcMMOscEntry(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, volMin = opts.volMin ?? 1.2, bodyMin = opts.bodyMin ?? 0.55;
+  const entryUp = opts.entryUp ?? 55, entryDn = opts.entryDn ?? 45;
+  const emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
+  const n = candles.length;
+  const oscNow = calcMMOscValue(candles, opts);
+  const oscPrev = n > 1 ? calcMMOscValue(candles.slice(0, n - 1), opts) : null;
+  if (oscNow == null || oscPrev == null) return { long: false, short: false, osc: oscNow };
+  const closes = candles.map(c => c.close);
+  const emaF = calcEMASeries(closes, emaFastLen)[n - 1];
+  const emaS = calcEMASeries(closes, emaSlowLen)[n - 1];
+  if (emaF == null || emaS == null) return { long: false, short: false, osc: oscNow };
+  const regimeUp = emaF > emaS, regimeDown = emaF < emaS;
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const last = candles[n - 1];
+  const volX = volMA != null && volMA > 0 ? last.volume / volMA : 0;
+  const rng = Math.max(last.high - last.low, 1e-9);
+  const bodyPct = Math.abs(last.close - last.open) / rng;
+  const baseOK = volX >= volMin && bodyPct >= bodyMin;
+  const crossover = oscPrev <= entryUp && oscNow > entryUp;
+  const crossunder = oscPrev >= entryDn && oscNow < entryDn;
+  return {
+    long: baseOK && regimeUp && crossover,
+    short: baseOK && regimeDown && crossunder,
+    osc: oscNow,
+  };
+}
+
+function calcMMOscPullbackZone(osc, direction, opts = {}) {
+  const rePullLo = opts.rePullLo ?? 48, rePullHi = opts.rePullHi ?? 55;
+  if (osc == null) return false;
+  if (direction === 1) return osc >= rePullLo && osc <= rePullHi;
+  if (direction === -1) return osc <= (100 - rePullLo) && osc >= (100 - rePullHi);
+  return false;
+}
+
+// ─── "Mario IMPULSE + CONFIRMED + GAP FILTER + BTC.D FILTER" (само IMPULSE и
+// CONFIRMED - Gap/BTC.D филтрите изискват данни, които Binance API не дава) ──
+function calcImpulseAtrSignal(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, impulseVolMult = opts.impulseVolMult ?? 2.5;
+  const impulseBodyPct = opts.impulseBodyPct ?? 0.6;
+  const atrLen = opts.atrLen ?? 14, atrMinPct = opts.atrMinPct ?? 0.15, atrMaxPct = opts.atrMaxPct ?? 3.0;
+  const n = candles.length;
+  if (n < Math.max(volLen, atrLen) + 2) return { long: false, short: false };
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const atr = calcATR(candles, atrLen);
+  if (volMA == null || atr == null) return { long: false, short: false };
+  const last = candles[n - 1], prev = candles[n - 2];
+  const atrPct = atr / last.close * 100;
+  const volatilityOK = atrPct >= atrMinPct && atrPct <= atrMaxPct;
+  const rng = Math.max(last.high - last.low, 1e-9);
+  const impulseCandle = Math.abs(last.close - last.open) / rng >= impulseBodyPct;
+  const impulseVol = last.volume >= volMA * impulseVolMult;
+  const gate = impulseCandle && impulseVol && volatilityOK;
+  return { long: gate && last.close > prev.high, short: gate && last.close < prev.low };
+}
+
+function calcConfirmedSignal(candles15, candles1h, opts = {}) {
+  const emaFastLen = opts.emaFastLen ?? 20, emaMidLen = opts.emaMidLen ?? 50;
+  const useHTFRegime = opts.useHTFRegime ?? true;
+  const n15 = candles15.length;
+  if (n15 < emaMidLen + 2) return { long: false, short: false };
+  const closes15 = candles15.map(c => c.close);
+  const ema20Series = calcEMASeries(closes15, emaFastLen);
+  const ema50Series = calcEMASeries(closes15, emaMidLen);
+  const ema20 = ema20Series[n15 - 1], ema20Prev = ema20Series[n15 - 2], ema50 = ema50Series[n15 - 1];
+  const close = closes15[n15 - 1], closePrev = closes15[n15 - 2];
+  if (ema20 == null || ema20Prev == null || ema50 == null) return { long: false, short: false };
+  const crossover = closePrev <= ema20Prev && close > ema20;
+  const crossunder = closePrev >= ema20Prev && close < ema20;
+  const pullbackLong = crossover && ema20 > ema50;
+  const pullbackShort = crossunder && ema20 < ema50;
+  let htfBull = true, htfBear = true;
+  if (useHTFRegime) {
+    const n1h = candles1h.length;
+    if (n1h < emaMidLen + 1) return { long: false, short: false };
+    const closes1h = candles1h.map(c => c.close);
+    const regEma20 = calcEMASeries(closes1h, emaFastLen)[n1h - 1];
+    const regEma50 = calcEMASeries(closes1h, emaMidLen)[n1h - 1];
+    if (regEma20 == null || regEma50 == null) return { long: false, short: false };
+    htfBull = regEma20 > regEma50;
+    htfBear = regEma20 < regEma50;
+  }
+  return { long: pullbackLong && htfBull, short: pullbackShort && htfBear };
+}
+
 function klinesToCandles(klines) {
   return (klines||[]).map(k => ({ open: parseFloat(k[1]), high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]) }));
 }
@@ -567,6 +670,21 @@ function buildUpCanArm(state) {
 }
 function markBuildUpArmed(state) {
   state.buildUpCooldown = { at: Date.now() };
+}
+
+// "Mario – MM-OSC Entry Companion" - RE-ENTRY прозорец/cooldown, огледален на
+// mmOscState/mmOscCanFire/markMMOscFired от signal-scanner.html, но върху KV state.
+const MMOSC_REWINDOW_MIN = 90;
+const MMOSC_COOLDOWN_MIN = 100;
+
+function mmOscCanFire(state, dir) {
+  const s = state.mmOscCooldown?.[dir];
+  if (!s) return true;
+  return (Date.now() - s.at) >= MMOSC_COOLDOWN_MIN * 60000;
+}
+function markMMOscFired(state, dir) {
+  if (!state.mmOscCooldown) state.mmOscCooldown = {};
+  state.mmOscCooldown[dir] = { at: Date.now() };
 }
 
 async function fetchKlinesWorker(symbol, interval, limit) {
@@ -663,6 +781,24 @@ async function scanSymbolSignals(env, symbol) {
   if (armed && ctx15.biasLong && x25.long && mmCanFire(state, 'x25', 1, MM_X25_COOLDOWN_MIN)) { mmX25Long = true; markMMFired(state, 'x25', 1); }
   if (armed && ctx15.biasShort && x25.short && mmCanFire(state, 'x25', -1, MM_X25_COOLDOWN_MIN)) { mmX25Short = true; markMMFired(state, 'x25', -1); }
 
+  const oscEntry = calcMMOscEntry(c5);
+  const oscS = state.mmOsc || {};
+  const oscInWindow = !!oscS.windowUntil && Date.now() < oscS.windowUntil;
+  if (oscInWindow && oscS.dir === 1 && calcMMOscPullbackZone(oscEntry.osc, 1)) oscS.sawPullback = true;
+  if (oscInWindow && oscS.dir === -1 && calcMMOscPullbackZone(oscEntry.osc, -1)) oscS.sawPullback = true;
+  const oscRawLong = oscEntry.long && mmOscCanFire(state, 'long');
+  const oscRawShort = oscEntry.short && mmOscCanFire(state, 'short');
+  const oscReLong = oscRawLong && oscInWindow && oscS.dir === 1 && oscS.sawPullback;
+  const oscReShort = oscRawShort && oscInWindow && oscS.dir === -1 && oscS.sawPullback;
+  const oscBestLong = oscRawLong && !oscReLong;
+  const oscBestShort = oscRawShort && !oscReShort;
+  if (oscRawLong) { markMMOscFired(state, 'long'); oscS.dir = 1; oscS.windowUntil = Date.now() + MMOSC_REWINDOW_MIN * 60000; oscS.sawPullback = false; }
+  if (oscRawShort) { markMMOscFired(state, 'short'); oscS.dir = -1; oscS.windowUntil = Date.now() + MMOSC_REWINDOW_MIN * 60000; oscS.sawPullback = false; }
+  state.mmOsc = oscS;
+
+  const impulseAtr = calcImpulseAtrSignal(c5);
+  const confirmed = calcConfirmedSignal(c15, c1h);
+
   await saveSymbolState(env, symbol, state);
 
   const fired = [];
@@ -690,6 +826,14 @@ async function scanSymbolSignals(env, symbol) {
   if (mmShort) fired.push('🔴 MM SHORT');
   if (mmX25Long) fired.push('💎 MM x25 LONG');
   if (mmX25Short) fired.push('💀 MM x25 SHORT');
+  if (oscBestLong) fired.push('🟢▲ MM-OSC BEST LONG');
+  if (oscBestShort) fired.push('🔴▼ MM-OSC BEST SHORT');
+  if (oscReLong) fired.push('🟢△ MM-OSC RE-LONG');
+  if (oscReShort) fired.push('🔴▽ MM-OSC RE-SHORT');
+  if (impulseAtr.long) fired.push('⚡ IMPULSE+ATR ▲');
+  if (impulseAtr.short) fired.push('⚡ IMPULSE+ATR ▼');
+  if (confirmed.long) fired.push('✅ CONFIRMED ▲');
+  if (confirmed.short) fired.push('✅ CONFIRMED ▼');
   return fired;
 }
 

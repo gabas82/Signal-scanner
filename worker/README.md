@@ -71,6 +71,8 @@ Dashboard → orange-grass-d809 → **Settings → Triggers → Cron Triggers �
    - **WARMING Gate**: WARM/HOT/SUPER + 4Ч обем + Dump Cascade
    - **MM WARMING→IMPULSE**: MM LONG/SHORT + MM x25
    - **Build-Up Detector**: EARLY BUILD-UP → BUILD-UP CONFIRMED → PRE-IMPULSE (18ч прозорец между Early и Confirm)
+   - **MM-OSC Entry Companion**: MM-OSC BEST LONG/SHORT + RE-LONG/RE-SHORT (90мин prozorec за "чист" ретест преди повторен вход в СЪЩАТА посока)
+   - **IMPULSE+ATR + CONFIRMED**: пробив с ATR% "здравословен диапазон" филтър + 15м/1ч multi-timeframe потвърждение на продължение на тренда (CME Gap и BTC.D филтрите от оригинала не са пренесени - изискват данни, каквито Binance API не дава)
 3. Cooldown/ARM/прозорец състоянието (за да не спамва един и същ сигнал постоянно) се пази в KV между извикванията, по символ.
 4. Ако нещо ново се е задействало, праща едно консолидирано WhatsApp съобщение със списък на сигналите.
 
