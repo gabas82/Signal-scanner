@@ -3,6 +3,7 @@ import {
   calcSMA, calcRSI, detectBottom, detectTop, calcSignal, calcSetupQuality,
   calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
   calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcBaseDivergenceStrength, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
+  calcBlowoffSignal, calcDistributionSignal, calcDumpSqueezeSignal, calcShiftDownSignal,
   calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
   calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
   calcSmoothedATR, calcBuildUpEarly, calcEmaTrendFilter, calc4hTwoBarTrend, calcATRExpansion,
@@ -860,5 +861,95 @@ describe('calcATRExpansion', () => {
   });
   it('връща false при недостатъчно свещи', () => {
     expect(calcATRExpansion([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }])).toBe(false);
+  });
+});
+
+describe('calcBlowoffSignal', () => {
+  it('връща true при екстремно висока RSI + вол spike + range spike + бичи свещ + HTF overbought', () => {
+    const candles = buildRisingCandles(25);
+    const last = candles[candles.length - 1];
+    const originalClose = last.close;
+    last.low = last.open - 0.1;
+    last.high = originalClose + 50;
+    last.close = last.high - 1;
+    last.volume = 100000;
+    expect(calcBlowoffSignal(candles, true)).toBe(true);
+  });
+  it('връща false, ако HTF филтърът не е в overbought', () => {
+    const candles = buildRisingCandles(25);
+    const last = candles[candles.length - 1];
+    const originalClose = last.close;
+    last.low = last.open - 0.1;
+    last.high = originalClose + 50;
+    last.close = last.high - 1;
+    last.volume = 100000;
+    expect(calcBlowoffSignal(candles, false)).toBe(false);
+  });
+  it('връща false, ако не е свещ с достатъчно висок RSI (низходящ пазар)', () => {
+    const candles = buildDecliningCandles(25);
+    const last = candles[candles.length - 1];
+    last.volume = 100000;
+    last.low = last.close - 50;
+    expect(calcBlowoffSignal(candles, true)).toBe(false);
+  });
+  it('връща false при недостатъчно свещи', () => {
+    expect(calcBlowoffSignal(buildRisingCandles(5), true)).toBe(false);
+  });
+});
+
+describe('calcDistributionSignal', () => {
+  function buildDistCandles() {
+    const n = 32;
+    const closes = [];
+    for (let i = 0; i < n; i++) {
+      if (i <= 21) closes.push(100 + i);       // силен ръст: 100..121
+      else closes.push(121 - (i - 21));         // отдръпване: 121..111 (RSI отслабва)
+    }
+    const candles = closes.map((close, i) => ({
+      open: close, high: 200 + i * 0.3, low: 200 + i * 0.3 - 0.4, close, volume: 1000,
+    }));
+    candles[n - 1].low = candles[n - 1].high - 0.1; // малък диапазон на последната свещ
+    candles[n - 1].volume = 300; // пресъхнал обем
+    return candles;
+  }
+  it('връща true при скрита bearish дивергенция + сух обем + малък диапазон + HTF overbought', () => {
+    expect(calcDistributionSignal(buildDistCandles(), true)).toBe(true);
+  });
+  it('връща false, ако HTF филтърът не е в overbought', () => {
+    expect(calcDistributionSignal(buildDistCandles(), false)).toBe(false);
+  });
+  it('връща false при недостатъчно свещи', () => {
+    expect(calcDistributionSignal([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }], true)).toBe(false);
+  });
+});
+
+describe('calcDumpSqueezeSignal', () => {
+  it('връща true при мечка свещ + вол spike + RSI<60', () => {
+    const candles = buildDecliningCandles(25);
+    const last = candles[candles.length - 1];
+    last.volume = 100000;
+    expect(calcDumpSqueezeSignal(candles)).toBe(true);
+  });
+  it('връща false без вол spike', () => {
+    const candles = buildDecliningCandles(25);
+    expect(calcDumpSqueezeSignal(candles)).toBe(false);
+  });
+  it('връща false при бичи свещ', () => {
+    const candles = buildRisingCandles(25);
+    const last = candles[candles.length - 1];
+    last.volume = 100000;
+    expect(calcDumpSqueezeSignal(candles)).toBe(false);
+  });
+});
+
+describe('calcShiftDownSignal', () => {
+  it('връща true при EMA crossunder надолу + RSI<55', () => {
+    const flat = Array.from({ length: 55 }, () => ({ open: 100, high: 100.5, low: 99.5, close: 100, volume: 1000 }));
+    const candles = [...flat, { open: 100, high: 100.5, low: 94.5, close: 95, volume: 1000 }];
+    expect(calcShiftDownSignal(candles)).toBe(true);
+  });
+  it('връща false без EMA crossunder (плосък пазар)', () => {
+    const flat = Array.from({ length: 60 }, () => ({ open: 100, high: 100.5, low: 99.5, close: 100, volume: 1000 }));
+    expect(calcShiftDownSignal(flat)).toBe(false);
   });
 });

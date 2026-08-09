@@ -112,6 +112,30 @@ function calcFlushSignal(candles, htfExtreme, opts = {}) {
   return rsi < rsiFlushLevel && volSpike && rangeSpike && bearCandle && htfFilter;
 }
 
+// BLOWOFF: огледалната версия на FLUSH при връх - екстремно висока RSI + вол spike +
+// голям диапазон + бичи свещ, филтрирано по HTF overbought (mirror на FLUSH-ия oversold).
+function calcBlowoffSignal(candles, htfOverbought, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, rsiBlowoffLevel = opts.rsiBlowoffLevel ?? 75;
+  const volLen = opts.volLen ?? 20, volFlushMult = opts.volFlushMult ?? 2.5;
+  const rangeLen = opts.rangeLen ?? 20, rangeMult = opts.rangeMult ?? 2.0;
+  const useHTFFilter = opts.useHTFFilter ?? true;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen, rangeLen) + 1) return false;
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  if (rsi == null || volMA == null || rangeMA == null) return false;
+  const last = candles[n - 1];
+  const volSpike = last.volume > volMA * volFlushMult;
+  const rangeSpike = (last.high - last.low) > rangeMA * rangeMult;
+  const bullCandle = last.close > last.open;
+  const htfFilter = useHTFFilter ? htfOverbought : true;
+  return rsi > rsiBlowoffLevel && volSpike && rangeSpike && bullCandle && htfFilter;
+}
+
 // BASE: скрита bullish дивергенция (цената прави по-ниско дъно, RSI прави по-високо
 // дъно) + сух обем + малък диапазон + RSI се възстановява над базовото ниво.
 function calcBaseSignal(candles, htfExtreme, opts = {}) {
@@ -160,6 +184,36 @@ function calcBaseDivergenceStrength(candles, opts = {}) {
   return { score: priceDropPct + rsiGain, priceDropPct, rsiGain };
 }
 
+// DISTRIBUTION: огледалната версия на BASE при връх - скрита bearish дивергенция
+// (цената прави по-високо връх, RSI прави по-нисък връх) + сух обем + малък
+// диапазон + RSI се отдръпва под "top" нивото + HTF overbought филтър.
+function calcDistributionSignal(candles, htfOverbought, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, rsiTopLevel = opts.rsiTopLevel ?? 65;
+  const volLen = opts.volLen ?? 20, volDryMult = opts.volDryMult ?? 0.8;
+  const rangeLen = opts.rangeLen ?? 20;
+  const useHTFFilter = opts.useHTFFilter ?? true;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen, rangeLen) + 11) return false;
+  const closes = candles.map(c => c.close);
+  const highs = candles.map(c => c.high);
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const rsiSeries = calcRSISeries(closes, rsiLen);
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  const rsi = rsiSeries[n - 1], rsi5 = rsiSeries[n - 6], rsi10 = rsiSeries[n - 11];
+  if (rsi == null || rsi5 == null || rsi10 == null || volMA == null || rangeMA == null) return false;
+  const priceHigherHigh = highs[n - 1] > highs[n - 6] && highs[n - 6] > highs[n - 11];
+  const rsiLowerHigh = rsi < rsi5 && rsi5 < rsi10;
+  const bearDiv = priceHigherHigh && rsiLowerHigh;
+  const last = candles[n - 1];
+  const volDry = last.volume < volMA * volDryMult;
+  const smallRange = (last.high - last.low) < rangeMA;
+  const rsiRetreat = rsi < rsiTopLevel;
+  const htfFilter = useHTFFilter ? htfOverbought : true;
+  return bearDiv && volDry && smallRange && rsiRetreat && htfFilter;
+}
+
 // SQUEEZE: бичи свещ + вол spike (сама сила като FLUSH прага) + RSI над 40 - типично
 // кратък шорт-скуийз изблик.
 function calcSqueezeSignal(candles, opts = {}) {
@@ -177,6 +231,24 @@ function calcSqueezeSignal(candles, opts = {}) {
   return bullCandle && volSpike && rsi > 40;
 }
 
+// DUMP SQUEEZE: огледалната версия на SQUEEZE при връх - мечка свещ + вол spike
+// (same сила като SQUEEZE прага) + RSI под 60 - типично кратък "long squeeze"
+// изблик надолу (последно влезлите на дълго биват изхвърлени).
+function calcDumpSqueezeSignal(candles, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, volLen = opts.volLen ?? 20, volFlushMult = opts.volFlushMult ?? 2.5;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen) + 1) return false;
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const volMA = calcSMA(volumes, volLen);
+  if (rsi == null || volMA == null) return false;
+  const last = candles[n - 1];
+  const bearCandle = last.close < last.open;
+  const volSpike = last.volume > volMA * volFlushMult;
+  return bearCandle && volSpike && rsi < 60;
+}
+
 // SHIFT: бърз EMA пресича нагоре бавния EMA + RSI над 45 - смяна на тренда нагоре.
 function calcShiftSignal(candles, opts = {}) {
   const rsiLen = opts.rsiLen ?? 14, emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
@@ -191,6 +263,23 @@ function calcShiftSignal(candles, opts = {}) {
   if (rsi == null || fNow == null || fPrev == null || sNow == null || sPrev == null) return false;
   const crossover = fPrev <= sPrev && fNow > sNow;
   return crossover && rsi > 45;
+}
+
+// SHIFT DOWN: огледалната версия на SHIFT при връх - бърз EMA пресича надолу
+// бавния EMA + RSI под 55 - смяна на тренда надолу.
+function calcShiftDownSignal(candles, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
+  const n = candles.length;
+  if (n < emaSlowLen + 1) return false;
+  const closes = candles.map(c => c.close);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const emaFastSeries = calcEMASeries(closes, emaFastLen);
+  const emaSlowSeries = calcEMASeries(closes, emaSlowLen);
+  const fNow = emaFastSeries[n - 1], fPrev = emaFastSeries[n - 2];
+  const sNow = emaSlowSeries[n - 1], sPrev = emaSlowSeries[n - 2];
+  if (rsi == null || fNow == null || fPrev == null || sNow == null || sPrev == null) return false;
+  const crossunder = fPrev >= sPrev && fNow < sNow;
+  return crossunder && rsi < 55;
 }
 
 // IMPULSE LONG/SHORT: тясна предходна свещ (компресия) + вол build-up + пробив на
@@ -637,6 +726,7 @@ if (typeof module !== 'undefined' && module.exports) {
     SYMBOL_MAP, fixSymbol, calcSMA, calcRSI, detectBottom, detectTop,
     calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
     calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcBaseDivergenceStrength, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
+    calcBlowoffSignal, calcDistributionSignal, calcDumpSqueezeSignal, calcShiftDownSignal,
     calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
     calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
     calcSmoothedATR, calcBuildUpEarly, calcEmaTrendFilter, calc4hTwoBarTrend, calcATRExpansion,
