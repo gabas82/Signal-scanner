@@ -783,6 +783,68 @@ function calcMMOscPullbackZone(osc, direction, opts = {}) {
   return false;
 }
 
+// ─── "Mario IMPULSE + CONFIRMED + GAP FILTER + BTC.D FILTER" (личен Pine Script
+// индикатор) ─────────────────────────────────────────────────────────────────
+// Пренесени са само IMPULSE и CONFIRMED - CME Gap филтърът (CME:BTC1! фючърсен
+// gap) и BTC.D филтърът (CRYPTOCAP:BTC.D EMA) изискват данни, които Binance API
+// не дава (CME фючърси / почасова история на доминацията), затова са пропуснати.
+
+// IMPULSE+ATR: пробив на предходния бар (close > prev.high / < prev.low) +
+// голямо тяло на свещта + обемен спайк, ПЛЮС нов ATR% "здравословен диапазон"
+// филтър (нито твърде тихо, нито екстремна волатилност) - разлика спрямо
+// съществуващия calcEntryImpulse, който няма ATR% гейт.
+function calcImpulseAtrSignal(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, impulseVolMult = opts.impulseVolMult ?? 2.5;
+  const impulseBodyPct = opts.impulseBodyPct ?? 0.6;
+  const atrLen = opts.atrLen ?? 14, atrMinPct = opts.atrMinPct ?? 0.15, atrMaxPct = opts.atrMaxPct ?? 3.0;
+  const n = candles.length;
+  if (n < Math.max(volLen, atrLen) + 2) return { long: false, short: false };
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const atr = calcATR(candles, atrLen);
+  if (volMA == null || atr == null) return { long: false, short: false };
+  const last = candles[n - 1], prev = candles[n - 2];
+  const atrPct = atr / last.close * 100;
+  const volatilityOK = atrPct >= atrMinPct && atrPct <= atrMaxPct;
+  const rng = Math.max(last.high - last.low, 1e-9);
+  const impulseCandle = Math.abs(last.close - last.open) / rng >= impulseBodyPct;
+  const impulseVol = last.volume >= volMA * impulseVolMult;
+  const gate = impulseCandle && impulseVol && volatilityOK;
+  return { long: gate && last.close > prev.high, short: gate && last.close < prev.low };
+}
+
+// CONFIRMED: на HTF (по подразбиране 15м) цената пресича обратно EMA20, докато
+// EMA20>EMA50 (bullish pullback continuation) / огледално за short, ПЛЮС по
+// избор HTF Regime Sync - 1ч EMA20/EMA50 да сочат същата посока. И двата
+// таймфрейма вече се тегли за WARMING Gate/Build-Up Detector, без нов fetch.
+function calcConfirmedSignal(candles15, candles1h, opts = {}) {
+  const emaFastLen = opts.emaFastLen ?? 20, emaMidLen = opts.emaMidLen ?? 50;
+  const useHTFRegime = opts.useHTFRegime ?? true;
+  const n15 = candles15.length;
+  if (n15 < emaMidLen + 2) return { long: false, short: false };
+  const closes15 = candles15.map(c => c.close);
+  const ema20Series = calcEMASeries(closes15, emaFastLen);
+  const ema50Series = calcEMASeries(closes15, emaMidLen);
+  const ema20 = ema20Series[n15 - 1], ema20Prev = ema20Series[n15 - 2], ema50 = ema50Series[n15 - 1];
+  const close = closes15[n15 - 1], closePrev = closes15[n15 - 2];
+  if (ema20 == null || ema20Prev == null || ema50 == null) return { long: false, short: false };
+  const crossover = closePrev <= ema20Prev && close > ema20;
+  const crossunder = closePrev >= ema20Prev && close < ema20;
+  const pullbackLong = crossover && ema20 > ema50;
+  const pullbackShort = crossunder && ema20 < ema50;
+  let htfBull = true, htfBear = true;
+  if (useHTFRegime) {
+    const n1h = candles1h.length;
+    if (n1h < emaMidLen + 1) return { long: false, short: false };
+    const closes1h = candles1h.map(c => c.close);
+    const regEma20 = calcEMASeries(closes1h, emaFastLen)[n1h - 1];
+    const regEma50 = calcEMASeries(closes1h, emaMidLen)[n1h - 1];
+    if (regEma20 == null || regEma50 == null) return { long: false, short: false };
+    htfBull = regEma20 > regEma50;
+    htfBear = regEma20 < regEma50;
+  }
+  return { long: pullbackLong && htfBull, short: pullbackShort && htfBear };
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -797,6 +859,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
     calcSmoothedATR, calcBuildUpEarly, calcEmaTrendFilter, calc4hTwoBarTrend, calcATRExpansion,
     calcMMOscValue, calcMMOscEntry, calcMMOscPullbackZone,
+    calcImpulseAtrSignal, calcConfirmedSignal,
     isManipulable, formatNum, formatPrice,
     formatOIDelta, getMaintenanceRate, calcLiquidationPrice, calcDCALevels
   };

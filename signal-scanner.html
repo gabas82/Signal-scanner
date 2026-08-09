@@ -148,6 +148,10 @@
   .tag-mmosc-short{background:rgba(255,51,102,0.25);color:var(--red);border:1px solid var(--red);font-weight:bold;}
   .tag-mmosc-relong{background:rgba(0,255,136,0.12);color:var(--green);border:1px solid rgba(0,255,136,0.4);}
   .tag-mmosc-reshort{background:rgba(255,51,102,0.12);color:var(--red);border:1px solid rgba(255,51,102,0.4);}
+  .tag-impulseatr-long{background:rgba(0,255,136,0.2);color:var(--green);border:1px solid var(--green);}
+  .tag-impulseatr-short{background:rgba(255,51,102,0.2);color:var(--red);border:1px solid var(--red);}
+  .tag-confirmed-long{background:rgba(0,255,136,0.2);color:var(--green);border:1px solid var(--green);font-weight:bold;}
+  .tag-confirmed-short{background:rgba(255,51,102,0.2);color:var(--red);border:1px solid var(--red);font-weight:bold;}
   @keyframes flipPulse{0%,100%{opacity:1;}50%{opacity:0.5;}}
   .coin-right{text-align:right;}
   .coin-price{font-family:'Share Tech Mono',monospace;font-size:15px;color:#fff;font-weight:bold;}
@@ -855,15 +859,24 @@ async function loadCapitulation() {
       mmOscState[coin.fullSymbol] = oscS;
       coin.mmOscSignals = { bestLong: oscBestLong, bestShort: oscBestShort, reLong: oscReLong, reShort: oscReShort };
 
+      // IMPULSE+ATR + CONFIRMED - преизползва СЪЩИТЕ 15м/1ч свещи, без нов fetch.
+      // (CME Gap и BTC.D филтрите от оригинала не се пренасят - изискват данни,
+      // които Binance API не дава.)
+      const impulseAtr = calcImpulseAtrSignal(c5);
+      const confirmed = calcConfirmedSignal(c15, c1h);
+      coin.impulseAtrSignals = { long: impulseAtr.long, short: impulseAtr.short };
+      coin.confirmedSignals = { long: confirmed.long, short: confirmed.short };
+
       if (flush || base || squeeze || shift || impulse.long || impulse.short
           || warmTier !== 'none' || superDownDump || coin.warmSignals.bigVol4hUp || coin.warmSignals.bigVol4hDown
           || mmLong || mmShort || mmX25Long || mmX25Short
           || early.long || early.short || buildUpConfirmLong || buildUpConfirmShort || preImpulseLong || preImpulseShort
           || blowoff || distribution || dumpSqueeze || shiftDown
-          || oscBestLong || oscBestShort || oscReLong || oscReShort) {
+          || oscBestLong || oscBestShort || oscReLong || oscReShort
+          || impulseAtr.long || impulseAtr.short || confirmed.long || confirmed.short) {
         results.push(coin);
       }
-    } catch(e) { coin.capSignals = null; coin.warmSignals = null; coin.mmSignals = null; coin.buildUpSignals = null; coin.mmOscSignals = null; }
+    } catch(e) { coin.capSignals = null; coin.warmSignals = null; coin.mmSignals = null; coin.buildUpSignals = null; coin.mmOscSignals = null; coin.impulseAtrSignals = null; coin.confirmedSignals = null; }
     await new Promise(res => setTimeout(res, 150));
   }
   if (results.length === 0) { content.innerHTML = `<div class="no-results">НЯМА АКТИВНИ CAPITULATION/WARMING СИГНАЛИ В МОМЕНТА</div>`; return; }
@@ -1188,6 +1201,10 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
   if (coin.mmOscSignals?.bestShort) tags.push(`<span class="tag tag-mmosc-short">🔴▼ MM-OSC BEST SHORT</span>`);
   if (coin.mmOscSignals?.reLong) tags.push(`<span class="tag tag-mmosc-relong">🟢△ MM-OSC RE-LONG</span>`);
   if (coin.mmOscSignals?.reShort) tags.push(`<span class="tag tag-mmosc-reshort">🔴▽ MM-OSC RE-SHORT</span>`);
+  if (coin.impulseAtrSignals?.long) tags.push(`<span class="tag tag-impulseatr-long">⚡ IMPULSE+ATR ▲</span>`);
+  if (coin.impulseAtrSignals?.short) tags.push(`<span class="tag tag-impulseatr-short">⚡ IMPULSE+ATR ▼</span>`);
+  if (coin.confirmedSignals?.long) tags.push(`<span class="tag tag-confirmed-long">✅ CONFIRMED ▲</span>`);
+  if (coin.confirmedSignals?.short) tags.push(`<span class="tag tag-confirmed-short">✅ CONFIRMED ▼</span>`);
   if (isBottom) tags.push(`<span class="tag tag-bottom">🟢 ДЪНО</span>`);
   if (isTop) tags.push(`<span class="tag tag-top">🔴 ВРЪХ</span>`);
   if (coin.pctFromAtl !== null && coin.pctFromAtl < 100) tags.push(`<span class="tag tag-atl">🟢 БЛИЗО ATL</span>`);

@@ -8,6 +8,7 @@ import {
   calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
   calcSmoothedATR, calcBuildUpEarly, calcEmaTrendFilter, calc4hTwoBarTrend, calcATRExpansion,
   calcMMOscValue, calcMMOscEntry, calcMMOscPullbackZone,
+  calcImpulseAtrSignal, calcConfirmedSignal,
   isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
@@ -1007,5 +1008,106 @@ describe('calcMMOscPullbackZone', () => {
   });
   it('връща false при null стойност', () => {
     expect(calcMMOscPullbackZone(null, 1)).toBe(false);
+  });
+});
+
+describe('calcImpulseAtrSignal', () => {
+  function buildFlat(n, range) {
+    return Array.from({ length: n }, () => ({ open: 100, high: 100 + range / 2, low: 100 - range / 2, close: 100, volume: 1000 }));
+  }
+  it('връща long:true при пробив нагоре със здравословна ATR% волатилност', () => {
+    const flat = buildFlat(25, 0.6);
+    const breakout = { open: 100, high: 103, low: 99.9, close: 102.5, volume: 3000 };
+    const r = calcImpulseAtrSignal([...flat, breakout]);
+    expect(r.long).toBe(true);
+    expect(r.short).toBe(false);
+  });
+  it('връща short:true при пробив надолу', () => {
+    const flat = buildFlat(25, 0.6);
+    const breakdown = { open: 100, high: 100.1, low: 97, close: 97.5, volume: 3000 };
+    const r = calcImpulseAtrSignal([...flat, breakdown]);
+    expect(r.short).toBe(true);
+    expect(r.long).toBe(false);
+  });
+  it('връща long:false, ако ATR% е под минималния праг (твърде тих пазар)', () => {
+    const flat = buildFlat(25, 0.01);
+    const quietBreak = { open: 100, high: 101.5, low: 99.9, close: 101.3, volume: 3000 };
+    const r = calcImpulseAtrSignal([...flat, quietBreak]);
+    expect(r.long).toBe(false);
+  });
+  it('връща long:false, ако ATR% е над максималния праг (твърде екстремна волатилност)', () => {
+    const flat = buildFlat(25, 8);
+    const wildBreak = { open: 100, high: 110, low: 99, close: 108, volume: 3000 };
+    const r = calcImpulseAtrSignal([...flat, wildBreak]);
+    expect(r.long).toBe(false);
+  });
+  it('връща long:false и short:false при недостатъчно свещи', () => {
+    const r = calcImpulseAtrSignal(buildFlat(10, 0.6));
+    expect(r.long).toBe(false);
+    expect(r.short).toBe(false);
+  });
+});
+
+describe('calcConfirmedSignal', () => {
+  function buildTrendSeries(n, start, step) {
+    const candles = [];
+    let price = start;
+    for (let i = 0; i < n; i++) {
+      price += step;
+      candles.push({ open: price - step, high: price + 0.3, low: price - step - 0.3, close: price, volume: 1000 });
+    }
+    return candles;
+  }
+  function buildBullConfirmed15m() {
+    const c15 = buildTrendSeries(60, 100, 0.4);
+    let lastClose = c15[c15.length - 1].close;
+    for (let i = 0; i < 6; i++) {
+      lastClose -= 1.5;
+      c15.push({ open: lastClose + 1.5, high: lastClose + 1.6, low: lastClose - 0.3, close: lastClose, volume: 1000 });
+    }
+    const e20 = calcEMASeries(c15.map(c => c.close), 20);
+    const bounceClose = e20[e20.length - 1] + 1;
+    c15.push({ open: lastClose, high: bounceClose + 0.3, low: lastClose - 0.1, close: bounceClose, volume: 1500 });
+    return c15;
+  }
+  function buildBearConfirmed15m() {
+    const c15 = buildTrendSeries(60, 200, -0.4);
+    let lastClose = c15[c15.length - 1].close;
+    for (let i = 0; i < 6; i++) {
+      lastClose += 1.5;
+      c15.push({ open: lastClose - 1.5, high: lastClose + 0.3, low: lastClose - 1.6, close: lastClose, volume: 1000 });
+    }
+    const e20 = calcEMASeries(c15.map(c => c.close), 20);
+    const dumpClose = e20[e20.length - 1] - 1;
+    c15.push({ open: lastClose, high: lastClose + 0.1, low: dumpClose - 0.3, close: dumpClose, volume: 1500 });
+    return c15;
+  }
+  it('връща long:true при bullish pullback (15м пресича обратно над EMA20, EMA20>EMA50) + 1ч regime sync bull', () => {
+    const c1hBull = buildTrendSeries(70, 100, 0.5);
+    const r = calcConfirmedSignal(buildBullConfirmed15m(), c1hBull);
+    expect(r.long).toBe(true);
+    expect(r.short).toBe(false);
+  });
+  it('връща short:true при bearish pullback + 1ч regime sync bear', () => {
+    const c1hBear = buildTrendSeries(70, 200, -0.5);
+    const r = calcConfirmedSignal(buildBearConfirmed15m(), c1hBear);
+    expect(r.short).toBe(true);
+    expect(r.long).toBe(false);
+  });
+  it('връща long:false, ако 1ч regime sync не съвпада (15м bullish, 1ч bearish)', () => {
+    const c1hBear = buildTrendSeries(70, 200, -0.5);
+    const r = calcConfirmedSignal(buildBullConfirmed15m(), c1hBear);
+    expect(r.long).toBe(false);
+  });
+  it('игнорира regime sync-а, ако useHTFRegime:false', () => {
+    const c1hBear = buildTrendSeries(70, 200, -0.5);
+    const r = calcConfirmedSignal(buildBullConfirmed15m(), c1hBear, { useHTFRegime: false });
+    expect(r.long).toBe(true);
+  });
+  it('връща long:false и short:false при недостатъчно свещи', () => {
+    const c1hBull = buildTrendSeries(70, 100, 0.5);
+    const r = calcConfirmedSignal(buildBullConfirmed15m().slice(0, 10), c1hBull);
+    expect(r.long).toBe(false);
+    expect(r.short).toBe(false);
   });
 });
