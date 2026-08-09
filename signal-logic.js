@@ -549,6 +549,85 @@ function calcDCALevels(entryPrice, side, symbol) {
   return steps;
 }
 
+// ─── "Mario – Build-Up Detector + EMA Filter" (личен Pine Script индикатор) ───
+// Три етапа: (1) Early Build-Up на 1ч - тих натиск в една посока + компресия
+// на волатилността спрямо собствената ѝ скорошна средна + обем все още не е
+// напълно пресъхнал; (2) 4ч Confirm - два поредни 4ч свещи в посоката +
+// EMA50>EMA200 (и растящ EMA50) филтър, в рамките на времеви прозорец от
+// early сигнала; (3) Pre-Impulse - потвърденият сигнал + разширяващ се ATR
+// (спрямо съвсем скорошната си средна) - най-силният, финален тригер.
+
+// Изглаждане на ATR спрямо собствената му скорошна средна (за lowVolatility/
+// atrExpansion проверките) - пресмята ATR на всяка от последните `lookback`
+// свещи и ги осреднява.
+function calcSmoothedATR(candles, atrLen, lookback) {
+  const n = candles.length;
+  let sum = 0, count = 0;
+  for (let i = 0; i < lookback; i++) {
+    const end = n - i;
+    if (end < atrLen) break;
+    const v = calcATR(candles.slice(0, end), atrLen);
+    if (v != null) { sum += v; count++; }
+  }
+  return count > 0 ? sum / count : null;
+}
+
+// Etap 1 (1ч): тих build-up в една посока - мнозинство свещи в тази посока +
+// "накъсани" higher lows / lower highs + ATR под собствената си скорошна
+// средна (компресия) + обемът все още не е напълно пресъхнал.
+function calcBuildUpEarly(candles, opts = {}) {
+  const earlyBars = opts.earlyBars ?? 6, atrLen = opts.atrLen ?? 14, volLen = opts.volLen ?? 20;
+  const atrLooseMult = opts.atrLooseMult ?? 1.3, volStableMult = opts.volStableMult ?? 0.8;
+  const n = candles.length;
+  if (n < Math.max(atrLen, volLen) + earlyBars + 3) return { long: false, short: false };
+  const last = candles.slice(n - earlyBars);
+  let bullCount = 0, bearCount = 0;
+  for (const c of last) { if (c.close > c.open) bullCount++; if (c.close < c.open) bearCount++; }
+  const higherLows = candles[n-1].low > candles[n-2].low || candles[n-2].low > candles[n-3].low;
+  const lowerHighs = candles[n-1].high < candles[n-2].high || candles[n-2].high < candles[n-3].high;
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const volStable = volMA != null && candles[n-1].volume >= volMA * volStableMult;
+  const currentAtr = calcATR(candles, atrLen);
+  const smoothedAtr = calcSmoothedATR(candles, atrLen, earlyBars);
+  const lowVolatility = currentAtr != null && smoothedAtr != null && currentAtr < smoothedAtr * atrLooseMult;
+  const long = bullCount >= earlyBars / 2 && higherLows && lowVolatility && volStable;
+  const short = bearCount >= earlyBars / 2 && lowerHighs && lowVolatility && volStable;
+  return { long, short };
+}
+
+// EMA филтър (по подразбиране 4ч в оригинала): EMA fast > slow И fast расте (bull),
+// или обратното (bear). Изисква candles.length >= slowLen (200 по подразбиране),
+// за разлика от останалите сигнали в приложението - виж fetchKlines лимита за 4ч.
+function calcEmaTrendFilter(candles, opts = {}) {
+  const fastLen = opts.fastLen ?? 50, slowLen = opts.slowLen ?? 200;
+  const closes = candles.map(c => c.close);
+  const fastSeries = calcEMASeries(closes, fastLen);
+  const slowSeries = calcEMASeries(closes, slowLen);
+  const n = candles.length;
+  const fNow = fastSeries[n-1], fPrev = fastSeries[n-2], sNow = slowSeries[n-1];
+  if (fNow == null || fPrev == null || sNow == null) return { bull: false, bear: false };
+  return { bull: fNow > sNow && fNow > fPrev, bear: fNow < sNow && fNow < fPrev };
+}
+
+// Etap 2 (4ч): последните 2 свещи И двете в същата посока - "потвърждение"
+// на build-up-а с реално ценово движение подир него.
+function calc4hTwoBarTrend(candles) {
+  const n = candles.length;
+  if (n < 2) return { bull: false, bear: false };
+  const last = candles[n-1], prev = candles[n-2];
+  return { bull: last.close > last.open && prev.close > prev.open, bear: last.close < last.open && prev.close < prev.open };
+}
+
+// Etap 3: ATR над съвсем скорошната си средна (по подразбиране 2 свещи) -
+// диапазонът вече се разширява, типично за начало на истински импулс.
+function calcATRExpansion(candles, opts = {}) {
+  const atrLen = opts.atrLen ?? 14, lookback = opts.lookback ?? 2;
+  const currentAtr = calcATR(candles, atrLen);
+  const smoothedAtr = calcSmoothedATR(candles, atrLen, lookback);
+  if (currentAtr == null || smoothedAtr == null) return false;
+  return currentAtr > smoothedAtr;
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -560,6 +639,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcBaseDivergenceStrength, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
     calcATR, calcTrueRangeSeries, calcWarmingTier, calc4HBigVolume, calcDumpCascade,
     calcVolumePressure, calcWarmingContext, calcEntryImpulse, calcMMx25Entry,
+    calcSmoothedATR, calcBuildUpEarly, calcEmaTrendFilter, calc4hTwoBarTrend, calcATRExpansion,
     isManipulable, formatNum, formatPrice,
     formatOIDelta, getMaintenanceRate, calcLiquidationPrice, calcDCALevels
   };

@@ -135,6 +135,11 @@
   .tag-mm-short{background:rgba(255,51,102,0.25);color:var(--red);border:1px solid var(--red);font-weight:bold;animation:flipPulse 1.5s infinite;}
   .tag-mmx25-long{background:rgba(0,255,136,0.35);color:#00ff88;border:1px solid #00ff88;font-weight:bold;animation:flipPulse 1.5s infinite;}
   .tag-mmx25-short{background:rgba(128,0,0,0.35);color:#ff6b6b;border:1px solid #800000;font-weight:bold;animation:flipPulse 1.5s infinite;}
+  .tag-buildup-early{background:rgba(255,204,0,0.15);color:var(--yellow);border:1px solid rgba(255,204,0,0.4);}
+  .tag-buildup-confirm-long{background:rgba(0,255,136,0.2);color:var(--green);border:1px solid var(--green);font-weight:bold;}
+  .tag-buildup-confirm-short{background:rgba(255,51,102,0.2);color:var(--red);border:1px solid var(--red);font-weight:bold;}
+  .tag-buildup-preimpulse-long{background:rgba(0,255,136,0.35);color:#00ff88;border:1px solid #00ff88;font-weight:bold;animation:flipPulse 1.5s infinite;}
+  .tag-buildup-preimpulse-short{background:rgba(128,0,0,0.35);color:#ff6b6b;border:1px solid #800000;font-weight:bold;animation:flipPulse 1.5s infinite;}
   @keyframes flipPulse{0%,100%{opacity:1;}50%{opacity:0.5;}}
   .coin-right{text-align:right;}
   .coin-price{font-family:'Share Tech Mono',monospace;font-size:15px;color:#fff;font-weight:bold;}
@@ -677,6 +682,25 @@ function markMMFired(symbol, key, direction) {
   mmCooldownState[symbol][key] = { at: Date.now(), dir: direction };
 }
 
+// "Mario – Build-Up Detector + EMA Filter" - тих build-up на 1ч отваря 18ч
+// прозорец за 4ч Confirm (2 поредни свещи в посоката + EMA50>EMA200 филтър),
+// а Confirm + разширяващ се ATR дава финалния Pre-Impulse. Оригиналният
+// bar-based cooldown (5 1ч свещи) е преведен в реално време (5ч), както
+// останалите bar-cooldown-и в тази страница.
+const buildUpWindowState = {};   // symbol -> {until, dir}
+const buildUpCooldownState = {}; // symbol -> {at}
+const BUILDUP_MAX_HOURS = 18;
+const BUILDUP_COOLDOWN_HOURS = 5;
+
+function buildUpCanArm(symbol) {
+  const state = buildUpCooldownState[symbol];
+  if (!state) return true;
+  return (Date.now() - state.at) >= BUILDUP_COOLDOWN_HOURS * 3600000;
+}
+function markBuildUpArmed(symbol) {
+  buildUpCooldownState[symbol] = { at: Date.now() };
+}
+
 async function loadCapitulation() {
   const content = document.getElementById('main-content');
   content.innerHTML = `<div class="loading">СКАНИРАНЕ ЗА CAPITULATION/WARMING СИГНАЛИ...<br><span style="font-size:10px;color:var(--text2)">Проверява ${allCoins.length} монети (15м/5м/1ч/4ч/1д свещи)</span><div class="loading-bar"><div class="loading-fill"></div></div></div>`;
@@ -687,7 +711,7 @@ async function loadCapitulation() {
         fetchKlines(coin.fullSymbol, '15m', 40, CAPITULATION_KLINE_TTL_MS),
         fetchKlines(coin.fullSymbol, '5m', 40, CAPITULATION_KLINE_TTL_MS),
         fetchKlines(coin.fullSymbol, '1h', 60, CAPITULATION_KLINE_TTL_MS),
-        fetchKlines(coin.fullSymbol, '4h', 20, CAPITULATION_KLINE_TTL_MS),
+        fetchKlines(coin.fullSymbol, '4h', 210, CAPITULATION_KLINE_TTL_MS), // 210 - нужни за EMA200 филтъра на Build-Up Detector-а
         fetchKlines(coin.fullSymbol, '1d', 20, CAPITULATION_KLINE_TTL_MS),
       ]);
       const c15 = klinesToCandles(k15), c5 = klinesToCandles(k5), c1h = klinesToCandles(k1h);
@@ -754,12 +778,35 @@ async function loadCapitulation() {
       }
       coin.mmSignals = { mmLong, mmShort, mmX25Long, mmX25Short };
 
+      // Build-Up Detector - преизползва СЪЩИТЕ 1ч/4ч свещи, без нов fetch.
+      const early = calcBuildUpEarly(c1h);
+      if ((early.long || early.short) && buildUpCanArm(coin.fullSymbol)) {
+        buildUpWindowState[coin.fullSymbol] = { until: Date.now() + BUILDUP_MAX_HOURS * 3600000, dir: early.long ? 1 : -1 };
+        markBuildUpArmed(coin.fullSymbol);
+      }
+      const buildUpWindow = buildUpWindowState[coin.fullSymbol];
+      const withinBuildUpWindow = !!buildUpWindow && Date.now() < buildUpWindow.until;
+      const trend4h = calc4hTwoBarTrend(c4h);
+      const emaFilter = calcEmaTrendFilter(c4h);
+      const buildUpConfirmLong = withinBuildUpWindow && buildUpWindow.dir === 1 && trend4h.bull && emaFilter.bull;
+      const buildUpConfirmShort = withinBuildUpWindow && buildUpWindow.dir === -1 && trend4h.bear && emaFilter.bear;
+      if (buildUpConfirmLong || buildUpConfirmShort) buildUpWindowState[coin.fullSymbol] = null;
+      const buildUpAtrExpanding = calcATRExpansion(c4h);
+      const preImpulseLong = buildUpConfirmLong && buildUpAtrExpanding;
+      const preImpulseShort = buildUpConfirmShort && buildUpAtrExpanding;
+      coin.buildUpSignals = {
+        earlyLong: early.long, earlyShort: early.short,
+        confirmLong: buildUpConfirmLong, confirmShort: buildUpConfirmShort,
+        preImpulseLong, preImpulseShort,
+      };
+
       if (flush || base || squeeze || shift || impulse.long || impulse.short
           || warmTier !== 'none' || superDownDump || coin.warmSignals.bigVol4hUp || coin.warmSignals.bigVol4hDown
-          || mmLong || mmShort || mmX25Long || mmX25Short) {
+          || mmLong || mmShort || mmX25Long || mmX25Short
+          || early.long || early.short || buildUpConfirmLong || buildUpConfirmShort || preImpulseLong || preImpulseShort) {
         results.push(coin);
       }
-    } catch(e) { coin.capSignals = null; coin.warmSignals = null; coin.mmSignals = null; }
+    } catch(e) { coin.capSignals = null; coin.warmSignals = null; coin.mmSignals = null; coin.buildUpSignals = null; }
     await new Promise(res => setTimeout(res, 150));
   }
   if (results.length === 0) { content.innerHTML = `<div class="no-results">НЯМА АКТИВНИ CAPITULATION/WARMING СИГНАЛИ В МОМЕНТА</div>`; return; }
@@ -1070,6 +1117,12 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
   if (coin.mmSignals?.mmShort) tags.push(`<span class="tag tag-mm-short">🔴 MM SHORT</span>`);
   if (coin.mmSignals?.mmX25Long) tags.push(`<span class="tag tag-mmx25-long">💎 MM x25 LONG</span>`);
   if (coin.mmSignals?.mmX25Short) tags.push(`<span class="tag tag-mmx25-short">💀 MM x25 SHORT</span>`);
+  if (coin.buildUpSignals?.earlyLong) tags.push(`<span class="tag tag-buildup-early">🟡 EARLY BUILD-UP ▲</span>`);
+  if (coin.buildUpSignals?.earlyShort) tags.push(`<span class="tag tag-buildup-early">🟡 EARLY BUILD-UP ▼</span>`);
+  if (coin.buildUpSignals?.confirmLong) tags.push(`<span class="tag tag-buildup-confirm-long">🟢 BUILD-UP CONFIRMED ▲</span>`);
+  if (coin.buildUpSignals?.confirmShort) tags.push(`<span class="tag tag-buildup-confirm-short">🔴 BUILD-UP CONFIRMED ▼</span>`);
+  if (coin.buildUpSignals?.preImpulseLong) tags.push(`<span class="tag tag-buildup-preimpulse-long">🚀 PRE-IMPULSE ▲</span>`);
+  if (coin.buildUpSignals?.preImpulseShort) tags.push(`<span class="tag tag-buildup-preimpulse-short">💥 PRE-IMPULSE ▼</span>`);
   if (isBottom) tags.push(`<span class="tag tag-bottom">🟢 ДЪНО</span>`);
   if (isTop) tags.push(`<span class="tag tag-top">🔴 ВРЪХ</span>`);
   if (coin.pctFromAtl !== null && coin.pctFromAtl < 100) tags.push(`<span class="tag tag-atl">🟢 БЛИЗО ATL</span>`);
