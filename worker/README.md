@@ -65,9 +65,13 @@ Dashboard → orange-grass-d809 → **Settings → Triggers → Cron Triggers �
 3. Ако цената е пресякла ниво, което не е било известено през последните 24ч, праща WhatsApp съобщение и пази маркер в KV за да не спамва повторно.
 
 **Пазарни сигнали** (за ВСЕКИ запис в watchlist-а, независимо от позиция):
-1. Изтегля 15м/5м/1ч/4ч/1д свещи от Binance за символа (същите timeframes като CAPITULATION таба в приложението).
-2. Изчислява FLUSH/BASE/SQUEEZE/SHIFT/IMPULSE (Capitulation Suite), WARMING/HOT/SUPER + 4Ч обем + Dump Cascade (WARMING Gate), и MM LONG/SHORT/x25 (MM WARMING→IMPULSE) — byte-identical логика с приложението.
-3. Cooldown/ARM състоянието (за да не спамва един и същ сигнал постоянно) се пази в KV между извикванията, по символ.
+1. Изтегля 15м/5м/1ч/4ч(210 свещи, за EMA200)/1д свещи от Binance за символа (същите timeframes като CAPITULATION таба в приложението).
+2. Изчислява byte-identical логика с приложението:
+   - **Capitulation Suite**: FLUSH/BASE/SQUEEZE/SHIFT/IMPULSE (дъно) + огледалните им връх версии BLOWOFF/DISTRIBUTION/DUMP SQUEEZE/SHIFT ▼ (следи и прегрят, и подценен пазар)
+   - **WARMING Gate**: WARM/HOT/SUPER + 4Ч обем + Dump Cascade
+   - **MM WARMING→IMPULSE**: MM LONG/SHORT + MM x25
+   - **Build-Up Detector**: EARLY BUILD-UP → BUILD-UP CONFIRMED → PRE-IMPULSE (18ч прозорец между Early и Confirm)
+3. Cooldown/ARM/прозорец състоянието (за да не спамва един и същ сигнал постоянно) се пази в KV между извикванията, по символ.
 4. Ако нещо ново се е задействало, праща едно консолидирано WhatsApp съобщение със списък на сигналите.
 
 ## Локални тестове
