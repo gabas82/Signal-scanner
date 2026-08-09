@@ -157,6 +157,28 @@ function calcFlushSignal(candles, htfExtreme, opts = {}) {
   return rsi < rsiFlushLevel && volSpike && rangeSpike && bearCandle && htfFilter;
 }
 
+function calcBlowoffSignal(candles, htfOverbought, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, rsiBlowoffLevel = opts.rsiBlowoffLevel ?? 75;
+  const volLen = opts.volLen ?? 20, volFlushMult = opts.volFlushMult ?? 2.5;
+  const rangeLen = opts.rangeLen ?? 20, rangeMult = opts.rangeMult ?? 2.0;
+  const useHTFFilter = opts.useHTFFilter ?? true;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen, rangeLen) + 1) return false;
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  if (rsi == null || volMA == null || rangeMA == null) return false;
+  const last = candles[n - 1];
+  const volSpike = last.volume > volMA * volFlushMult;
+  const rangeSpike = (last.high - last.low) > rangeMA * rangeMult;
+  const bullCandle = last.close > last.open;
+  const htfFilter = useHTFFilter ? htfOverbought : true;
+  return rsi > rsiBlowoffLevel && volSpike && rangeSpike && bullCandle && htfFilter;
+}
+
 function calcBaseSignal(candles, htfExtreme, opts = {}) {
   const rsiLen = opts.rsiLen ?? 14, rsiBaseLevel = opts.rsiBaseLevel ?? 35;
   const volLen = opts.volLen ?? 20, volDryMult = opts.volDryMult ?? 0.8;
@@ -184,6 +206,33 @@ function calcBaseSignal(candles, htfExtreme, opts = {}) {
   return bullDiv && volDry && smallRange && rsiRecover && htfFilter;
 }
 
+function calcDistributionSignal(candles, htfOverbought, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, rsiTopLevel = opts.rsiTopLevel ?? 65;
+  const volLen = opts.volLen ?? 20, volDryMult = opts.volDryMult ?? 0.8;
+  const rangeLen = opts.rangeLen ?? 20;
+  const useHTFFilter = opts.useHTFFilter ?? true;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen, rangeLen) + 11) return false;
+  const closes = candles.map(c => c.close);
+  const highs = candles.map(c => c.high);
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const rsiSeries = calcRSISeries(closes, rsiLen);
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  const rsi = rsiSeries[n - 1], rsi5 = rsiSeries[n - 6], rsi10 = rsiSeries[n - 11];
+  if (rsi == null || rsi5 == null || rsi10 == null || volMA == null || rangeMA == null) return false;
+  const priceHigherHigh = highs[n - 1] > highs[n - 6] && highs[n - 6] > highs[n - 11];
+  const rsiLowerHigh = rsi < rsi5 && rsi5 < rsi10;
+  const bearDiv = priceHigherHigh && rsiLowerHigh;
+  const last = candles[n - 1];
+  const volDry = last.volume < volMA * volDryMult;
+  const smallRange = (last.high - last.low) < rangeMA;
+  const rsiRetreat = rsi < rsiTopLevel;
+  const htfFilter = useHTFFilter ? htfOverbought : true;
+  return bearDiv && volDry && smallRange && rsiRetreat && htfFilter;
+}
+
 function calcSqueezeSignal(candles, opts = {}) {
   const rsiLen = opts.rsiLen ?? 14, volLen = opts.volLen ?? 20, volFlushMult = opts.volFlushMult ?? 2.5;
   const n = candles.length;
@@ -199,6 +248,21 @@ function calcSqueezeSignal(candles, opts = {}) {
   return bullCandle && volSpike && rsi > 40;
 }
 
+function calcDumpSqueezeSignal(candles, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, volLen = opts.volLen ?? 20, volFlushMult = opts.volFlushMult ?? 2.5;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen) + 1) return false;
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const volMA = calcSMA(volumes, volLen);
+  if (rsi == null || volMA == null) return false;
+  const last = candles[n - 1];
+  const bearCandle = last.close < last.open;
+  const volSpike = last.volume > volMA * volFlushMult;
+  return bearCandle && volSpike && rsi < 60;
+}
+
 function calcShiftSignal(candles, opts = {}) {
   const rsiLen = opts.rsiLen ?? 14, emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
   const n = candles.length;
@@ -212,6 +276,21 @@ function calcShiftSignal(candles, opts = {}) {
   if (rsi == null || fNow == null || fPrev == null || sNow == null || sPrev == null) return false;
   const crossover = fPrev <= sPrev && fNow > sNow;
   return crossover && rsi > 45;
+}
+
+function calcShiftDownSignal(candles, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
+  const n = candles.length;
+  if (n < emaSlowLen + 1) return false;
+  const closes = candles.map(c => c.close);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const emaFastSeries = calcEMASeries(closes, emaFastLen);
+  const emaSlowSeries = calcEMASeries(closes, emaSlowLen);
+  const fNow = emaFastSeries[n - 1], fPrev = emaFastSeries[n - 2];
+  const sNow = emaSlowSeries[n - 1], sPrev = emaSlowSeries[n - 2];
+  if (rsi == null || fNow == null || fPrev == null || sNow == null || sPrev == null) return false;
+  const crossunder = fPrev >= sPrev && fNow < sNow;
+  return crossunder && rsi < 55;
 }
 
 function calcImpulseSignal(candles, flushActive, opts = {}) {
@@ -381,6 +460,65 @@ function calcMMx25Entry(candles, opts = {}) {
   return { long: last.close > ema && proxyOK, short: last.close < ema && proxyOK, ema, proxyOK };
 }
 
+// ─── "Mario – Build-Up Detector + EMA Filter" ────────────────────────────
+function calcSmoothedATR(candles, atrLen, lookback) {
+  const n = candles.length;
+  let sum = 0, count = 0;
+  for (let i = 0; i < lookback; i++) {
+    const end = n - i;
+    if (end < atrLen) break;
+    const v = calcATR(candles.slice(0, end), atrLen);
+    if (v != null) { sum += v; count++; }
+  }
+  return count > 0 ? sum / count : null;
+}
+
+function calcBuildUpEarly(candles, opts = {}) {
+  const earlyBars = opts.earlyBars ?? 6, atrLen = opts.atrLen ?? 14, volLen = opts.volLen ?? 20;
+  const atrLooseMult = opts.atrLooseMult ?? 1.3, volStableMult = opts.volStableMult ?? 0.8;
+  const n = candles.length;
+  if (n < Math.max(atrLen, volLen) + earlyBars + 3) return { long: false, short: false };
+  const last = candles.slice(n - earlyBars);
+  let bullCount = 0, bearCount = 0;
+  for (const c of last) { if (c.close > c.open) bullCount++; if (c.close < c.open) bearCount++; }
+  const higherLows = candles[n-1].low > candles[n-2].low || candles[n-2].low > candles[n-3].low;
+  const lowerHighs = candles[n-1].high < candles[n-2].high || candles[n-2].high < candles[n-3].high;
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const volStable = volMA != null && candles[n-1].volume >= volMA * volStableMult;
+  const currentAtr = calcATR(candles, atrLen);
+  const smoothedAtr = calcSmoothedATR(candles, atrLen, earlyBars);
+  const lowVolatility = currentAtr != null && smoothedAtr != null && currentAtr < smoothedAtr * atrLooseMult;
+  const long = bullCount >= earlyBars / 2 && higherLows && lowVolatility && volStable;
+  const short = bearCount >= earlyBars / 2 && lowerHighs && lowVolatility && volStable;
+  return { long, short };
+}
+
+function calcEmaTrendFilter(candles, opts = {}) {
+  const fastLen = opts.fastLen ?? 50, slowLen = opts.slowLen ?? 200;
+  const closes = candles.map(c => c.close);
+  const fastSeries = calcEMASeries(closes, fastLen);
+  const slowSeries = calcEMASeries(closes, slowLen);
+  const n = candles.length;
+  const fNow = fastSeries[n-1], fPrev = fastSeries[n-2], sNow = slowSeries[n-1];
+  if (fNow == null || fPrev == null || sNow == null) return { bull: false, bear: false };
+  return { bull: fNow > sNow && fNow > fPrev, bear: fNow < sNow && fNow < fPrev };
+}
+
+function calc4hTwoBarTrend(candles) {
+  const n = candles.length;
+  if (n < 2) return { bull: false, bear: false };
+  const last = candles[n-1], prev = candles[n-2];
+  return { bull: last.close > last.open && prev.close > prev.open, bear: last.close < last.open && prev.close < prev.open };
+}
+
+function calcATRExpansion(candles, opts = {}) {
+  const atrLen = opts.atrLen ?? 14, lookback = opts.lookback ?? 2;
+  const currentAtr = calcATR(candles, atrLen);
+  const smoothedAtr = calcSmoothedATR(candles, atrLen, lookback);
+  if (currentAtr == null || smoothedAtr == null) return false;
+  return currentAtr > smoothedAtr;
+}
+
 function klinesToCandles(klines) {
   return (klines||[]).map(k => ({ open: parseFloat(k[1]), high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]) }));
 }
@@ -417,6 +555,20 @@ function markMMFired(state, key, direction) {
   state.mmCooldown[key] = { at: Date.now(), dir: direction };
 }
 
+// "Mario – Build-Up Detector + EMA Filter" - Early Build-Up на 1ч отваря 18ч
+// прозорец за 4ч Confirm, а Confirm + разширяващ се ATR дава Pre-Impulse.
+const BUILDUP_MAX_HOURS = 18;
+const BUILDUP_COOLDOWN_HOURS = 5;
+
+function buildUpCanArm(state) {
+  const s = state.buildUpCooldown;
+  if (!s) return true;
+  return (Date.now() - s.at) >= BUILDUP_COOLDOWN_HOURS * 3600000;
+}
+function markBuildUpArmed(state) {
+  state.buildUpCooldown = { at: Date.now() };
+}
+
 async function fetchKlinesWorker(symbol, interval, limit) {
   const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
   return r.json();
@@ -440,7 +592,7 @@ async function scanSymbolSignals(env, symbol) {
     fetchKlinesWorker(symbol, '15m', 40),
     fetchKlinesWorker(symbol, '5m', 40),
     fetchKlinesWorker(symbol, '1h', 60),
-    fetchKlinesWorker(symbol, '4h', 20),
+    fetchKlinesWorker(symbol, '4h', 210), // 210 - нужни за EMA200 филтъра на Build-Up Detector-а
     fetchKlinesWorker(symbol, '1d', 20),
   ]);
   const c15 = klinesToCandles(k15), c5 = klinesToCandles(k5), c1h = klinesToCandles(k1h);
@@ -449,14 +601,35 @@ async function scanSymbolSignals(env, symbol) {
   const rsi4h = c4h.length ? calcRSI(c4h.map(x=>x.close), 14) : null;
   const rsi1d = c1d.length ? calcRSI(c1d.map(x=>x.close), 14) : null;
   const htfExtreme = rsi4h!=null && rsi1d!=null && rsi4h<35 && rsi1d<35;
+  const htfOverbought = rsi4h!=null && rsi1d!=null && rsi4h>65 && rsi1d>65;
 
   const flush = calcFlushSignal(c15, htfExtreme);
+  const blowoff = calcBlowoffSignal(c15, htfOverbought);
   const base = calcBaseSignal(c1h, htfExtreme);
+  const distribution = calcDistributionSignal(c1h, htfOverbought);
   const squeeze = calcSqueezeSignal(c5);
+  const dumpSqueeze = calcDumpSqueezeSignal(c5);
   const shift = calcShiftSignal(c1h);
+  const shiftDown = calcShiftDownSignal(c1h);
   const impulse = calcImpulseSignal(c1h, flush);
 
   const state = await loadSymbolState(env, symbol);
+
+  const early = calcBuildUpEarly(c1h);
+  if ((early.long || early.short) && buildUpCanArm(state)) {
+    state.buildUpWindow = { until: Date.now() + BUILDUP_MAX_HOURS * 3600000, dir: early.long ? 1 : -1 };
+    markBuildUpArmed(state);
+  }
+  const buildUpWindow = state.buildUpWindow;
+  const withinBuildUpWindow = !!buildUpWindow && Date.now() < buildUpWindow.until;
+  const trend4h = calc4hTwoBarTrend(c4h);
+  const emaFilter = calcEmaTrendFilter(c4h);
+  const buildUpConfirmLong = withinBuildUpWindow && buildUpWindow.dir === 1 && trend4h.bull && emaFilter.bull;
+  const buildUpConfirmShort = withinBuildUpWindow && buildUpWindow.dir === -1 && trend4h.bear && emaFilter.bear;
+  if (buildUpConfirmLong || buildUpConfirmShort) state.buildUpWindow = null;
+  const buildUpAtrExpanding = calcATRExpansion(c4h);
+  const preImpulseLong = buildUpConfirmLong && buildUpAtrExpanding;
+  const preImpulseShort = buildUpConfirmShort && buildUpAtrExpanding;
 
   const bigVol4h = calc4HBigVolume(c4h);
   if (bigVol4h.active) {
@@ -494,11 +667,21 @@ async function scanSymbolSignals(env, symbol) {
 
   const fired = [];
   if (flush) fired.push('💥 FLUSH');
+  if (blowoff) fired.push('🔥 BLOWOFF');
   if (base) fired.push('🔵 BASE');
+  if (distribution) fired.push('🟠 DISTRIBUTION');
   if (squeeze) fired.push('🟣 SQUEEZE');
+  if (dumpSqueeze) fired.push('🟣 DUMP SQUEEZE');
   if (shift) fired.push('🟠 SHIFT');
+  if (shiftDown) fired.push('🟠 SHIFT ▼');
   if (impulse.long) fired.push('🟢 IMPULSE LONG');
   if (impulse.short) fired.push('🔴 IMPULSE SHORT');
+  if (early.long) fired.push('🟡 EARLY BUILD-UP ▲');
+  if (early.short) fired.push('🟡 EARLY BUILD-UP ▼');
+  if (buildUpConfirmLong) fired.push('🟢 BUILD-UP CONFIRMED ▲');
+  if (buildUpConfirmShort) fired.push('🔴 BUILD-UP CONFIRMED ▼');
+  if (preImpulseLong) fired.push('🚀 PRE-IMPULSE ▲');
+  if (preImpulseShort) fired.push('💥 PRE-IMPULSE ▼');
   if (warmTier === 'warm') fired.push(`🔵 WARMING ${warming.direction === 'up' ? '▲' : '▼'}`);
   if (warmTier === 'hot') fired.push(`🟠 HOT ${warming.direction === 'up' ? '▲' : '▼'}`);
   if (warmTier === 'super') fired.push(`${warming.direction === 'up' ? '🟢' : '🔴'} SUPER ${warming.direction === 'up' ? '▲' : '▼'}`);
