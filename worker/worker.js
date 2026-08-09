@@ -17,8 +17,21 @@
 // SHIFT/IMPULSE) - за това entryPrice/side НЕ са нужни. Добавяш ги само ако
 // искаш и DCA известия за конкретна твоя позиция в тази монета.
 const WATCHLIST = [
-  // { symbol: 'BTCUSDT' },                              // само пазарни сигнали
-  // { symbol: 'ETHUSDT', entryPrice: 3200, side: 'short' }, // + DCA известия
+  { symbol: 'BTCUSDT' },
+  { symbol: 'ETHUSDT' },
+  { symbol: 'SOLUSDT' },
+  { symbol: 'LTCUSDT' },
+  { symbol: 'SUIUSDT' },
+  { symbol: 'APTUSDT' },
+  { symbol: 'INJUSDT' },
+  { symbol: 'HYPEUSDT' },
+  { symbol: 'RIVERUSDT' },
+  { symbol: 'TAOUSDT' },
+  { symbol: 'ZECUSDT' },
+  { symbol: 'ONDOUSDT' },
+  { symbol: 'WLDUSDT' },
+  { symbol: 'OPUSDT' },
+  { symbol: 'ARKMUSDT' },
 ];
 
 const DCA_ALERT_COOLDOWN_MS = 24 * 3600000; // не повтаря едно и също DCA ниво по-често от 24ч
