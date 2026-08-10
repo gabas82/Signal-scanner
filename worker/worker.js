@@ -739,6 +739,18 @@ function formatPrice(p) {
   return p.toFixed(6);
 }
 
+// TP % стълба, извлечена от външен VIP сигнален канал (Cornix формат): техните
+// Target 1/3/4/5/7 се мапват към нашите TP1-TP5 (по изрично желание - нямаме
+// втори вход/stop loss тук, защото вече имаме собствена DCA стратегия за това).
+// Процентите са осреднени от два реални техни сигнала (ETH и MNT), които се
+// оказаха с почти идентична %-дистанция от входа въпреки различната монета -
+// значи каналът използва фиксирана относителна стълба, не абсолютни нива.
+const TP_PCTS = [1.26, 2.34, 3.58, 4.52, 8.23];
+
+function calcTakeProfitLevels(price, direction) {
+  return TP_PCTS.map(pct => direction === 'long' ? price * (1 + pct / 100) : price * (1 - pct / 100));
+}
+
 async function loadSymbolState(env, symbol) {
   if (!env.ALERT_STATE) return {};
   const raw = await env.ALERT_STATE.get(`sigstate:${symbol}`);
@@ -848,43 +860,48 @@ async function scanSymbolSignals(env, symbol) {
 
   await saveSymbolState(env, symbol, state);
 
+  // longHits/shortHits проследяват дали задействалите се сигнали са предимно
+  // бичи (дъно/пробив нагоре) или мечи (връх/пробив надолу) - за да решим
+  // накъде да покажем TP стълбата в известието (виж calcTakeProfitLevels).
   const fired = [];
-  if (flush) fired.push('💥 FLUSH');
-  if (blowoff) fired.push('🔥 BLOWOFF');
-  if (base) fired.push('🔵 BASE');
-  if (distribution) fired.push('🟠 DISTRIBUTION');
-  if (squeeze) fired.push('🟣 SQUEEZE');
-  if (dumpSqueeze) fired.push('🟣 DUMP SQUEEZE');
-  if (shift) fired.push('🟠 SHIFT');
-  if (shiftDown) fired.push('🟠 SHIFT ▼');
-  if (impulse.long) fired.push('🟢 IMPULSE LONG');
-  if (impulse.short) fired.push('🔴 IMPULSE SHORT');
-  if (early.long) fired.push('🟡 EARLY BUILD-UP ▲');
-  if (early.short) fired.push('🟡 EARLY BUILD-UP ▼');
-  if (buildUpConfirmLong) fired.push('🟢 BUILD-UP CONFIRMED ▲');
-  if (buildUpConfirmShort) fired.push('🔴 BUILD-UP CONFIRMED ▼');
-  if (preImpulseLong) fired.push('🚀 PRE-IMPULSE ▲');
-  if (preImpulseShort) fired.push('💥 PRE-IMPULSE ▼');
-  if (warmTier === 'warm') fired.push(`🔵 WARMING ${warming.direction === 'up' ? '▲' : '▼'}`);
-  if (warmTier === 'hot') fired.push(`🟠 HOT ${warming.direction === 'up' ? '▲' : '▼'}`);
-  if (warmTier === 'super') fired.push(`${warming.direction === 'up' ? '🟢' : '🔴'} SUPER ${warming.direction === 'up' ? '▲' : '▼'}`);
-  if (superDownDump) fired.push('🚨 SUPER DOWN (DUMP)');
-  if (mmLong) fired.push('🟢 MM LONG');
-  if (mmShort) fired.push('🔴 MM SHORT');
-  if (mmX25Long) fired.push('💎 MM x25 LONG');
-  if (mmX25Short) fired.push('💀 MM x25 SHORT');
-  if (oscBestLong) fired.push('🟢▲ MM-OSC BEST LONG');
-  if (oscBestShort) fired.push('🔴▼ MM-OSC BEST SHORT');
-  if (oscReLong) fired.push('🟢△ MM-OSC RE-LONG');
-  if (oscReShort) fired.push('🔴▽ MM-OSC RE-SHORT');
-  if (impulseAtr.long) fired.push('⚡ IMPULSE+ATR ▲');
-  if (impulseAtr.short) fired.push('⚡ IMPULSE+ATR ▼');
-  if (confirmed.long) fired.push('✅ CONFIRMED ▲');
-  if (confirmed.short) fired.push('✅ CONFIRMED ▼');
+  let longHits = 0, shortHits = 0;
+  if (flush) { fired.push('💥 FLUSH'); longHits++; }
+  if (blowoff) { fired.push('🔥 BLOWOFF'); shortHits++; }
+  if (base) { fired.push('🔵 BASE'); longHits++; }
+  if (distribution) { fired.push('🟠 DISTRIBUTION'); shortHits++; }
+  if (squeeze) { fired.push('🟣 SQUEEZE'); longHits++; }
+  if (dumpSqueeze) { fired.push('🟣 DUMP SQUEEZE'); shortHits++; }
+  if (shift) { fired.push('🟠 SHIFT'); longHits++; }
+  if (shiftDown) { fired.push('🟠 SHIFT ▼'); shortHits++; }
+  if (impulse.long) { fired.push('🟢 IMPULSE LONG'); longHits++; }
+  if (impulse.short) { fired.push('🔴 IMPULSE SHORT'); shortHits++; }
+  if (early.long) { fired.push('🟡 EARLY BUILD-UP ▲'); longHits++; }
+  if (early.short) { fired.push('🟡 EARLY BUILD-UP ▼'); shortHits++; }
+  if (buildUpConfirmLong) { fired.push('🟢 BUILD-UP CONFIRMED ▲'); longHits++; }
+  if (buildUpConfirmShort) { fired.push('🔴 BUILD-UP CONFIRMED ▼'); shortHits++; }
+  if (preImpulseLong) { fired.push('🚀 PRE-IMPULSE ▲'); longHits++; }
+  if (preImpulseShort) { fired.push('💥 PRE-IMPULSE ▼'); shortHits++; }
+  if (warmTier === 'warm') { fired.push(`🔵 WARMING ${warming.direction === 'up' ? '▲' : '▼'}`); warming.direction === 'up' ? longHits++ : shortHits++; }
+  if (warmTier === 'hot') { fired.push(`🟠 HOT ${warming.direction === 'up' ? '▲' : '▼'}`); warming.direction === 'up' ? longHits++ : shortHits++; }
+  if (warmTier === 'super') { fired.push(`${warming.direction === 'up' ? '🟢' : '🔴'} SUPER ${warming.direction === 'up' ? '▲' : '▼'}`); warming.direction === 'up' ? longHits++ : shortHits++; }
+  if (superDownDump) { fired.push('🚨 SUPER DOWN (DUMP)'); shortHits++; }
+  if (mmLong) { fired.push('🟢 MM LONG'); longHits++; }
+  if (mmShort) { fired.push('🔴 MM SHORT'); shortHits++; }
+  if (mmX25Long) { fired.push('💎 MM x25 LONG'); longHits++; }
+  if (mmX25Short) { fired.push('💀 MM x25 SHORT'); shortHits++; }
+  if (oscBestLong) { fired.push('🟢▲ MM-OSC BEST LONG'); longHits++; }
+  if (oscBestShort) { fired.push('🔴▼ MM-OSC BEST SHORT'); shortHits++; }
+  if (oscReLong) { fired.push('🟢△ MM-OSC RE-LONG'); longHits++; }
+  if (oscReShort) { fired.push('🔴▽ MM-OSC RE-SHORT'); shortHits++; }
+  if (impulseAtr.long) { fired.push('⚡ IMPULSE+ATR ▲'); longHits++; }
+  if (impulseAtr.short) { fired.push('⚡ IMPULSE+ATR ▼'); shortHits++; }
+  if (confirmed.long) { fired.push('✅ CONFIRMED ▲'); longHits++; }
+  if (confirmed.short) { fired.push('✅ CONFIRMED ▼'); shortHits++; }
 
   const price = c5.length ? c5[c5.length - 1].close : null;
   const { support, resistance } = calcSupportResistance(c1h, 20);
-  return { fired, price, support, resistance };
+  const direction = longHits > shortHits ? 'long' : shortHits > longHits ? 'short' : null;
+  return { fired, price, support, resistance, direction };
 }
 
 // ---- Пазарни сигнали следене (извиква се от scheduled()) -------------------
@@ -893,12 +910,16 @@ async function scanSymbolSignals(env, symbol) {
 async function checkMarketSignals(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
     try {
-      const { fired, price, support, resistance } = await scanSymbolSignals(env, pos.symbol);
+      const { fired, price, support, resistance, direction } = await scanSymbolSignals(env, pos.symbol);
       if (fired.length > 0) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
         const longShort = await fetchLongShortWorker(env, pos.symbol);
         const lines = [`🔥 ${symbolNoUsdt}`];
         if (price != null) lines.push(`💰 Цена: $${formatPrice(price)}`);
+        if (direction) lines.push(`📍 Посока: ${direction === 'long' ? 'LONG 🔵' : 'SHORT 🔴'}`);
+        if (price != null && direction) {
+          calcTakeProfitLevels(price, direction).forEach((tp, i) => lines.push(`🎯 TP${i + 1}: $${formatPrice(tp)}`));
+        }
         if (resistance != null) lines.push(`🔺 Съпротива: $${formatPrice(resistance)}`);
         if (support != null) lines.push(`🔻 Подкрепа: $${formatPrice(support)}`);
         if (longShort) lines.push(`⚖️ Long/Short: ${longShort.longPct}% / ${longShort.shortPct}%`);
