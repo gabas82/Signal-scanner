@@ -689,7 +689,15 @@ function markMMOscFired(state, dir) {
 
 async function fetchKlinesWorker(symbol, interval, limit) {
   const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-  return r.json();
+  const bodyText = await r.text();
+  if (!r.ok) {
+    throw new Error(`Binance klines ${symbol} ${interval} -> HTTP ${r.status}: ${bodyText.slice(0, 300)}`);
+  }
+  try {
+    return JSON.parse(bodyText);
+  } catch (e) {
+    throw new Error(`Binance klines ${symbol} ${interval} -> non-JSON response (status ${r.status}): ${bodyText.slice(0, 300)}`);
+  }
 }
 
 async function loadSymbolState(env, symbol) {
