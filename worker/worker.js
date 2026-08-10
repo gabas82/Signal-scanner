@@ -687,16 +687,19 @@ function markMMOscFired(state, dir) {
   state.mmOscCooldown[dir] = { at: Date.now() };
 }
 
-async function fetchKlinesWorker(symbol, interval, limit) {
-  const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+// Binance блокира Cloudflare Workers-ите на ниво WAF (HTTP 403) - затова
+// заявките минават през малкия relay сървър на DigitalOcean (виж relay/README.md),
+// не директно към fapi.binance.com. RELAY_URL/RELAY_TOKEN са Worker Secrets.
+async function fetchKlinesWorker(env, symbol, interval, limit) {
+  const r = await fetch(`${env.RELAY_URL}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
   const bodyText = await r.text();
   if (!r.ok) {
-    throw new Error(`Binance klines ${symbol} ${interval} -> HTTP ${r.status}: ${bodyText.slice(0, 300)}`);
+    throw new Error(`Relay klines ${symbol} ${interval} -> HTTP ${r.status}: ${bodyText.slice(0, 300)}`);
   }
   try {
     return JSON.parse(bodyText);
   } catch (e) {
-    throw new Error(`Binance klines ${symbol} ${interval} -> non-JSON response (status ${r.status}): ${bodyText.slice(0, 300)}`);
+    throw new Error(`Relay klines ${symbol} ${interval} -> non-JSON response (status ${r.status}): ${bodyText.slice(0, 300)}`);
   }
 }
 
@@ -715,11 +718,11 @@ async function saveSymbolState(env, symbol, state) {
 // потиснати от cooldown) - празен масив означава "нищо ново тази обиколка".
 async function scanSymbolSignals(env, symbol) {
   const [k15, k5, k1h, k4h, k1d] = await Promise.all([
-    fetchKlinesWorker(symbol, '15m', 40),
-    fetchKlinesWorker(symbol, '5m', 40),
-    fetchKlinesWorker(symbol, '1h', 60),
-    fetchKlinesWorker(symbol, '4h', 210), // 210 - нужни за EMA200 филтъра на Build-Up Detector-а
-    fetchKlinesWorker(symbol, '1d', 20),
+    fetchKlinesWorker(env, symbol, '15m', 40),
+    fetchKlinesWorker(env, symbol, '5m', 40),
+    fetchKlinesWorker(env, symbol, '1h', 60),
+    fetchKlinesWorker(env, symbol, '4h', 210), // 210 - нужни за EMA200 филтъра на Build-Up Detector-а
+    fetchKlinesWorker(env, symbol, '1d', 20),
   ]);
   const c15 = klinesToCandles(k15), c5 = klinesToCandles(k5), c1h = klinesToCandles(k1h);
   const c4h = klinesToCandles(k4h), c1d = klinesToCandles(k1d);
@@ -865,7 +868,7 @@ async function checkDcaLevels(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
     if (!pos.entryPrice || !pos.side) continue;
     try {
-      const r = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${pos.symbol}`);
+      const r = await fetch(`${env.RELAY_URL}/ticker?symbol=${pos.symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
       const d = await r.json();
       const price = parseFloat(d.price);
       if (!price) continue;
