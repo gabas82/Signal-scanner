@@ -15,7 +15,10 @@ const PORT = process.env.PORT || 8080;
 // Shared secret so a random person who finds this app's public URL can't use
 // it as a free open Binance proxy. Set as an App Platform environment
 // variable (RELAY_TOKEN) - the Worker must send the same value as ?token=.
-const TOKEN = process.env.RELAY_TOKEN;
+// .trim() guards against a stray trailing newline/space that platform UIs
+// sometimes add when a secret value is pasted into a textarea.
+const TOKEN = (process.env.RELAY_TOKEN || '').trim();
+console.log(`RELAY_TOKEN configured: ${TOKEN ? 'yes (' + TOKEN.length + ' chars)' : 'no'}`);
 
 function proxyToBinance(targetUrl, res) {
   https.get(targetUrl, (binRes) => {
@@ -33,7 +36,8 @@ function proxyToBinance(targetUrl, res) {
 
 function requireToken(url, res) {
   if (!TOKEN) return true; // no token configured - allow (not recommended, but don't hard-fail)
-  if (url.searchParams.get('token') === TOKEN) return true;
+  const supplied = (url.searchParams.get('token') || '').trim();
+  if (supplied === TOKEN) return true;
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Unauthorized' }));
   return false;
