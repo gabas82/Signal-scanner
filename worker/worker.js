@@ -751,6 +751,23 @@ function calcTakeProfitLevels(price, direction) {
   return TP_PCTS.map(pct => direction === 'long' ? price * (1 + pct / 100) : price * (1 - pct / 100));
 }
 
+// Колко пъти по-голямо трябва да е мнозинството (лонг срещу шорт контекст
+// сигнали) спрямо малцинството, за да покажем посока+TP с увереност вместо
+// предупреждение за смесени сигнали. 4 означава напр. 4:1 или 8:2 минава,
+// 3:2 или 2:1 - не (само в известието се показва %-но разпределение).
+const DIRECTION_CONFIDENCE_RATIO = 4;
+
+function computeDirectionConfidence(longHits, shortHits) {
+  const total = longHits + shortHits;
+  const longPct = total ? Math.round((longHits / total) * 100) : 0;
+  const shortPct = 100 - longPct;
+  const majority = Math.max(longHits, shortHits);
+  const minority = Math.min(longHits, shortHits);
+  const confident = total > 0 && (minority === 0 || majority >= minority * DIRECTION_CONFIDENCE_RATIO);
+  const direction = longHits === shortHits ? null : (longHits > shortHits ? 'long' : 'short');
+  return { direction, confident, longPct, shortPct };
+}
+
 async function loadSymbolState(env, symbol) {
   if (!env.ALERT_STATE) return {};
   const raw = await env.ALERT_STATE.get(`sigstate:${symbol}`);
@@ -900,8 +917,8 @@ async function scanSymbolSignals(env, symbol) {
 
   const price = c5.length ? c5[c5.length - 1].close : null;
   const { support, resistance } = calcSupportResistance(c1h, 20);
-  const direction = longHits > shortHits ? 'long' : shortHits > longHits ? 'short' : null;
-  return { fired, price, support, resistance, direction };
+  const { direction, confident, longPct, shortPct } = computeDirectionConfidence(longHits, shortHits);
+  return { fired, price, support, resistance, direction, confident, longPct, shortPct };
 }
 
 // ---- Пазарни сигнали следене (извиква се от scheduled()) -------------------
@@ -910,15 +927,20 @@ async function scanSymbolSignals(env, symbol) {
 async function checkMarketSignals(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
     try {
-      const { fired, price, support, resistance, direction } = await scanSymbolSignals(env, pos.symbol);
+      const { fired, price, support, resistance, direction, confident, longPct, shortPct } = await scanSymbolSignals(env, pos.symbol);
       if (fired.length > 0) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
         const longShort = await fetchLongShortWorker(env, pos.symbol);
         const lines = [`🔥 ${symbolNoUsdt}`];
         if (price != null) lines.push(`💰 Цена: $${formatPrice(price)}`);
-        if (direction) lines.push(`📍 Посока: ${direction === 'long' ? 'LONG 🔵' : 'SHORT 🔴'}`);
-        if (price != null && direction) {
-          calcTakeProfitLevels(price, direction).forEach((tp, i) => lines.push(`🎯 TP${i + 1}: $${formatPrice(tp)}`));
+        if (direction && confident) {
+          const pct = direction === 'long' ? longPct : shortPct;
+          lines.push(`📍 Посока: ${direction === 'long' ? 'LONG 🔵' : 'SHORT 🔴'} (${pct}% от сигналите)`);
+          if (price != null) {
+            calcTakeProfitLevels(price, direction).forEach((tp, i) => lines.push(`🎯 TP${i + 1}: $${formatPrice(tp)}`));
+          }
+        } else {
+          lines.push(`⚠️ СМЕСЕНИ СИГНАЛИ — Лонг ${longPct}% / Шорт ${shortPct}% (без ясно мнозинство, TP не се показва)`);
         }
         if (resistance != null) lines.push(`🔺 Съпротива: $${formatPrice(resistance)}`);
         if (support != null) lines.push(`🔻 Подкрепа: $${formatPrice(support)}`);
