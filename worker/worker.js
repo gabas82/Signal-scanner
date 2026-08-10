@@ -856,7 +856,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
         await sendWhatsApp(env, `🔥 ${symbolNoUsdt}\n${fired.join('\n')}`);
       }
-    } catch (e) { console.error('Signal scan error for', pos.symbol, e); }
+    } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }
   }
 }
 
@@ -882,7 +882,7 @@ async function checkDcaLevels(env, watchlist = WATCHLIST) {
         await sendWhatsApp(env, `📉 ${symbolNoUsdt} (${dirLabel}) достигна ${step.label}\nЦена: $${price}\nНиво: $${step.levelPrice.toFixed(6)}\nСредна цена след ниво: $${step.avgPrice.toFixed(6)}`);
         if (env.ALERT_STATE) await env.ALERT_STATE.put(kvKey, String(Date.now()));
       }
-    } catch (e) { console.error('DCA check error for', pos.symbol, e); }
+    } catch (e) { console.error(`DCA check error for ${pos.symbol}: ${e.message}`); }
   }
 }
 
