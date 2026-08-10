@@ -732,11 +732,16 @@ async function fetchLongShortWorker(env, symbol) {
   }
 }
 
+// WhatsApp/Android понякога разпознава "$" залепено директно за низ от цифри
+// като телефонен/тракинг номер и чупи и визуализацията, и copy-paste (изяжда
+// водещи символи - напр. "$65061.30" стана "5061.30", "$0.3520" стана
+// ".3520" в реални тествани известия). toLocaleString слага разделител по
+// хиляди, който чупи непрекъснатата поредица от цифри; "$" вече не е залепен
+// директно за числото в известията (виж checkMarketSignals/checkDcaLevels).
 function formatPrice(p) {
   if (p == null) return null;
-  if (p >= 100) return p.toFixed(2);
-  if (p >= 1) return p.toFixed(4);
-  return p.toFixed(6);
+  const decimals = p >= 100 ? 2 : p >= 1 ? 4 : 6;
+  return p.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
 
 // TP % стълба, извлечена от външен VIP сигнален канал (Cornix формат): техните
@@ -932,18 +937,18 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
         const longShort = await fetchLongShortWorker(env, pos.symbol);
         const lines = [`🔥 ${symbolNoUsdt}`];
-        if (price != null) lines.push(`💰 Цена: $${formatPrice(price)}`);
+        if (price != null) lines.push(`💰 Цена: ${formatPrice(price)} USD`);
         if (direction && confident) {
           const pct = direction === 'long' ? longPct : shortPct;
           lines.push(`📍 Посока: ${direction === 'long' ? 'LONG 🔵' : 'SHORT 🔴'} (${pct}% от сигналите)`);
           if (price != null) {
-            calcTakeProfitLevels(price, direction).forEach((tp, i) => lines.push(`🎯 TP${i + 1}: $${formatPrice(tp)}`));
+            calcTakeProfitLevels(price, direction).forEach((tp, i) => lines.push(`🎯 TP${i + 1}: ${formatPrice(tp)} USD`));
           }
         } else {
           lines.push(`⚠️ СМЕСЕНИ СИГНАЛИ — Лонг ${longPct}% / Шорт ${shortPct}% (без ясно мнозинство, TP не се показва)`);
         }
-        if (resistance != null) lines.push(`🔺 Съпротива: $${formatPrice(resistance)}`);
-        if (support != null) lines.push(`🔻 Подкрепа: $${formatPrice(support)}`);
+        if (resistance != null) lines.push(`🔺 Съпротива: ${formatPrice(resistance)} USD`);
+        if (support != null) lines.push(`🔻 Подкрепа: ${formatPrice(support)} USD`);
         if (longShort) lines.push(`⚖️ Long/Short: ${longShort.longPct}% / ${longShort.shortPct}%`);
         lines.push('──────────');
         lines.push(...fired);
@@ -972,7 +977,7 @@ async function checkDcaLevels(env, watchlist = WATCHLIST) {
         const last = env.ALERT_STATE ? await env.ALERT_STATE.get(kvKey) : null;
         if (last && (Date.now() - parseInt(last, 10)) < DCA_ALERT_COOLDOWN_MS) continue;
         const dirLabel = pos.side === 'long' ? 'LONG' : 'SHORT';
-        await sendWhatsApp(env, `📉 ${symbolNoUsdt} (${dirLabel}) достигна ${step.label}\nЦена: $${price}\nНиво: $${step.levelPrice.toFixed(6)}\nСредна цена след ниво: $${step.avgPrice.toFixed(6)}`);
+        await sendWhatsApp(env, `📉 ${symbolNoUsdt} (${dirLabel}) достигна ${step.label}\nЦена: ${formatPrice(price)} USD\nНиво: ${formatPrice(step.levelPrice)} USD\nСредна цена след ниво: ${formatPrice(step.avgPrice)} USD`);
         if (env.ALERT_STATE) await env.ALERT_STATE.put(kvKey, String(Date.now()));
       }
     } catch (e) { console.error(`DCA check error for ${pos.symbol}: ${e.message}`); }
