@@ -23,6 +23,12 @@ Dashboard → orange-grass-d809 → **Settings → Variables and Secrets** → A
 | `APISPORTS_KEY` | твоят съществуващ api-sports.io ключ |
 | `CALLMEBOT_PHONE` | твоят WhatsApp номер с код на държавата, напр. `+359...` |
 | `CALLMEBOT_APIKEY` | apikey от CallMeBot (стъпка 4) |
+| `RELAY_URL` | адресът на DigitalOcean relay-я, напр. `https://signal-scanner-relay-l7rin.ondigitalocean.app` (виж `relay/README.md`) |
+| `RELAY_TOKEN` | същият таен код, зададен като `RELAY_TOKEN` в DigitalOcean |
+
+### Защо има relay
+
+Binance блокира заявки от Cloudflare Workers-ите на ниво WAF (HTTP 403) — заради това `worker.js` вече не вика `fapi.binance.com` директно, а през малкия relay сървър на DigitalOcean (`relay/` в този repo). Виж `relay/README.md` за deploy инструкции.
 
 ## 3. Добави KV namespace (за cooldown паметта на известията)
 
