@@ -703,6 +703,42 @@ async function fetchKlinesWorker(env, symbol, interval, limit) {
   }
 }
 
+// Долен/горен диапазон на последните `lookback` 1ч свещи - проста прокси мярка
+// за близка съпротива/подкрепа (не Fibonacci/pivot точки, само swing high/low).
+function calcSupportResistance(candles, lookback = 20) {
+  if (!candles.length) return { support: null, resistance: null };
+  const window = candles.slice(-lookback);
+  return {
+    resistance: Math.max(...window.map(c => c.high)),
+    support: Math.min(...window.map(c => c.low)),
+  };
+}
+
+// Съотношение дълги/къси позиции (Binance "Top Trader"/"Global" account ratio,
+// 1ч период) - през relay-я по същата причина като klines/ticker. Връща null
+// при грешка/липсващи данни, за да не чупи известието заради спомагателна инфо.
+async function fetchLongShortWorker(env, symbol) {
+  try {
+    const r = await fetch(`${env.RELAY_URL}/longshort?symbol=${symbol}&period=1h&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const entry = Array.isArray(data) ? data[0] : null;
+    if (!entry) return null;
+    const longFrac = parseFloat(entry.longAccount), shortFrac = parseFloat(entry.shortAccount);
+    if (!isFinite(longFrac) || !isFinite(shortFrac)) return null;
+    return { longPct: (longFrac * 100).toFixed(1), shortPct: (shortFrac * 100).toFixed(1) };
+  } catch (e) {
+    return null;
+  }
+}
+
+function formatPrice(p) {
+  if (p == null) return null;
+  if (p >= 100) return p.toFixed(2);
+  if (p >= 1) return p.toFixed(4);
+  return p.toFixed(6);
+}
+
 async function loadSymbolState(env, symbol) {
   if (!env.ALERT_STATE) return {};
   const raw = await env.ALERT_STATE.get(`sigstate:${symbol}`);
@@ -845,7 +881,10 @@ async function scanSymbolSignals(env, symbol) {
   if (impulseAtr.short) fired.push('⚡ IMPULSE+ATR ▼');
   if (confirmed.long) fired.push('✅ CONFIRMED ▲');
   if (confirmed.short) fired.push('✅ CONFIRMED ▼');
-  return fired;
+
+  const price = c5.length ? c5[c5.length - 1].close : null;
+  const { support, resistance } = calcSupportResistance(c1h, 20);
+  return { fired, price, support, resistance };
 }
 
 // ---- Пазарни сигнали следене (извиква се от scheduled()) -------------------
@@ -854,10 +893,18 @@ async function scanSymbolSignals(env, symbol) {
 async function checkMarketSignals(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
     try {
-      const fired = await scanSymbolSignals(env, pos.symbol);
+      const { fired, price, support, resistance } = await scanSymbolSignals(env, pos.symbol);
       if (fired.length > 0) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
-        await sendWhatsApp(env, `🔥 ${symbolNoUsdt}\n${fired.join('\n')}`);
+        const longShort = await fetchLongShortWorker(env, pos.symbol);
+        const lines = [`🔥 ${symbolNoUsdt}`];
+        if (price != null) lines.push(`💰 Цена: $${formatPrice(price)}`);
+        if (resistance != null) lines.push(`🔺 Съпротива: $${formatPrice(resistance)}`);
+        if (support != null) lines.push(`🔻 Подкрепа: $${formatPrice(support)}`);
+        if (longShort) lines.push(`⚖️ Long/Short: ${longShort.longPct}% / ${longShort.shortPct}%`);
+        lines.push('──────────');
+        lines.push(...fired);
+        await sendWhatsApp(env, lines.join('\n'));
       }
     } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }
   }

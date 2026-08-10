@@ -22,6 +22,9 @@ Node.js, така че `npm install` няма какво да инсталира
   препраща към `https://fapi.binance.com/fapi/v1/klines`.
 - `GET /ticker?symbol=BTCUSDT&token=ТАЙНИЯ_КОД` — препраща към
   `https://fapi.binance.com/fapi/v1/ticker/price`.
+- `GET /longshort?symbol=BTCUSDT&period=1h&token=ТАЙНИЯ_КОД` — препраща към
+  `https://fapi.binance.com/futures/data/globalLongShortAccountRatio`
+  (съотношение дълги/къси позиции, за контекста в пазарните известия).
 
 `token` е споделена тайна (задава се като `RELAY_TOKEN`), за да не може
 случаен човек, който намери публичния URL на приложението, да го ползва

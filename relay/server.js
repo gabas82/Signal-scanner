@@ -81,6 +81,20 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (url.pathname === '/longshort') {
+    if (!requireToken(url, res)) return;
+    const symbol = url.searchParams.get('symbol');
+    const period = url.searchParams.get('period') || '1h';
+    if (!symbol) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'symbol is required' }));
+      return;
+    }
+    const target = `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=1`;
+    proxyToBinance(target, res);
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
 });
