@@ -1,0 +1,13 @@
+{
+  "name": "signal-relay",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Minimal Binance Futures API relay - works around Binance blocking Cloudflare Workers' IP ranges. See README.md.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
