@@ -993,7 +993,12 @@ async function fetchCoinKlineData(symbol) {
     if (!klines || klines.length < 55) return null;
     const closes = klines.map(k => parseFloat(k[4]));
     const dma50 = calcSMA(closes, 50);
-    const dma200 = calcSMA(closes, closes.length >= 200 ? 200 : closes.length);
+    // Преди: при <200 дневни свещи (нови монети) периодът се свиваше до
+    // наличните свещи, значи "dma200" всъщност беше 60-дневна средна за
+    // монета с 60 дни история - GOLDEN X/DEATH X показваше подвеждащ дългосрочен
+    // тренд от съвсем кратка извадка. calcSMA вече връща null при <200, което
+    // коректно крие тага (виж goldenCross по-долу), вместо да лъже.
+    const dma200 = calcSMA(closes, 200);
     const klines1h = await fetchKlines(symbol, '1h', 8);
     let vol1h = 0, vol4h = 0;
     if (klines1h && klines1h.length >= 4) {
@@ -1150,7 +1155,7 @@ function updateCardKlines(fullSymbol, kdata) {
         const tagsEl = card.querySelector('.coin-tags');
         if (tagsEl && !tagsEl.querySelector('.tag-golden') && !tagsEl.querySelector('.tag-death')) {
           const t = document.createElement('span');
-          if (kdata.goldenCross) { t.className='tag tag-golden'; t.textContent='🟡 GOLDEN X'; } else { t.className='tag tag-death'; t.textContent='💀 DEATH X'; }
+          if (kdata.goldenCross) { t.className='tag tag-golden'; t.textContent='🟡 GOLDEN X (1d)'; } else { t.className='tag tag-death'; t.textContent='💀 DEATH X (1d)'; }
           tagsEl.appendChild(t);
         }
       }
@@ -1174,47 +1179,47 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
   const tags = [];
   if (coin.oiFlip === 'up') tags.push(`<span class="tag tag-flip-up">🔔 OI ОБРЪЩАНЕ ▲</span>`);
   if (coin.oiFlip === 'down') tags.push(`<span class="tag tag-flip-down">🔔 OI ОБРЪЩАНЕ ▼</span>`);
-  if (coin.capSignals?.flush) tags.push(`<span class="tag tag-flush">💥 FLUSH</span>`);
-  if (coin.capSignals?.base) tags.push(`<span class="tag tag-base">🔵 BASE</span>`);
-  if (coin._topBaseRank) tags.push(`<span class="tag tag-top-base">🏆 TOP ${coin._topBaseRank} ДЪНО</span>`);
-  if (coin.capSignals?.squeeze) tags.push(`<span class="tag tag-squeeze2">🟣 SQUEEZE</span>`);
-  if (coin.capSignals?.shift) tags.push(`<span class="tag tag-shift">🟠 SHIFT</span>`);
-  if (coin.capSignals?.impulseLong) tags.push(`<span class="tag tag-impulse-long">🟢 IMPULSE L</span>`);
-  if (coin.capSignals?.impulseShort) tags.push(`<span class="tag tag-impulse-short">🔴 IMPULSE S</span>`);
-  if (coin.capSignals?.blowoff) tags.push(`<span class="tag tag-blowoff">🔥 BLOWOFF</span>`);
-  if (coin.capSignals?.distribution) tags.push(`<span class="tag tag-distribution">🟠 DISTRIBUTION</span>`);
-  if (coin.capSignals?.dumpSqueeze) tags.push(`<span class="tag tag-dumpsqueeze">🟣 DUMP SQUEEZE</span>`);
-  if (coin.capSignals?.shiftDown) tags.push(`<span class="tag tag-shiftdown">🟠 SHIFT ▼</span>`);
-  if (coin.warmSignals?.tier === 'warm') tags.push(`<span class="tag tag-warm-${coin.warmSignals.direction}">🔵 WARMING ${coin.warmSignals.direction==='up'?'▲':'▼'}</span>`);
-  if (coin.warmSignals?.tier === 'hot') tags.push(`<span class="tag tag-hot-${coin.warmSignals.direction}">🟠 HOT ${coin.warmSignals.direction==='up'?'▲':'▼'}</span>`);
-  if (coin.warmSignals?.tier === 'super') tags.push(`<span class="tag tag-super-${coin.warmSignals.direction}">${coin.warmSignals.direction==='up'?'🟢':'🔴'} SUPER ${coin.warmSignals.direction==='up'?'▲':'▼'}</span>`);
-  if (coin.warmSignals?.superDownDump) tags.push(`<span class="tag tag-dump-override">🚨 SUPER DOWN (DUMP)</span>`);
-  if (coin.warmSignals?.bigVol4hUp) tags.push(`<span class="tag tag-4hvol-up">📈 4Ч ОБЕМ ▲</span>`);
-  if (coin.warmSignals?.bigVol4hDown) tags.push(`<span class="tag tag-4hvol-down">📉 4Ч ОБЕМ ▼</span>`);
-  if (coin.mmSignals?.mmLong) tags.push(`<span class="tag tag-mm-long">🟢 MM LONG</span>`);
-  if (coin.mmSignals?.mmShort) tags.push(`<span class="tag tag-mm-short">🔴 MM SHORT</span>`);
-  if (coin.mmSignals?.mmX25Long) tags.push(`<span class="tag tag-mmx25-long">💎 MM x25 LONG</span>`);
-  if (coin.mmSignals?.mmX25Short) tags.push(`<span class="tag tag-mmx25-short">💀 MM x25 SHORT</span>`);
-  if (coin.buildUpSignals?.earlyLong) tags.push(`<span class="tag tag-buildup-early">🟡 EARLY BUILD-UP ▲</span>`);
-  if (coin.buildUpSignals?.earlyShort) tags.push(`<span class="tag tag-buildup-early">🟡 EARLY BUILD-UP ▼</span>`);
-  if (coin.buildUpSignals?.confirmLong) tags.push(`<span class="tag tag-buildup-confirm-long">🟢 BUILD-UP CONFIRMED ▲</span>`);
-  if (coin.buildUpSignals?.confirmShort) tags.push(`<span class="tag tag-buildup-confirm-short">🔴 BUILD-UP CONFIRMED ▼</span>`);
-  if (coin.buildUpSignals?.preImpulseLong) tags.push(`<span class="tag tag-buildup-preimpulse-long">🚀 PRE-IMPULSE ▲</span>`);
-  if (coin.buildUpSignals?.preImpulseShort) tags.push(`<span class="tag tag-buildup-preimpulse-short">💥 PRE-IMPULSE ▼</span>`);
-  if (coin.mmOscSignals?.bestLong) tags.push(`<span class="tag tag-mmosc-long">🟢▲ MM-OSC BEST LONG</span>`);
-  if (coin.mmOscSignals?.bestShort) tags.push(`<span class="tag tag-mmosc-short">🔴▼ MM-OSC BEST SHORT</span>`);
-  if (coin.mmOscSignals?.reLong) tags.push(`<span class="tag tag-mmosc-relong">🟢△ MM-OSC RE-LONG</span>`);
-  if (coin.mmOscSignals?.reShort) tags.push(`<span class="tag tag-mmosc-reshort">🔴▽ MM-OSC RE-SHORT</span>`);
-  if (coin.impulseAtrSignals?.long) tags.push(`<span class="tag tag-impulseatr-long">⚡ IMPULSE+ATR ▲</span>`);
-  if (coin.impulseAtrSignals?.short) tags.push(`<span class="tag tag-impulseatr-short">⚡ IMPULSE+ATR ▼</span>`);
-  if (coin.confirmedSignals?.long) tags.push(`<span class="tag tag-confirmed-long">✅ CONFIRMED ▲</span>`);
-  if (coin.confirmedSignals?.short) tags.push(`<span class="tag tag-confirmed-short">✅ CONFIRMED ▼</span>`);
+  if (coin.capSignals?.flush) tags.push(`<span class="tag tag-flush">💥 FLUSH (15min)</span>`);
+  if (coin.capSignals?.base) tags.push(`<span class="tag tag-base">🔵 BASE (1h)</span>`);
+  if (coin._topBaseRank) tags.push(`<span class="tag tag-top-base">🏆 TOP ${coin._topBaseRank} ДЪНО (1h)</span>`);
+  if (coin.capSignals?.squeeze) tags.push(`<span class="tag tag-squeeze2">🟣 SQUEEZE (5min)</span>`);
+  if (coin.capSignals?.shift) tags.push(`<span class="tag tag-shift">🟠 SHIFT (1h)</span>`);
+  if (coin.capSignals?.impulseLong) tags.push(`<span class="tag tag-impulse-long">🟢 IMPULSE L (1h)</span>`);
+  if (coin.capSignals?.impulseShort) tags.push(`<span class="tag tag-impulse-short">🔴 IMPULSE S (1h)</span>`);
+  if (coin.capSignals?.blowoff) tags.push(`<span class="tag tag-blowoff">🔥 BLOWOFF (15min)</span>`);
+  if (coin.capSignals?.distribution) tags.push(`<span class="tag tag-distribution">🟠 DISTRIBUTION (1h)</span>`);
+  if (coin.capSignals?.dumpSqueeze) tags.push(`<span class="tag tag-dumpsqueeze">🟣 DUMP SQUEEZE (5min)</span>`);
+  if (coin.capSignals?.shiftDown) tags.push(`<span class="tag tag-shiftdown">🟠 SHIFT ▼ (1h)</span>`);
+  if (coin.warmSignals?.tier === 'warm') tags.push(`<span class="tag tag-warm-${coin.warmSignals.direction}">🔵 WARMING ${coin.warmSignals.direction==='up'?'▲':'▼'} (1h)</span>`);
+  if (coin.warmSignals?.tier === 'hot') tags.push(`<span class="tag tag-hot-${coin.warmSignals.direction}">🟠 HOT ${coin.warmSignals.direction==='up'?'▲':'▼'} (1h)</span>`);
+  if (coin.warmSignals?.tier === 'super') tags.push(`<span class="tag tag-super-${coin.warmSignals.direction}">${coin.warmSignals.direction==='up'?'🟢':'🔴'} SUPER ${coin.warmSignals.direction==='up'?'▲':'▼'} (1h)</span>`);
+  if (coin.warmSignals?.superDownDump) tags.push(`<span class="tag tag-dump-override">🚨 SUPER DOWN (DUMP) (15min)</span>`);
+  if (coin.warmSignals?.bigVol4hUp) tags.push(`<span class="tag tag-4hvol-up">📈 4Ч ОБЕМ ▲ (4h)</span>`);
+  if (coin.warmSignals?.bigVol4hDown) tags.push(`<span class="tag tag-4hvol-down">📉 4Ч ОБЕМ ▼ (4h)</span>`);
+  if (coin.mmSignals?.mmLong) tags.push(`<span class="tag tag-mm-long">🟢 MM LONG (5min)</span>`);
+  if (coin.mmSignals?.mmShort) tags.push(`<span class="tag tag-mm-short">🔴 MM SHORT (5min)</span>`);
+  if (coin.mmSignals?.mmX25Long) tags.push(`<span class="tag tag-mmx25-long">💎 MM x25 LONG (5min)</span>`);
+  if (coin.mmSignals?.mmX25Short) tags.push(`<span class="tag tag-mmx25-short">💀 MM x25 SHORT (5min)</span>`);
+  if (coin.buildUpSignals?.earlyLong) tags.push(`<span class="tag tag-buildup-early">🟡 EARLY BUILD-UP ▲ (1h)</span>`);
+  if (coin.buildUpSignals?.earlyShort) tags.push(`<span class="tag tag-buildup-early">🟡 EARLY BUILD-UP ▼ (1h)</span>`);
+  if (coin.buildUpSignals?.confirmLong) tags.push(`<span class="tag tag-buildup-confirm-long">🟢 BUILD-UP CONFIRMED ▲ (4h)</span>`);
+  if (coin.buildUpSignals?.confirmShort) tags.push(`<span class="tag tag-buildup-confirm-short">🔴 BUILD-UP CONFIRMED ▼ (4h)</span>`);
+  if (coin.buildUpSignals?.preImpulseLong) tags.push(`<span class="tag tag-buildup-preimpulse-long">🚀 PRE-IMPULSE ▲ (4h)</span>`);
+  if (coin.buildUpSignals?.preImpulseShort) tags.push(`<span class="tag tag-buildup-preimpulse-short">💥 PRE-IMPULSE ▼ (4h)</span>`);
+  if (coin.mmOscSignals?.bestLong) tags.push(`<span class="tag tag-mmosc-long">🟢▲ MM-OSC BEST LONG (5min)</span>`);
+  if (coin.mmOscSignals?.bestShort) tags.push(`<span class="tag tag-mmosc-short">🔴▼ MM-OSC BEST SHORT (5min)</span>`);
+  if (coin.mmOscSignals?.reLong) tags.push(`<span class="tag tag-mmosc-relong">🟢△ MM-OSC RE-LONG (5min)</span>`);
+  if (coin.mmOscSignals?.reShort) tags.push(`<span class="tag tag-mmosc-reshort">🔴▽ MM-OSC RE-SHORT (5min)</span>`);
+  if (coin.impulseAtrSignals?.long) tags.push(`<span class="tag tag-impulseatr-long">⚡ IMPULSE+ATR ▲ (5min)</span>`);
+  if (coin.impulseAtrSignals?.short) tags.push(`<span class="tag tag-impulseatr-short">⚡ IMPULSE+ATR ▼ (5min)</span>`);
+  if (coin.confirmedSignals?.long) tags.push(`<span class="tag tag-confirmed-long">✅ CONFIRMED ▲ (15min+1h)</span>`);
+  if (coin.confirmedSignals?.short) tags.push(`<span class="tag tag-confirmed-short">✅ CONFIRMED ▼ (15min+1h)</span>`);
   if (isBottom) tags.push(`<span class="tag tag-bottom">🟢 ДЪНО</span>`);
   if (isTop) tags.push(`<span class="tag tag-top">🔴 ВРЪХ</span>`);
   if (coin.pctFromAtl !== null && coin.pctFromAtl < 100) tags.push(`<span class="tag tag-atl">🟢 БЛИЗО ATL</span>`);
   if (coin.pctFromAth !== null && coin.pctFromAth > -15) tags.push(`<span class="tag tag-ath">🔴 БЛИЗО ATH</span>`);
-  if (coin.goldenCross === true) tags.push(`<span class="tag tag-golden">🟡 GOLDEN X</span>`);
-  if (coin.goldenCross === false) tags.push(`<span class="tag tag-death">💀 DEATH X</span>`);
+  if (coin.goldenCross === true) tags.push(`<span class="tag tag-golden">🟡 GOLDEN X (1d)</span>`);
+  if (coin.goldenCross === false) tags.push(`<span class="tag tag-death">💀 DEATH X (1d)</span>`);
   if (coin.isTrending) tags.push(`<span class="tag tag-trending">🔥 TRENDING</span>`);
   if (coin.chg24 > 5) tags.push(`<span class="tag tag-gainer">▲ GAINER</span>`);
   if (coin.oi > 500000000) tags.push(`<span class="tag tag-oi">HIGH OI</span>`);
