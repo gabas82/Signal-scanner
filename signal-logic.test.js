@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  calcSMA, calcRSI, detectBottom, detectTop, calcSignal, calcSetupQuality,
+  calcSMA, calcStdDev, calcRSI, detectBottom, detectTop, calcSignal, calcSetupQuality,
   calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
   calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcBaseDivergenceStrength, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
   calcBlowoffSignal, calcDistributionSignal, calcDumpSqueezeSignal, calcShiftDownSignal,
@@ -317,19 +317,43 @@ describe('calcDCALevels', () => {
 });
 
 describe('calcAltRadarScore', () => {
-  it('връща 0, когато нито едно условие не е изпълнено (или няма SMA история)', () => {
-    expect(calcAltRadarScore(55, 100, 50, 1, null, null, null, null)).toBe(0);
+  it('връща 0, когато нито едно условие не е изпълнено (или няма SMA/StdDev история)', () => {
+    expect(calcAltRadarScore(55, 100, 50, 1, null, null, null, null, null, null, null, null)).toBe(0);
   });
-  it('брои btc_d<sma условието (BTC доминансът пада)', () => {
-    expect(calcAltRadarScore(54, 100, 50, 1, 55, null, null, null)).toBe(1);
-    expect(calcAltRadarScore(56, 100, 50, 1, 55, null, null, null)).toBe(0);
+  it('брои btc_d<sma условието, само ако отклонението надвишава 0.5×StdDev (BTC доминансът реално пада)', () => {
+    expect(calcAltRadarScore(54, 100, 50, 1, 55, null, null, null, 1, null, null, null)).toBe(1);
+    expect(calcAltRadarScore(56, 100, 50, 1, 55, null, null, null, 1, null, null, null)).toBe(0);
   });
-  it('брои total3>sma условието (ALT пазарна капитализация расте)', () => {
-    expect(calcAltRadarScore(55, 105, 50, 1, null, 100, null, null)).toBe(1);
-    expect(calcAltRadarScore(55, 95, 50, 1, null, 100, null, null)).toBe(0);
+  it('брои total3>sma условието, само ако отклонението надвишава 0.5×StdDev (ALT пазарна капитализация реално расте)', () => {
+    expect(calcAltRadarScore(55, 105, 50, 1, null, 100, null, null, null, 2, null, null)).toBe(1);
+    expect(calcAltRadarScore(55, 95, 50, 1, null, 100, null, null, null, 2, null, null)).toBe(0);
   });
-  it('брои всичките 4 условия, когато всички са изпълнени', () => {
-    expect(calcAltRadarScore(54, 105, 55, 1.1, 55, 100, 50, 1)).toBe(4);
+  it('брои всичките 4 условия, когато всички реално надвишават своя 0.5×StdDev праг', () => {
+    expect(calcAltRadarScore(54, 105, 55, 1.1, 55, 100, 50, 1, 1, 2, 2, 0.1)).toBe(4);
+  });
+  it('НЕ брои условие, чието отклонение от SMA е чист шум под 0.5×StdDev прага (реален случай от "мъртъв" пазар)', () => {
+    // Стойности от реален "мъртъв пазар" екран: BTC.D 56.5 срещу SMA 56.6
+    // (отклонение 0.1), TOTAL3 762.04B срещу SMA 761.59B (0.45), OTHERS 254.52B
+    // срещу SMA 253.15B (1.37), ALT/BTC 0.5939 срещу SMA 0.59 (0.0039) - всяко
+    // отклонение е много под типичното дневно StdDev за съответния показател
+    // (2 пр.п., 15B, 8B, 0.02), затова нито едно не бива да се брои.
+    expect(calcAltRadarScore(56.5, 762.04, 254.52, 0.5939, 56.6, 761.59, 253.15, 0.59, 2, 15, 8, 0.02)).toBe(0);
+  });
+  it('позволява персонализиран stdMult през opts', () => {
+    // Същото малко отклонение (0.1 срещу StdDev 1) минава с по-хлабав праг 0.05.
+    expect(calcAltRadarScore(54.9, 100, 50, 1, 55, null, null, null, 1, null, null, null, { stdMult: 0.05 })).toBe(1);
+  });
+});
+
+describe('calcStdDev', () => {
+  it('връща null при недостатъчно данни', () => {
+    expect(calcStdDev([1, 2], 5)).toBeNull();
+  });
+  it('връща 0 при константна серия (без вариация)', () => {
+    expect(calcStdDev([5, 5, 5, 5, 5], 5)).toBe(0);
+  });
+  it('изчислява стандартното отклонение на последните `period` стойности', () => {
+    expect(calcStdDev([2, 4, 4, 4, 5, 5, 7, 9], 8)).toBeCloseTo(2, 5);
   });
 });
 
