@@ -20,12 +20,21 @@ function fixSymbol(s) { return (SYMBOL_MAP[s] || s) + 'USDT'; }
 // расте спрямо своя 5-дневен SMA), сборувани в резултат 0-4, който определя
 // PRESSURE/EXPANSION/SEASON нивото. SMA(null) означава недостатъчно история
 // (все още) - условието просто не се брои, вместо да гърми.
-function calcAltRadarScore(btcD, total3, others, altBtc, btcDSma, total3Sma, othersSma, altBtcSma) {
+//
+// Всяко условие изисква отклонението от SMA да е поне stdMult (по подразбиране
+// 0.5) стандартни отклонения на същия 5-дневен прозорец - без този праг чист
+// пазарен шум (+0.01% над средната) в страничен/"мъртъв" пазар лъжливо
+// покриваше и 4-те условия едновременно (реален случай: BTC.D/TOTAL3/OTHERS
+// на части от процента над своите SMA, докато пазарът реално не мърда).
+// Стандартното отклонение (не фиксиран %) се самонагласява за всеки показател -
+// BTC.D се движи в процентни пунктове, TOTAL3/OTHERS в милиарди долари.
+function calcAltRadarScore(btcD, total3, others, altBtc, btcDSma, total3Sma, othersSma, altBtcSma, btcDStd, total3Std, othersStd, altBtcStd, opts) {
+  const stdMult = opts?.stdMult ?? 0.5;
   let score = 0;
-  if (btcDSma != null && btcD < btcDSma) score++;
-  if (total3Sma != null && total3 > total3Sma) score++;
-  if (othersSma != null && others > othersSma) score++;
-  if (altBtcSma != null && altBtc > altBtcSma) score++;
+  if (btcDSma != null && btcDStd != null && (btcDSma - btcD) > stdMult * btcDStd) score++;
+  if (total3Sma != null && total3Std != null && (total3 - total3Sma) > stdMult * total3Std) score++;
+  if (othersSma != null && othersStd != null && (others - othersSma) > stdMult * othersStd) score++;
+  if (altBtcSma != null && altBtcStd != null && (altBtc - altBtcSma) > stdMult * altBtcStd) score++;
   return score;
 }
 
@@ -40,6 +49,14 @@ function calcAltRadarSignal(score, pressureMin, expansionMin, seasonMin) {
 function calcSMA(closes, period) {
   if (closes.length < period) return null;
   return closes.slice(-period).reduce((a,b) => a+b, 0) / period;
+}
+
+function calcStdDev(closes, period) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(-period);
+  const mean = slice.reduce((a,b) => a+b, 0) / period;
+  const variance = slice.reduce((a,b) => a + (b-mean)*(b-mean), 0) / period;
+  return Math.sqrt(variance);
 }
 
 function calcRSI(closes, period) {
@@ -851,7 +868,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     DCA_LEVERAGE, DCA_ENTRY, MAJOR_COINS, SEMI_MAJOR_COINS,
     MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
-    SYMBOL_MAP, fixSymbol, calcSMA, calcRSI, detectBottom, detectTop,
+    SYMBOL_MAP, fixSymbol, calcSMA, calcStdDev, calcRSI, detectBottom, detectTop,
     calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
     calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcBaseDivergenceStrength, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
     calcBlowoffSignal, calcDistributionSignal, calcDumpSqueezeSignal, calcShiftDownSignal,

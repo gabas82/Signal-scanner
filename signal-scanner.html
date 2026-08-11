@@ -441,7 +441,11 @@ async function loadAltRadar(btcD, total3, btcMcap) {
     const total3Sma = calcSMA(hist.map(h=>h.total3), 5);
     const othersSma = calcSMA(hist.map(h=>h.others), 5);
     const altBtcSma = calcSMA(hist.map(h=>h.altBtc), 5);
-    const score = calcAltRadarScore(btcD, total3, others, altBtc, btcDSma, total3Sma, othersSma, altBtcSma);
+    const btcDStd = calcStdDev(hist.map(h=>h.btcD), 5);
+    const total3Std = calcStdDev(hist.map(h=>h.total3), 5);
+    const othersStd = calcStdDev(hist.map(h=>h.others), 5);
+    const altBtcStd = calcStdDev(hist.map(h=>h.altBtc), 5);
+    const score = calcAltRadarScore(btcD, total3, others, altBtc, btcDSma, total3Sma, othersSma, altBtcSma, btcDStd, total3Std, othersStd, altBtcStd);
     const signal = days < 5 ? 'none' : calcAltRadarSignal(score);
     const el = id => document.getElementById(id);
     el('alt-btcd-val').textContent = btcD.toFixed(1)+'%';
