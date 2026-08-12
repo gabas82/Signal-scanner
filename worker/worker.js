@@ -1044,7 +1044,7 @@ export default {
       });
     }
 
-    if (path === "/tv-alert" && request.method === "POST") {
+    if (path === "/tv-alert" && (request.method === "POST" || request.method === "GET")) {
       const suppliedToken = (url.searchParams.get("token") || "").trim();
       const expectedToken = (env.TV_ALERT_TOKEN || "").trim();
       if (expectedToken && suppliedToken !== expectedToken) {
@@ -1053,14 +1053,20 @@ export default {
           headers: { "Content-Type": "application/json" }
         });
       }
+      // GET - за ръчно тестване директно от адресната лента на браузъра (query params
+      // вместо JSON тяло). Реалният TradingView webhook винаги праща POST с JSON.
       let payload;
-      try {
-        payload = JSON.parse(await request.text());
-      } catch (e) {
-        return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" }
-        });
+      if (request.method === "GET") {
+        payload = Object.fromEntries(url.searchParams.entries());
+      } else {
+        try {
+          payload = JSON.parse(await request.text());
+        } catch (e) {
+          return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
       }
       const val = (v, digits) => v == null ? "?" : (digits != null ? Number(v).toFixed(digits) : v);
       const text = `🔭 ALT CYCLE RADAR\nФаза: ${payload.phase || "?"}\nScore: ${val(payload.score, 1)}/100\n\n`
