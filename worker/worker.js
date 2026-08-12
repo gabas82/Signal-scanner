@@ -1044,6 +1044,33 @@ export default {
       });
     }
 
+    if (path === "/tv-alert" && request.method === "POST") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TV_ALERT_TOKEN || "").trim();
+      if (expectedToken && suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      let payload;
+      try {
+        payload = JSON.parse(await request.text());
+      } catch (e) {
+        return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      const val = (v, digits) => v == null ? "?" : (digits != null ? Number(v).toFixed(digits) : v);
+      const text = `🔭 ALT CYCLE RADAR\nФаза: ${payload.phase || "?"}\nScore: ${val(payload.score, 1)}/100\n\n`
+        + `BTC.D: ${val(payload.btcD, 2)}%\nALT/BTC: ${val(payload.altBtc, 4)}\n`
+        + `Breadth 30/60/90: ${val(payload.breadth30, 0)}/${val(payload.breadth60, 0)}/${val(payload.breadth90, 0)}\n\n`
+        + `Дата: ${payload.time || "?"}`;
+      await sendWhatsApp(env, text);
+      return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+    }
+
     const target = "https://open-api-v4.coinglass.com" + path + search;
     const response = await fetch(target, {
       method: request.method,
