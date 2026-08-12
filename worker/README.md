@@ -25,6 +25,7 @@ Dashboard → orange-grass-d809 → **Settings → Variables and Secrets** → A
 | `CALLMEBOT_APIKEY` | apikey от CallMeBot (стъпка 4) |
 | `RELAY_URL` | адресът на DigitalOcean relay-я, напр. `https://signal-scanner-relay-l7rin.ondigitalocean.app` (виж `relay/README.md`) |
 | `RELAY_TOKEN` | същият таен код, зададен като `RELAY_TOKEN` в DigitalOcean |
+| `TV_ALERT_TOKEN` | произволен таен код по твой избор (виж "ALT CYCLE RADAR webhook" по-долу) |
 
 ### Защо има relay
 
@@ -87,6 +88,21 @@ Dashboard → orange-grass-d809 → **Settings → Triggers → Cron Triggers �
 **Посока и увереност** (`computeDirectionConfidence` в `worker.js`): всеки от 14-те детектора гласува LONG или SHORT (виж `longHits`/`shortHits` в `scanSymbolSignals`). Понеже детекторите са напълно независими (различни timeframes/логика), е възможно в една обиколка да се задействат и в двете посоки едновременно за една и съща монета. Затова посока+TP стълба се показват само при **мнозинство поне 4:1** (напр. 4 срещу 1, 8 срещу 2) — при по-слабо мнозинство (напр. 3:2, 2:1) известието показва `⚠️ СМЕСЕНИ СИГНАЛИ` с %-но разпределение вместо подвеждащо уверена посока/TP.
 
 **Защо `formatPrice` слага "USD" след числото, не "$" преди него**: реални тествани известия показаха, че WhatsApp/Android понякога разпознава `$` залепено директно за низ от цифри като телефонен/тракинг номер и чупи и визуализацията, и copy-paste (напр. `$65061.30` се показа като `5061.30`, `$0.3520` — като `.3520`, дори `/system/bin/sh.` префикс). `formatPrice` вече слага разделител по хиляди (`toLocaleString`) и `$` никъде не е директно залепен за цифра в известията.
+
+## ALT CYCLE RADAR webhook (TradingView → WhatsApp)
+
+`worker.js` приема `POST /tv-alert?token=TV_ALERT_TOKEN` — приема JSON тяло `{phase, score, btcD, altBtc, breadth30, breadth60, breadth90, time}` и праща WhatsApp известие през `sendWhatsApp` (същата функция/секрети като пазарните сигнали). Предназначен е за webhook alert на Pine Script индикатора "ALT CYCLE RADAR" (`worker/alt-cycle-radar.pine`).
+
+Настройка:
+1. Добави `TV_ALERT_TOKEN` secret (стъпка 2 по-горе) — произволен таен низ по твой избор.
+2. В TradingView, на индикатора "ALT CYCLE RADAR" → **Create Alert** → Condition: **"Any alert() function call"** → Webhook URL:
+   ```
+   https://orange-grass-d809.gabas82.workers.dev/tv-alert?token=ТВОЯТ_TV_ALERT_TOKEN
+   ```
+3. Съобщението (alert message) остава каквото индикаторът генерира сам (`alert()` в скрипта вече изпраща готов JSON) — не пипай полето Message в TradingView.
+4. На Plus план alert-ите изтичат след известно време на неактивност — ако спрат да идват известия, провери в TradingView дали alert-ът все още е "Active" и го рестартирай при нужда.
+
+Без валиден `token` заявката връща 401 — пази URL-а по същия начин като останалите тайни ключове.
 
 ## Локални тестове
 

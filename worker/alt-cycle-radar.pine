@@ -1,0 +1,252 @@
+//@version=6
+indicator("ALT CYCLE RADAR", overlay=false, precision=1)
+
+// ============================================================
+// ALT CYCLE RADAR
+// 5 независими блока -> композитен score 0-100 -> 8 фази
+// (BTC SEASON -> COLD -> WARMING -> ROTATION -> ALT SEASON -> EUPHORIA -> TOP RISK -> COOLING)
+// Проектиран за дневен (1D) chart. Работи на всеки chart -
+// всички данни се дърпат директно през request.security().
+// ============================================================
+
+// ---------------- INPUTS ----------------
+grpData = "Данни"
+symBtcD    = input.symbol("CRYPTOCAP:BTC.D",       "BTC Dominance", group=grpData)
+symTotal   = input.symbol("CRYPTOCAP:TOTAL",       "Total Market Cap", group=grpData)
+symTotal3  = input.symbol("CRYPTOCAP:TOTAL3",      "TOTAL3", group=grpData)
+symOthers  = input.symbol("CRYPTOCAP:OTHERS",      "OTHERS", group=grpData)
+symTotal3Btc = input.symbol("CRYPTOCAP:TOTAL3ESBTC", "TOTAL3/BTC ratio", group=grpData)
+symEthBtc  = input.symbol("BINANCE:ETHBTC",        "ETH/BTC", group=grpData)
+
+grpStruct = "Структура / EMA"
+emaFastLen   = input.int(20, "EMA бърза", group=grpStruct)
+emaSlowLen   = input.int(50, "EMA бавна", group=grpStruct)
+structLen    = input.int(20, "Прозорец за HH/LL структура (бара)", group=grpStruct)
+slopeLen     = input.int(10, "Прозорец за наклон на EMA (бара)", group=grpStruct)
+slopeThresh  = input.float(1.0, "Праг за значим наклон (%)", group=grpStruct)
+
+grpBreadth = "Breadth Proxy (Блок 3)"
+len30 = input.int(30, "Прозорец 1 (дни)", group=grpBreadth)
+len60 = input.int(60, "Прозорец 2 (дни)", group=grpBreadth)
+len90 = input.int(90, "Прозорец 3 (дни)", group=grpBreadth)
+breadthScale = input.float(15.0, "Скала на логистичната функция (по-малко = по-чувствително)", group=grpBreadth)
+
+grpRotation = "Ротация (Блок 4)"
+rotLen    = input.int(14, "Прозорец за посока (бара)", group=grpRotation)
+rotThresh = input.float(2.0, "Праг за значима посока (%)", group=grpRotation)
+
+grpMomentum = "Momentum (Блок 5)"
+momLen = input.int(5, "Прозорец за momentum на score-а (бара)", group=grpMomentum)
+momentumSensitivity = input.float(1.0, "Чувствителност на momentum бонуса", group=grpMomentum)
+
+grpPersist = "Устойчивост / Overlay"
+persistBars = input.int(3, "Барове за потвърждение на нова фаза", group=grpPersist)
+toppingDropThresh = input.float(8.0, "Спад на 30D breadth proxy за TOP RISK сигнал (точки)", group=grpPersist)
+coolingWindowBars = input.int(30, "Прозорец, в който спад след връх се чете като COOLING (бара)", group=grpPersist)
+
+// ---------------- DATA ----------------
+btcD      = request.security(symBtcD, timeframe.period, close)
+totalCap  = request.security(symTotal, timeframe.period, close)
+total3    = request.security(symTotal3, timeframe.period, close)
+others    = request.security(symOthers, timeframe.period, close)
+altBtc    = request.security(symTotal3Btc, timeframe.period, close) // TOTAL3/BTC
+ethBtc    = request.security(symEthBtc, timeframe.period, close)
+
+btcMcap   = totalCap * btcD / 100
+othersBtc = btcMcap != 0 ? others / btcMcap : na
+
+// ---------------- HELPERS ----------------
+f_slopePct(src, len) =>
+    prev = src[len]
+    prev != 0 and not na(prev) ? (src - prev) / prev * 100 : 0.0
+
+f_structureBias(src, len) =>
+    hh1 = ta.highest(src, len)
+    hh2 = ta.highest(src[len], len)
+    ll1 = ta.lowest(src, len)
+    ll2 = ta.lowest(src[len], len)
+    hhBias = hh1 > hh2 ? 1 : hh1 < hh2 ? -1 : 0
+    llBias = ll1 > ll2 ? 1 : ll1 < ll2 ? -1 : 0
+    hhBias + llBias
+
+f_dir(pct, thresh) =>
+    pct > thresh ? 1 : pct < -thresh ? -1 : 0
+
+f_logistic(x, scale) =>
+    100.0 / (1.0 + math.exp(-x / scale))
+
+// ============================================================
+// БЛОК 1: BTC DOMINANCE STRUCTURE — тежест 20
+// ============================================================
+ema20D = ta.ema(btcD, emaFastLen)
+ema50D = ta.ema(btcD, emaSlowLen)
+structD = f_structureBias(btcD, structLen)          // отрицателно = LH/LL = добро за алтове
+slope20D = f_slopePct(ema20D, slopeLen)              // отрицателно = EMA20 пада
+
+cond1a = btcD < ema20D and ema20D < ema50D
+cond1b = slope20D < -slopeThresh
+cond1c = structD <= -1
+
+block1 = (cond1a ? 8 : 0) + (cond1b ? 6 : 0) + (cond1c ? 6 : 0)   // 0-20
+
+// ============================================================
+// БЛОК 2: ALT/BTC RELATIVE STRENGTH — тежест 25
+// ============================================================
+ema20A = ta.ema(altBtc, emaFastLen)
+ema50A = ta.ema(altBtc, emaSlowLen)
+structA = f_structureBias(altBtc, structLen)         // положително = HH/HL
+slope20A = f_slopePct(ema20A, slopeLen)
+othersBtcSlope = f_slopePct(othersBtc, slopeLen)
+
+cond2a = altBtc > ema20A and ema20A > ema50A
+cond2b = structA >= 1
+cond2c = slope20A > slopeThresh
+cond2d = othersBtcSlope > slopeThresh
+
+block2 = (cond2a ? 9 : 0) + (cond2b ? 7 : 0) + (cond2c ? 6 : 0) + (cond2d ? 3 : 0)  // 0-25
+
+// ============================================================
+// БЛОК 3: MARKET BREADTH PROXY — тежест 25
+// (истинско 30/60/90д breadth по монета изисква >40 security() calls,
+//  над лимита на не-Ultimate план. Proxy: % промяна на TOTAL3/BTC ratio-то
+//  самото то за 30/60/90 дни = агрегатно overperformance на алт кошницата
+//  спрямо BTC, минато през логистична функция за 0-100 скала. Виж
+//  HIFI Altcoin Season Index за сходна методология.)
+// ============================================================
+diff30 = f_slopePct(altBtc, len30)
+diff60 = f_slopePct(altBtc, len60)
+diff90 = f_slopePct(altBtc, len90)
+
+breadth30 = f_logistic(diff30, breadthScale)
+breadth60 = f_logistic(diff60, breadthScale)
+breadth90 = f_logistic(diff90, breadthScale)
+
+block3 = math.max(0.0, math.min(25.0, (breadth30 * 0.5 + breadth60 * 0.3 + breadth90 * 0.2) / 100 * 25))  // 0-25
+
+// Ранен сигнал за връх: 30D breadth завива надолу, докато 60D/90D още са високи
+toppingSignal = (breadth30 < breadth30[5] - toppingDropThresh) and breadth60 > 55 and breadth90 > 50 and othersBtcSlope < 0
+
+// ============================================================
+// БЛОК 4: CAPITAL ROTATION — тежест 20
+// ============================================================
+altBtcPct = f_slopePct(altBtc, rotLen)
+ethBtcPct = f_slopePct(ethBtc, rotLen)
+othersBtcPct = f_slopePct(othersBtc, rotLen)
+
+dirEth    = f_dir(ethBtcPct, rotThresh)
+dirAlt    = f_dir(altBtcPct, rotThresh)
+dirOthers = f_dir(othersBtcPct, rotThresh)
+
+posCount = (dirEth >= 1 ? 1 : 0) + (dirAlt >= 1 ? 1 : 0) + (dirOthers >= 1 ? 1 : 0)
+block4 = posCount / 3.0 * 20  // 0-20
+
+euphoriaTilt = dirOthers >= 1 and othersBtcPct > altBtcPct and dirAlt >= 1  // малките монети водят - типично за късна фаза
+
+// ============================================================
+// БЛОК 5: MOMENTUM НА СОБСТВЕНИЯ SCORE — тежест 10 (само потвърждение)
+// ============================================================
+rawScore = block1 + block2 + block3 + block4   // 0-90
+momDelta = rawScore - rawScore[momLen]
+momBonus = math.max(-10.0, math.min(10.0, momDelta * momentumSensitivity))
+
+totalScoreRaw = rawScore + momBonus
+totalScore = math.max(0.0, math.min(100.0, totalScoreRaw))
+
+// ============================================================
+// ФАЗИ + УСТОЙЧИВОСТ (изисква N поредни бара преди смяна)
+// dataReady пази от грешни/na резултати през периода на "загряване"
+// (докато EMA50/90-дневния breadth прозорец все още нямат достатъчно история)
+// ============================================================
+dataReady = bar_index > (math.max(emaSlowLen, len90) + momLen) and not na(btcD) and not na(totalCap) and not na(total3) and not na(others) and not na(altBtc) and not na(ethBtc) and not na(totalScore)
+
+phaseTierRaw = dataReady ? (totalScore < 20 ? 0 : totalScore < 40 ? 1 : totalScore < 55 ? 2 : totalScore < 70 ? 3 : totalScore < 85 ? 4 : 5) : 0
+
+var int candidateTier = 0
+var int candidateCount = 0
+var int confirmedTier = 0
+
+if dataReady
+    if phaseTierRaw != candidateTier
+        candidateTier := phaseTierRaw
+        candidateCount := 1
+    else
+        candidateCount += 1
+    if candidateCount >= persistBars and candidateTier != confirmedTier
+        confirmedTier := candidateTier
+
+// проследяваме колко бара сме извън "висока" фаза, за COOLING прозореца
+var int barsSinceHigh = 999999
+if confirmedTier >= 4
+    barsSinceHigh := 0
+else
+    barsSinceHigh += 1
+
+wasRecentlyHigh = barsSinceHigh <= coolingWindowBars
+
+tierNames = array.from("🔵 BTC SEASON", "⚪ COLD", "🟡 WARMING", "🟠 ROTATION", "🟢 ALT SEASON", "🚀 EUPHORIA")
+
+baseLabel = array.get(tierNames, confirmedTier)
+
+displayLabel = not dataReady ? "⏳ НАТРУПВА ИСТОРИЯ" :
+     confirmedTier >= 4 and toppingSignal ? "⚠️ TOP RISK / LATE ALT SEASON" :
+     wasRecentlyHigh and confirmedTier <= 2 and barsSinceHigh > 0 ? "🔻 COOLING" :
+     baseLabel
+
+// ============================================================
+// ALERT — динамично съобщение, покрива ВСИЧКИ фазови преходи
+// с 1 (единствен) alert в TradingView (условие "Any alert() function call")
+// Без str.format() - само конкатениране на низове, за да няма
+// проблем с escape-ването на буквалните {} в JSON-а.
+// ============================================================
+var string prevDisplayLabel = ""
+phaseChanged = dataReady and displayLabel != prevDisplayLabel and prevDisplayLabel != ""
+
+if phaseChanged
+    msg = "{\"symbol\":\"ALT_CYCLE\",\"phase\":\"" + displayLabel + "\",\"score\":" + str.tostring(totalScore, "#.#") +
+         ",\"btcD\":" + str.tostring(btcD, "#.##") + ",\"altBtc\":" + str.tostring(altBtc, "#.####") +
+         ",\"breadth30\":" + str.tostring(breadth30, "#.#") + ",\"breadth60\":" + str.tostring(breadth60, "#.#") +
+         ",\"breadth90\":" + str.tostring(breadth90, "#.#") + ",\"time\":\"" + str.format_time(time, "yyyy-MM-dd") + "\"}"
+    alert(msg, alert.freq_once_per_bar_close)
+
+prevDisplayLabel := displayLabel
+
+// ============================================================
+// ВИЗУАЛИЗАЦИЯ
+// ============================================================
+plot(totalScore, "ALT CYCLE SCORE", color=color.new(color.orange, 0), linewidth=2)
+hline(20, "BTC SEASON / COLD", color=color.gray, linestyle=hline.style_dotted)
+hline(40, "COLD / WARMING", color=color.gray, linestyle=hline.style_dotted)
+hline(55, "WARMING / ROTATION", color=color.gray, linestyle=hline.style_dotted)
+hline(70, "ROTATION / ALT SEASON", color=color.gray, linestyle=hline.style_dotted)
+hline(85, "ALT SEASON / EUPHORIA", color=color.gray, linestyle=hline.style_dotted)
+
+bgColor = not dataReady ? na :
+     confirmedTier == 0 ? color.new(color.blue, 90) :
+     confirmedTier == 1 ? color.new(color.gray, 92) :
+     confirmedTier == 2 ? color.new(color.yellow, 88) :
+     confirmedTier == 3 ? color.new(color.orange, 85) :
+     confirmedTier == 4 ? color.new(color.green, 85) :
+     color.new(color.purple, 80)
+bgcolor(bgColor)
+
+var table infoTable = table.new(position.top_right, 2, 8, border_width=1)
+if barstate.islast
+    table.cell(infoTable, 0, 0, "ALT CYCLE RADAR", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(infoTable, 1, 0, displayLabel, text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(infoTable, 0, 1, "Score", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(totalScore, "#.#") + " / 100", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 2, "БЛОК 1 (BTC.D)", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(block1, "#") + " / 20", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 3, "БЛОК 2 (ALT/BTC)", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(block2, "#") + " / 25", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 4, "БЛОК 3 (Breadth)", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(block3, "#.#") + " / 25", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 5, "БЛОК 4 (Ротация)", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 5, str.tostring(block4, "#.#") + " / 20", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 6, "БЛОК 5 (Momentum)", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 6, str.tostring(momBonus, "#.#") + " / ±10", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 7, "Breadth 30/60/90", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 7, str.tostring(breadth30, "#") + "/" + str.tostring(breadth60, "#") + "/" + str.tostring(breadth90, "#"), text_color=color.white, text_size=size.small)
+
+if timeframe.period != "1D" and barstate.islast
+    label.new(bar_index, totalScore, "⚠ Препоръчва се 1D chart за реални дни в breadth/EMA прозорците", color=color.red, style=label.style_label_down, textcolor=color.white, size=size.small)
