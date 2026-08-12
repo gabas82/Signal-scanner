@@ -84,10 +84,23 @@ function calcDCALevels(entryPrice, side, symbol) {
 }
 
 // ---- CallMeBot WhatsApp helper ---------------------------------------------
+// Връща диагностика (ok/status/body) вместо да гълта резултата - CallMeBot
+// може да отхвърли заявка (изтекъл activation, rate limit и т.н.) без HTTP
+// грешка, и досега това оставаше невидимо (fetch() без проверка на отговора).
 async function sendWhatsApp(env, text) {
-  if (!env.CALLMEBOT_PHONE || !env.CALLMEBOT_APIKEY) { console.error('CallMeBot secrets not set - skipping notification'); return; }
+  if (!env.CALLMEBOT_PHONE || !env.CALLMEBOT_APIKEY) {
+    console.error('CallMeBot secrets not set - skipping notification');
+    return { ok: false, error: 'CALLMEBOT_PHONE/CALLMEBOT_APIKEY not set' };
+  }
   const url = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(env.CALLMEBOT_PHONE)}&text=${encodeURIComponent(text)}&apikey=${encodeURIComponent(env.CALLMEBOT_APIKEY)}`;
-  try { await fetch(url); } catch (e) { console.error('CallMeBot send error:', e); }
+  try {
+    const r = await fetch(url);
+    const body = await r.text();
+    return { ok: r.ok, status: r.status, body: body.slice(0, 500) };
+  } catch (e) {
+    console.error('CallMeBot send error:', e);
+    return { ok: false, error: e.message };
+  }
 }
 
 // ============================================================================
@@ -1073,8 +1086,8 @@ export default {
         + `BTC.D: ${val(payload.btcD, 2)}%\nALT/BTC: ${val(payload.altBtc, 4)}\n`
         + `Breadth 30/60/90: ${val(payload.breadth30, 0)}/${val(payload.breadth60, 0)}/${val(payload.breadth90, 0)}\n\n`
         + `Дата: ${payload.time || "?"}`;
-      await sendWhatsApp(env, text);
-      return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+      const cmResult = await sendWhatsApp(env, text);
+      return new Response(JSON.stringify({ ok: true, callmebot: cmResult }), { headers: { "Content-Type": "application/json" } });
     }
 
     const target = "https://open-api-v4.coinglass.com" + path + search;
