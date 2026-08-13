@@ -1,6 +1,6 @@
 # Cloudflare Worker (orange-grass-d809) — setup
 
-Този Worker прави две неща: (1) прокси за Yahoo/football-data.org/api-sports.io/CoinGlass заявките на приложенията, и (2) на cron разписание следи личен watchlist за DCA нива И/ИЛИ пазарни сигнали (WARMING/HOT/SUPER, MM LONG/SHORT/x25, FLUSH/BASE/SQUEEZE/SHIFT/IMPULSE) и праща WhatsApp известие през CallMeBot.
+Този Worker прави две неща: (1) прокси за Yahoo/football-data.org/api-sports.io/CoinGlass заявките на приложенията, и (2) на cron разписание следи личен watchlist за DCA нива И/ИЛИ пазарни сигнали (WARMING/HOT/SUPER, MM LONG/SHORT/x25, FLUSH/BASE/SQUEEZE/SHIFT/IMPULSE) и праща WhatsApp известие през TextMeBot.
 
 `worker.js` **не съдържа никакви ключове в кода** — всички се четат от Worker Secrets, за да могат безопасно да стоят в публичния Signal-scanner repo.
 
@@ -21,8 +21,8 @@ Dashboard → orange-grass-d809 → **Settings → Variables and Secrets** → A
 | `CG_API_KEY` | твоят съществуващ CoinGlass ключ |
 | `FOOTBALL_DATA_TOKEN` | твоят съществуващ football-data.org token |
 | `APISPORTS_KEY` | твоят съществуващ api-sports.io ключ |
-| `CALLMEBOT_PHONE` | твоят WhatsApp номер с код на държавата, напр. `+359...` |
-| `CALLMEBOT_APIKEY` | apikey от CallMeBot (стъпка 4) |
+| `CALLMEBOT_PHONE` | твоят WhatsApp номер с код на държавата, напр. `+359...` (името е историческо, вижда се и за TextMeBot - същият номер, за да не се дублира secret) |
+| `TEXTMEBOT_APIKEY` | apikey от TextMeBot (стъпка 4) |
 | `RELAY_URL` | адресът на DigitalOcean relay-я, напр. `https://signal-scanner-relay-l7rin.ondigitalocean.app` (виж `relay/README.md`) |
 | `RELAY_TOKEN` | същият таен код, зададен като `RELAY_TOKEN` в DigitalOcean |
 | `TV_ALERT_TOKEN` | произволен таен код по твой избор (виж "ALT CYCLE RADAR webhook" по-долу) |
@@ -37,13 +37,16 @@ Dashboard → **Storage & Databases → KV** → Create namespace, име нап
 
 Без това известията пак ще работят, но при всяко cron изпълнение ще спамят едно и също ниво (няма памет между извикванията).
 
-## 4. Активирай CallMeBot (безплатно, без регистрация)
+## 4. Активирай TextMeBot
 
-1. Добави `+34 694 25 79 52` като контакт в телефона си.
-2. От WhatsApp прати на този контакт точно текста: `I allow callmebot to send me messages`
-3. До 2 минути ще получиш отговор с текст като `API Activated for your phone number. Your APIKEY is 123456` — това число е `CALLMEBOT_APIKEY` от стъпка 2. Ако не дойде до 2 мин, опитай пак след 24ч.
+1. На `https://textmebot.com/` вземи API ключ (безплатен 3-дневен demo, или директно $1/месец план "1 recipient" - достатъчен е, защото пращаме само на себе си).
+2. Ще получиш имейл с ключа и линк `https://api.textmebot.com/addphone.php?apikey=...` за свързване на WhatsApp номера.
+3. На тази страница ще се появи QR код — трябва да го сканираш **от WhatsApp на телефона** (Settings → Linked Devices → Link a Device), докато страницата е отворена на **друг** екран (компютър), не на самия телефон — камерата не може да сканира собствения си екран.
+4. След успешно свързване страницата показва "DB Status: Connected" и зелена отметка.
 
-Endpoint-ът, който Worker-ът ползва зад кулисите: `https://api.callmebot.com/whatsapp.php?phone=...&text=...&apikey=...`
+Endpoint-ът, който Worker-ът ползва зад кулисите: `https://api.textmebot.com/send.php?recipient=...&apikey=...&text=...`
+
+(Заменихме CallMeBot, защото изчерпа безплатния си лимит съобщения и след това плащанията за абонамент бяха постоянно счупени от тяхна страна.)
 
 ## 5. Попълни watchlist-а
 
