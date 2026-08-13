@@ -83,22 +83,25 @@ function calcDCALevels(entryPrice, side, symbol) {
   return steps;
 }
 
-// ---- CallMeBot WhatsApp helper ---------------------------------------------
-// Връща диагностика (ok/status/body) вместо да гълта резултата - CallMeBot
-// може да отхвърли заявка (изтекъл activation, rate limit и т.н.) без HTTP
-// грешка, и досега това оставаше невидимо (fetch() без проверка на отговора).
+// ---- TextMeBot WhatsApp helper ----------------------------------------------
+// Заменя CallMeBot (виж git history) - CallMeBot изчерпа безплатния си лимит
+// съобщения ("0 messages left") и оттогава сайтът/плащанията им бяха постоянно
+// счупени (сървърна MySQL грешка), затова минаваме на TextMeBot. env.CALLMEBOT_PHONE
+// пази старото си име нарочно (същият номер, само за да не се дублира secret-а
+// с ново име) - вижда се и в TEXTMEBOT_APIKEY, единственият нов secret тук.
+// Връща диагностика (ok/status/body) вместо да гълта резултата.
 async function sendWhatsApp(env, text) {
-  if (!env.CALLMEBOT_PHONE || !env.CALLMEBOT_APIKEY) {
-    console.error('CallMeBot secrets not set - skipping notification');
-    return { ok: false, error: 'CALLMEBOT_PHONE/CALLMEBOT_APIKEY not set' };
+  if (!env.CALLMEBOT_PHONE || !env.TEXTMEBOT_APIKEY) {
+    console.error('TextMeBot secrets not set - skipping notification');
+    return { ok: false, error: 'CALLMEBOT_PHONE/TEXTMEBOT_APIKEY not set' };
   }
-  const url = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(env.CALLMEBOT_PHONE)}&text=${encodeURIComponent(text)}&apikey=${encodeURIComponent(env.CALLMEBOT_APIKEY)}`;
+  const url = `https://api.textmebot.com/send.php?recipient=${encodeURIComponent(env.CALLMEBOT_PHONE)}&apikey=${encodeURIComponent(env.TEXTMEBOT_APIKEY)}&text=${encodeURIComponent(text)}`;
   try {
     const r = await fetch(url);
     const body = await r.text();
     return { ok: r.ok, status: r.status, body: body.slice(0, 500) };
   } catch (e) {
-    console.error('CallMeBot send error:', e);
+    console.error('TextMeBot send error:', e);
     return { ok: false, error: e.message };
   }
 }
