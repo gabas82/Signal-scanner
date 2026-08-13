@@ -588,7 +588,7 @@ async function loadWalls(refreshed) {
           const isLong = sig.signal === 'LONG';
           if (isLong) { entry=bw.price*1.003; target=sw.price*0.997; sl=bw.price*0.99; }
           else { entry=sw.price*0.997; target=bw.price*1.003; sl=sw.price*1.01; }
-          const planLabel = isLong ? '▲ ЛОНГ ПЛАН' : '▼ ШОРТ ПЛАН';
+          const planLabel = isLong ? '▲ ЛОНГ ПЛАН (по МОМЕНТУМ посоката)' : '▼ ШОРТ ПЛАН (по МОМЕНТУМ посоката)';
           const planClass = isLong ? 'long-plan' : 'short-plan';
           rows += `<div class="wall-plan-header ${planClass}">${planLabel}</div>`;
           rows += `<div class="wall-plan">
@@ -1276,6 +1276,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     </div>
     ${detectorBanner}
     ${setupBanner}
+    <div style="color:var(--text2);font-size:9px;letter-spacing:.5px;margin:6px 0 -2px;">⚡ МОМЕНТУМ ПОСОКА (24ч/L-S/funding/обем) — независимо от паттърн таговете горе</div>
     <div class="signal-box">
       <div class="signal-badge badge-${sc}">${sig.signal}</div>
       <div class="signal-detail">L:${sig.ls} / S:${sig.ss}<div class="score-dots">${dotsHtml}</div></div>
