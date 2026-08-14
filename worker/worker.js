@@ -843,7 +843,10 @@ async function saveSymbolState(env, symbol, state) {
 // потиснати от cooldown) - празен масив означава "нищо ново тази обиколка".
 async function scanSymbolSignals(env, symbol) {
   const [k15, k5, k1h, k4h, k1d] = await Promise.all([
-    fetchKlinesWorker(env, symbol, '15m', 40),
+    // 60 (не 40) - calcConfirmedSignal изисква поне 52 15м свещи (emaMidLen 50 + 2)
+    // след затворената свещ (c15Closed = 59 свещи); с 40 CONFIRMED структурно
+    // никога не можеше да се задейства.
+    fetchKlinesWorker(env, symbol, '15m', 60),
     fetchKlinesWorker(env, symbol, '5m', 40),
     fetchKlinesWorker(env, symbol, '1h', 60),
     fetchKlinesWorker(env, symbol, '4h', 210), // 210 - нужни за EMA200 филтъра на Build-Up Detector-а
