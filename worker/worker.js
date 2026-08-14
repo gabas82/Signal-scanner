@@ -652,6 +652,13 @@ const WARMING_DUMP_EASE = 0.85;
 const MM_ARM_MINUTES = 90;
 const MM_COOLDOWN_MIN = 30;
 const MM_X25_COOLDOWN_MIN = 30;
+// Минимална % промяна на цената спрямо предходния MM/MM x25 fire, за да се
+// позволи ОБРЪЩАНЕ на посоката преди пълния cooldown да е изтекъл. Без това
+// s.dir !== direction пропускаше flip веднага, независимо от цената - реален
+// случай: MM x25 LONG на SOL @76.11, после MM x25 SHORT @76.06 15 мин по-късно
+// (практически същата цена) - двоен "100% увереност" сигнал в двете посоки
+// насред застоял диапазон (whipsaw), не истинско обръщане на тренда.
+const MM_FLIP_MIN_MOVE_PCT = 0.5;
 
 function warmingTierAllowed(state, tier, direction) {
   const s = state.warmingCooldown?.[tier];
@@ -663,15 +670,19 @@ function markWarmingFired(state, tier, direction) {
   if (!state.warmingCooldown) state.warmingCooldown = {};
   state.warmingCooldown[tier] = { at: Date.now(), dir: direction };
 }
-function mmCanFire(state, key, direction, coolMin) {
+function mmCanFire(state, key, direction, coolMin, price) {
   const s = state.mmCooldown?.[key];
   if (!s) return true;
   const cooledDown = (Date.now() - s.at) >= coolMin * 60000;
-  return cooledDown || s.dir !== direction;
+  if (cooledDown) return true;
+  if (s.dir === direction) return false;
+  if (s.price == null || price == null) return true;
+  const movePct = Math.abs((price - s.price) / s.price) * 100;
+  return movePct >= MM_FLIP_MIN_MOVE_PCT;
 }
-function markMMFired(state, key, direction) {
+function markMMFired(state, key, direction, price) {
   if (!state.mmCooldown) state.mmCooldown = {};
-  state.mmCooldown[key] = { at: Date.now(), dir: direction };
+  state.mmCooldown[key] = { at: Date.now(), dir: direction, price };
 }
 
 // "Mario – Build-Up Detector + EMA Filter" - Early Build-Up на 1ч отваря 18ч
@@ -872,11 +883,12 @@ async function scanSymbolSignals(env, symbol) {
   const armed = !!state.mmArm && Date.now() < state.mmArm.until;
   const entry5 = calcEntryImpulse(c5);
   const x25 = calcMMx25Entry(c5);
+  const mmPrice = c5.length ? c5[c5.length - 1].close : null;
   let mmLong = false, mmShort = false, mmX25Long = false, mmX25Short = false;
-  if (armed && ctx15.biasLong && entry5.impulseUp && mmCanFire(state, 'mm', 1, MM_COOLDOWN_MIN)) { mmLong = true; markMMFired(state, 'mm', 1); }
-  if (armed && ctx15.biasShort && entry5.impulseDn && mmCanFire(state, 'mm', -1, MM_COOLDOWN_MIN)) { mmShort = true; markMMFired(state, 'mm', -1); }
-  if (armed && ctx15.biasLong && x25.long && mmCanFire(state, 'x25', 1, MM_X25_COOLDOWN_MIN)) { mmX25Long = true; markMMFired(state, 'x25', 1); }
-  if (armed && ctx15.biasShort && x25.short && mmCanFire(state, 'x25', -1, MM_X25_COOLDOWN_MIN)) { mmX25Short = true; markMMFired(state, 'x25', -1); }
+  if (armed && ctx15.biasLong && entry5.impulseUp && mmCanFire(state, 'mm', 1, MM_COOLDOWN_MIN, mmPrice)) { mmLong = true; markMMFired(state, 'mm', 1, mmPrice); }
+  if (armed && ctx15.biasShort && entry5.impulseDn && mmCanFire(state, 'mm', -1, MM_COOLDOWN_MIN, mmPrice)) { mmShort = true; markMMFired(state, 'mm', -1, mmPrice); }
+  if (armed && ctx15.biasLong && x25.long && mmCanFire(state, 'x25', 1, MM_X25_COOLDOWN_MIN, mmPrice)) { mmX25Long = true; markMMFired(state, 'x25', 1, mmPrice); }
+  if (armed && ctx15.biasShort && x25.short && mmCanFire(state, 'x25', -1, MM_X25_COOLDOWN_MIN, mmPrice)) { mmX25Short = true; markMMFired(state, 'x25', -1, mmPrice); }
 
   const oscEntry = calcMMOscEntry(c5);
   const oscS = state.mmOsc || {};
