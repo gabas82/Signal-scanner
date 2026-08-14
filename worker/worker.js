@@ -808,16 +808,24 @@ function calcTakeProfitLevels(price, direction) {
 // предупреждение за смесени сигнали. 4 означава напр. 4:1 или 8:2 минава,
 // 3:2 или 2:1 - не (само в известието се показва %-но разпределение).
 const DIRECTION_CONFIDENCE_RATIO = 4;
+// Отделен, по-строг праг само за показване на TP стълбата - самата посока
+// (Посока: LONG/SHORT) може да се покаже и при 1 потвърждение (ratioOK), но
+// TP1-5 изисква поне MIN_TP_CONFIRMATION_HITS реални (не cooldown-потиснати)
+// сигнала в мнозинството, иначе "1 от 1 сигнал LONG" изглеждаше подвеждащо
+// сигурно като "4 от 5".
+const MIN_TP_CONFIRMATION_HITS = 2;
 
 function computeDirectionConfidence(longHits, shortHits) {
   const total = longHits + shortHits;
   const longPct = total ? Math.round((longHits / total) * 100) : 0;
-  const shortPct = 100 - longPct;
+  const shortPct = total ? 100 - longPct : 0;
   const majority = Math.max(longHits, shortHits);
   const minority = Math.min(longHits, shortHits);
-  const confident = total > 0 && (minority === 0 || majority >= minority * DIRECTION_CONFIDENCE_RATIO);
+  const ratioOK = total > 0 && (minority === 0 || majority >= minority * DIRECTION_CONFIDENCE_RATIO);
+  const enoughHits = majority >= MIN_TP_CONFIRMATION_HITS;
+  const confident = ratioOK && enoughHits;
   const direction = longHits === shortHits ? null : (longHits > shortHits ? 'long' : 'short');
-  return { direction, confident, longPct, shortPct };
+  return { direction, confident, longPct, shortPct, longHits, shortHits, total, majority, ratioOK, enoughHits };
 }
 
 async function loadSymbolState(env, symbol) {
@@ -843,6 +851,15 @@ async function scanSymbolSignals(env, symbol) {
   ]);
   const c15 = klinesToCandles(k15), c5 = klinesToCandles(k5), c1h = klinesToCandles(k1h);
   const c4h = klinesToCandles(k4h), c1d = klinesToCandles(k1d);
+  // CONFIRMED/структурни детектори (SHIFT/SHIFT▼/IMPULSE/IMPULSE+ATR/CONFIRMED/
+  // BUILD-UP CONFIRMED/PRE-IMPULSE) трябва да гледат само последната ЗАТВОРЕНА
+  // свещ, за да не се появяват/изчезват насред текущата незатворена свещ.
+  // EARLY/LIVE детекторите (EARLY BUILD-UP, WARMING/HOT/SUPER, MM/MM x25/MM-OSC)
+  // остават на живите candles (c1h/c5/c15) - целта им е ранно предупреждение.
+  const c15Closed = c15.slice(0, -1);
+  const c5Closed = c5.slice(0, -1);
+  const c1hClosed = c1h.slice(0, -1);
+  const c4hClosed = c4h.slice(0, -1);
 
   const rsi4h = c4h.length ? calcRSI(c4h.map(x=>x.close), 14) : null;
   const rsi1d = c1d.length ? calcRSI(c1d.map(x=>x.close), 14) : null;
@@ -855,9 +872,9 @@ async function scanSymbolSignals(env, symbol) {
   const distribution = calcDistributionSignal(c1h, htfOverbought);
   const squeeze = calcSqueezeSignal(c5);
   const dumpSqueeze = calcDumpSqueezeSignal(c5);
-  const shift = calcShiftSignal(c1h);
-  const shiftDown = calcShiftDownSignal(c1h);
-  const impulse = calcImpulseSignal(c1h, flush);
+  const shift = calcShiftSignal(c1hClosed);
+  const shiftDown = calcShiftDownSignal(c1hClosed);
+  const impulse = calcImpulseSignal(c1hClosed, flush);
 
   const state = await loadSymbolState(env, symbol);
 
@@ -868,12 +885,12 @@ async function scanSymbolSignals(env, symbol) {
   }
   const buildUpWindow = state.buildUpWindow;
   const withinBuildUpWindow = !!buildUpWindow && Date.now() < buildUpWindow.until;
-  const trend4h = calc4hTwoBarTrend(c4h);
-  const emaFilter = calcEmaTrendFilter(c4h);
+  const trend4h = calc4hTwoBarTrend(c4hClosed);
+  const emaFilter = calcEmaTrendFilter(c4hClosed);
   const buildUpConfirmLong = withinBuildUpWindow && buildUpWindow.dir === 1 && trend4h.bull && emaFilter.bull;
   const buildUpConfirmShort = withinBuildUpWindow && buildUpWindow.dir === -1 && trend4h.bear && emaFilter.bear;
   if (buildUpConfirmLong || buildUpConfirmShort) state.buildUpWindow = null;
-  const buildUpAtrExpanding = calcATRExpansion(c4h);
+  const buildUpAtrExpanding = calcATRExpansion(c4hClosed);
   const preImpulseLong = buildUpConfirmLong && buildUpAtrExpanding;
   const preImpulseShort = buildUpConfirmShort && buildUpAtrExpanding;
 
@@ -925,57 +942,62 @@ async function scanSymbolSignals(env, symbol) {
   if (oscRawShort) { markMMOscFired(state, 'short'); oscS.dir = -1; oscS.windowUntil = Date.now() + MMOSC_REWINDOW_MIN * 60000; oscS.sawPullback = false; }
   state.mmOsc = oscS;
 
-  const impulseAtr = calcImpulseAtrSignal(c5);
-  const confirmed = calcConfirmedSignal(c15, c1h);
+  const impulseAtr = calcImpulseAtrSignal(c5Closed);
+  const confirmed = calcConfirmedSignal(c15Closed, c1hClosed);
 
-  // longHits/shortHits проследяват дали задействалите се сигнали са предимно
-  // бичи (дъно/пробив нагоре) или мечи (връх/пробив надолу) - за да решим
-  // накъде да покажем TP стълбата в известието (виж calcTakeProfitLevels).
+  // fired е масив от {label, direction} обекти, не голи низове - direction
+  // тук е ИЗТОЧНИКЪТ на истината за LONG/SHORT приноса на всеки сигнал (не се
+  // извежда чрез повторно парсене на емоджита/текста на label по-долу).
+  // longHits/shortHits НЕ се броят тук - броят се по-долу, САМО от newFired
+  // (сигналите, които реално минават tagCanFire cooldown филтъра), за да не
+  // влияят в %/посоката стари сигнали, потиснати заради cooldown в това
+  // конкретно известие (виж TEST 1/6 в спецификацията).
   const fired = [];
-  let longHits = 0, shortHits = 0;
-  if (flush) { fired.push('💥 FLUSH'); longHits++; }
-  if (blowoff) { fired.push('🔥 BLOWOFF'); shortHits++; }
-  if (base) { fired.push('🔵 BASE'); longHits++; }
-  if (distribution) { fired.push('🟠 DISTRIBUTION'); shortHits++; }
-  if (squeeze) { fired.push('🟣 SQUEEZE'); longHits++; }
-  if (dumpSqueeze) { fired.push('🟣 DUMP SQUEEZE'); shortHits++; }
-  if (shift) { fired.push('🟠 SHIFT'); longHits++; }
-  if (shiftDown) { fired.push('🟠 SHIFT ▼'); shortHits++; }
-  if (impulse.long) { fired.push('🟢 IMPULSE LONG'); longHits++; }
-  if (impulse.short) { fired.push('🔴 IMPULSE SHORT'); shortHits++; }
-  if (early.long) { fired.push('🟡 EARLY BUILD-UP ▲'); longHits++; }
-  if (early.short) { fired.push('🟡 EARLY BUILD-UP ▼'); shortHits++; }
-  if (buildUpConfirmLong) { fired.push('🟢 BUILD-UP CONFIRMED ▲'); longHits++; }
-  if (buildUpConfirmShort) { fired.push('🔴 BUILD-UP CONFIRMED ▼'); shortHits++; }
-  if (preImpulseLong) { fired.push('🚀 PRE-IMPULSE ▲'); longHits++; }
-  if (preImpulseShort) { fired.push('💥 PRE-IMPULSE ▼'); shortHits++; }
-  if (warmTier === 'warm') { fired.push(`🔵 WARMING ${warming.direction === 'up' ? '▲' : '▼'}`); warming.direction === 'up' ? longHits++ : shortHits++; }
-  if (warmTier === 'hot') { fired.push(`🟠 HOT ${warming.direction === 'up' ? '▲' : '▼'}`); warming.direction === 'up' ? longHits++ : shortHits++; }
-  if (warmTier === 'super') { fired.push(`${warming.direction === 'up' ? '🟢' : '🔴'} SUPER ${warming.direction === 'up' ? '▲' : '▼'}`); warming.direction === 'up' ? longHits++ : shortHits++; }
-  if (superDownDump) { fired.push('🚨 SUPER DOWN (DUMP)'); shortHits++; }
-  if (mmLong) { fired.push('🟢 MM LONG'); longHits++; }
-  if (mmShort) { fired.push('🔴 MM SHORT'); shortHits++; }
-  if (mmX25Long) { fired.push('💎 MM x25 LONG'); longHits++; }
-  if (mmX25Short) { fired.push('💀 MM x25 SHORT'); shortHits++; }
-  if (oscBestLong) { fired.push('🟢▲ MM-OSC BEST LONG'); longHits++; }
-  if (oscBestShort) { fired.push('🔴▼ MM-OSC BEST SHORT'); shortHits++; }
-  if (oscReLong) { fired.push('🟢△ MM-OSC RE-LONG'); longHits++; }
-  if (oscReShort) { fired.push('🔴▽ MM-OSC RE-SHORT'); shortHits++; }
-  if (impulseAtr.long) { fired.push('⚡ IMPULSE+ATR ▲'); longHits++; }
-  if (impulseAtr.short) { fired.push('⚡ IMPULSE+ATR ▼'); shortHits++; }
-  if (confirmed.long) { fired.push('✅ CONFIRMED ▲'); longHits++; }
-  if (confirmed.short) { fired.push('✅ CONFIRMED ▼'); shortHits++; }
+  if (flush) fired.push({ label: '💥 FLUSH', direction: 'long' });
+  if (blowoff) fired.push({ label: '🔥 BLOWOFF', direction: 'short' });
+  if (base) fired.push({ label: '🔵 BASE', direction: 'long' });
+  if (distribution) fired.push({ label: '🟠 DISTRIBUTION', direction: 'short' });
+  if (squeeze) fired.push({ label: '🟣 SQUEEZE', direction: 'long' });
+  if (dumpSqueeze) fired.push({ label: '🟣 DUMP SQUEEZE', direction: 'short' });
+  if (shift) fired.push({ label: '🟠 SHIFT', direction: 'long' });
+  if (shiftDown) fired.push({ label: '🟠 SHIFT ▼', direction: 'short' });
+  if (impulse.long) fired.push({ label: '🟢 IMPULSE LONG', direction: 'long' });
+  if (impulse.short) fired.push({ label: '🔴 IMPULSE SHORT', direction: 'short' });
+  if (early.long) fired.push({ label: '🟡 EARLY BUILD-UP ▲', direction: 'long' });
+  if (early.short) fired.push({ label: '🟡 EARLY BUILD-UP ▼', direction: 'short' });
+  if (buildUpConfirmLong) fired.push({ label: '🟢 BUILD-UP CONFIRMED ▲', direction: 'long' });
+  if (buildUpConfirmShort) fired.push({ label: '🔴 BUILD-UP CONFIRMED ▼', direction: 'short' });
+  if (preImpulseLong) fired.push({ label: '🚀 PRE-IMPULSE ▲', direction: 'long' });
+  if (preImpulseShort) fired.push({ label: '💥 PRE-IMPULSE ▼', direction: 'short' });
+  if (warmTier === 'warm') fired.push({ label: `🔵 WARMING ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short' });
+  if (warmTier === 'hot') fired.push({ label: `🟠 HOT ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short' });
+  if (warmTier === 'super') fired.push({ label: `${warming.direction === 'up' ? '🟢' : '🔴'} SUPER ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short' });
+  if (superDownDump) fired.push({ label: '🚨 SUPER DOWN (DUMP)', direction: 'short' });
+  if (mmLong) fired.push({ label: '🟢 MM LONG', direction: 'long' });
+  if (mmShort) fired.push({ label: '🔴 MM SHORT', direction: 'short' });
+  if (mmX25Long) fired.push({ label: '💎 MM x25 LONG', direction: 'long' });
+  if (mmX25Short) fired.push({ label: '💀 MM x25 SHORT', direction: 'short' });
+  if (oscBestLong) fired.push({ label: '🟢▲ MM-OSC BEST LONG', direction: 'long' });
+  if (oscBestShort) fired.push({ label: '🔴▼ MM-OSC BEST SHORT', direction: 'short' });
+  if (oscReLong) fired.push({ label: '🟢△ MM-OSC RE-LONG', direction: 'long' });
+  if (oscReShort) fired.push({ label: '🔴▽ MM-OSC RE-SHORT', direction: 'short' });
+  if (impulseAtr.long) fired.push({ label: '⚡ IMPULSE+ATR ▲', direction: 'long' });
+  if (impulseAtr.short) fired.push({ label: '⚡ IMPULSE+ATR ▼', direction: 'short' });
+  if (confirmed.long) fired.push({ label: '✅ CONFIRMED ▲', direction: 'long' });
+  if (confirmed.short) fired.push({ label: '✅ CONFIRMED ▼', direction: 'short' });
 
-  const newFired = fired.filter(label => tagCanFire(state, label));
-  newFired.forEach(label => markTagFired(state, label));
+  const newFired = fired.filter(sig => tagCanFire(state, sig.label));
+  newFired.forEach(sig => markTagFired(state, sig.label));
+  const longHits = newFired.filter(sig => sig.direction === 'long').length;
+  const shortHits = newFired.filter(sig => sig.direction === 'short').length;
 
   const price = c5.length ? c5[c5.length - 1].close : null;
   const { support, resistance } = calcSupportResistance(c1h, 20);
-  const { direction, confident, longPct, shortPct } = computeDirectionConfidence(longHits, shortHits);
+  const confidence = computeDirectionConfidence(longHits, shortHits);
 
   await saveSymbolState(env, symbol, state);
 
-  return { fired: newFired, price, support, resistance, direction, confident, longPct, shortPct };
+  return { fired: newFired.map(sig => sig.label), price, support, resistance, ...confidence };
 }
 
 // ---- Пазарни сигнали следене (извиква се от scheduled()) -------------------
@@ -984,20 +1006,33 @@ async function scanSymbolSignals(env, symbol) {
 async function checkMarketSignals(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
     try {
-      const { fired, price, support, resistance, direction, confident, longPct, shortPct } = await scanSymbolSignals(env, pos.symbol);
+      const { fired, price, support, resistance, direction, longPct, shortPct, longHits, shortHits, majority, ratioOK, enoughHits } = await scanSymbolSignals(env, pos.symbol);
       if (fired.length > 0) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
         const longShort = await fetchLongShortWorker(env, pos.symbol);
         const lines = [`🔥 ${symbolNoUsdt}`];
         if (price != null) lines.push(`💰 Цена: ${formatPrice(price)} USD`);
-        if (direction && confident) {
-          const pct = direction === 'long' ? longPct : shortPct;
-          lines.push(`📍 Посока: ${direction === 'long' ? 'LONG 🔵' : 'SHORT 🔴'} (${pct}% от сигналите)`);
-          if (price != null) {
-            calcTakeProfitLevels(price, direction).forEach((tp, i) => lines.push(`🎯 TP${i + 1}: ${formatPrice(tp)} USD`));
+        // Три ясни състояния (виж спецификацията, т.13): A) ясна посока + доста
+        // потвърждения -> Посока+Сигнали%+Потвърждения+TP1-5; B) ясна посока, но
+        // под MIN_TP_CONFIRMATION_HITS -> същото без TP, вместо това предупреждение;
+        // C) смесени сигнали (ratio не минава) -> "СМЕСЕНИ СИГНАЛИ", без TP.
+        // "% от сигналите"/"100% увереност" НЕ се пише никъде - процентът е ясно
+        // надписан "Сигнали: LONG X% / SHORT Y%", не вероятност за успех.
+        if (direction && ratioOK) {
+          lines.push(`📍 Посока: ${direction === 'long' ? 'LONG 🔵' : 'SHORT 🔴'}`);
+          lines.push(`📊 Сигнали: LONG ${longPct}% / SHORT ${shortPct}%`);
+          lines.push(`✅ Потвърждения: ${longHits} LONG / ${shortHits} SHORT`);
+          if (enoughHits) {
+            if (price != null) {
+              calcTakeProfitLevels(price, direction).forEach((tp, i) => lines.push(`🎯 TP${i + 1}: ${formatPrice(tp)} USD`));
+            }
+          } else {
+            lines.push(`⚠️ Само ${majority} потвърждение — TP не се показва`);
           }
         } else {
-          lines.push(`⚠️ СМЕСЕНИ СИГНАЛИ — Лонг ${longPct}% / Шорт ${shortPct}% (без ясно мнозинство, TP не се показва)`);
+          lines.push(`⚠️ СМЕСЕНИ СИГНАЛИ`);
+          lines.push(`📊 Сигнали: LONG ${longPct}% / SHORT ${shortPct}%`);
+          lines.push(`✅ Потвърждения: ${longHits} LONG / ${shortHits} SHORT`);
         }
         if (resistance != null) lines.push(`🔺 Съпротива: ${formatPrice(resistance)} USD`);
         if (support != null) lines.push(`🔻 Подкрепа: ${formatPrice(support)} USD`);
