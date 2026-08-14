@@ -685,6 +685,26 @@ function markMMFired(state, key, direction, price) {
   state.mmCooldown[key] = { at: Date.now(), dir: direction, price };
 }
 
+// Всички детектори БЕЗ собствен cooldown (FLUSH/BASE/DISTRIBUTION/SQUEEZE/
+// DUMP SQUEEZE/SHIFT/SHIFT▼/IMPULSE/IMPULSE+ATR/CONFIRMED/EARLY BUILD-UP)
+// препращаха идентично известие на ВСЯКО 5-мин cron изпълнение, докато
+// условието на свещта остане вярно (може да е с часове при 1ч/4ч свещи) -
+// реален случай, докладван от потребителя. Тук пазим кога за последно е
+// пратен ВСЕКИ конкретен таг за дадена монета и потискаме повторение по-рано
+// от SIGNAL_REPEAT_COOLDOWN_MIN. MM/MM x25/WARMING/MMOSC вече имат собствен
+// cooldown преди изобщо да стигнат до fired[] - този филтър просто минава
+// и през тях безвредно (те никога не са в tagCooldown при първо влизане).
+const SIGNAL_REPEAT_COOLDOWN_MIN = 20;
+function tagCanFire(state, label) {
+  const s = state.tagCooldown?.[label];
+  if (!s) return true;
+  return (Date.now() - s) >= SIGNAL_REPEAT_COOLDOWN_MIN * 60000;
+}
+function markTagFired(state, label) {
+  if (!state.tagCooldown) state.tagCooldown = {};
+  state.tagCooldown[label] = Date.now();
+}
+
 // "Mario – Build-Up Detector + EMA Filter" - Early Build-Up на 1ч отваря 18ч
 // прозорец за 4ч Confirm, а Confirm + разширяващ се ATR дава Pre-Impulse.
 const BUILDUP_MAX_HOURS = 18;
@@ -908,8 +928,6 @@ async function scanSymbolSignals(env, symbol) {
   const impulseAtr = calcImpulseAtrSignal(c5);
   const confirmed = calcConfirmedSignal(c15, c1h);
 
-  await saveSymbolState(env, symbol, state);
-
   // longHits/shortHits проследяват дали задействалите се сигнали са предимно
   // бичи (дъно/пробив нагоре) или мечи (връх/пробив надолу) - за да решим
   // накъде да покажем TP стълбата в известието (виж calcTakeProfitLevels).
@@ -948,10 +966,16 @@ async function scanSymbolSignals(env, symbol) {
   if (confirmed.long) { fired.push('✅ CONFIRMED ▲'); longHits++; }
   if (confirmed.short) { fired.push('✅ CONFIRMED ▼'); shortHits++; }
 
+  const newFired = fired.filter(label => tagCanFire(state, label));
+  newFired.forEach(label => markTagFired(state, label));
+
   const price = c5.length ? c5[c5.length - 1].close : null;
   const { support, resistance } = calcSupportResistance(c1h, 20);
   const { direction, confident, longPct, shortPct } = computeDirectionConfidence(longHits, shortHits);
-  return { fired, price, support, resistance, direction, confident, longPct, shortPct };
+
+  await saveSymbolState(env, symbol, state);
+
+  return { fired: newFired, price, support, resistance, direction, confident, longPct, shortPct };
 }
 
 // ---- Пазарни сигнали следене (извиква се от scheduled()) -------------------
