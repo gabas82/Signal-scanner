@@ -686,16 +686,27 @@ const mmCooldownState = {}; // symbol -> {mm:{at,dir}, x25:{at,dir}}
 const MM_ARM_MINUTES = 90;
 const MM_COOLDOWN_MIN = 30;
 const MM_X25_COOLDOWN_MIN = 30;
+// Минимална % промяна на цената спрямо предходния MM/MM x25 fire, за да се
+// позволи ОБРЪЩАНЕ на посоката преди пълния cooldown да е изтекъл. Без това
+// state.dir !== direction пропускаше flip веднага, независимо от цената -
+// реален случай: MM x25 LONG на SOL @76.11, после MM x25 SHORT @76.06 15 мин
+// по-късно (практически същата цена) - двоен "100% увереност" сигнал в
+// двете посоки насред застоял диапазон (whipsaw), не истинско обръщане.
+const MM_FLIP_MIN_MOVE_PCT = 0.5;
 
-function mmCanFire(symbol, key, direction, coolMin) {
+function mmCanFire(symbol, key, direction, coolMin, price) {
   const state = mmCooldownState[symbol]?.[key];
   if (!state) return true;
   const cooledDown = (Date.now() - state.at) >= coolMin * 60000;
-  return cooledDown || state.dir !== direction;
+  if (cooledDown) return true;
+  if (state.dir === direction) return false;
+  if (state.price == null || price == null) return true;
+  const movePct = Math.abs((price - state.price) / state.price) * 100;
+  return movePct >= MM_FLIP_MIN_MOVE_PCT;
 }
-function markMMFired(symbol, key, direction) {
+function markMMFired(symbol, key, direction, price) {
   if (!mmCooldownState[symbol]) mmCooldownState[symbol] = {};
-  mmCooldownState[symbol][key] = { at: Date.now(), dir: direction };
+  mmCooldownState[symbol][key] = { at: Date.now(), dir: direction, price };
 }
 
 // "Mario – Build-Up Detector + EMA Filter" - тих build-up на 1ч отваря 18ч
@@ -808,19 +819,20 @@ async function loadCapitulation() {
       const armed = !!arm && Date.now() < arm.until;
       const entry5 = calcEntryImpulse(c5);
       const x25 = calcMMx25Entry(c5);
+      const mmPrice = c5.length ? c5[c5.length - 1].close : null;
 
       let mmLong = false, mmShort = false, mmX25Long = false, mmX25Short = false;
-      if (armed && ctx15.biasLong && entry5.impulseUp && mmCanFire(coin.fullSymbol, 'mm', 1, MM_COOLDOWN_MIN)) {
-        mmLong = true; markMMFired(coin.fullSymbol, 'mm', 1);
+      if (armed && ctx15.biasLong && entry5.impulseUp && mmCanFire(coin.fullSymbol, 'mm', 1, MM_COOLDOWN_MIN, mmPrice)) {
+        mmLong = true; markMMFired(coin.fullSymbol, 'mm', 1, mmPrice);
       }
-      if (armed && ctx15.biasShort && entry5.impulseDn && mmCanFire(coin.fullSymbol, 'mm', -1, MM_COOLDOWN_MIN)) {
-        mmShort = true; markMMFired(coin.fullSymbol, 'mm', -1);
+      if (armed && ctx15.biasShort && entry5.impulseDn && mmCanFire(coin.fullSymbol, 'mm', -1, MM_COOLDOWN_MIN, mmPrice)) {
+        mmShort = true; markMMFired(coin.fullSymbol, 'mm', -1, mmPrice);
       }
-      if (armed && ctx15.biasLong && x25.long && mmCanFire(coin.fullSymbol, 'x25', 1, MM_X25_COOLDOWN_MIN)) {
-        mmX25Long = true; markMMFired(coin.fullSymbol, 'x25', 1);
+      if (armed && ctx15.biasLong && x25.long && mmCanFire(coin.fullSymbol, 'x25', 1, MM_X25_COOLDOWN_MIN, mmPrice)) {
+        mmX25Long = true; markMMFired(coin.fullSymbol, 'x25', 1, mmPrice);
       }
-      if (armed && ctx15.biasShort && x25.short && mmCanFire(coin.fullSymbol, 'x25', -1, MM_X25_COOLDOWN_MIN)) {
-        mmX25Short = true; markMMFired(coin.fullSymbol, 'x25', -1);
+      if (armed && ctx15.biasShort && x25.short && mmCanFire(coin.fullSymbol, 'x25', -1, MM_X25_COOLDOWN_MIN, mmPrice)) {
+        mmX25Short = true; markMMFired(coin.fullSymbol, 'x25', -1, mmPrice);
       }
       coin.mmSignals = { mmLong, mmShort, mmX25Long, mmX25Short };
 
