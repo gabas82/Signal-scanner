@@ -659,16 +659,26 @@ const MM_X25_COOLDOWN_MIN = 30;
 // (практически същата цена) - двоен "100% увереност" сигнал в двете посоки
 // насред застоял диапазон (whipsaw), не истинско обръщане на тренда.
 const MM_FLIP_MIN_MOVE_PCT = 0.5;
+// Същата защита, но за WARMING/HOT/SUPER: `warmingTierAllowed` имаше същия
+// корен бъг като старото mmCanFire - `s.dir !== direction` пропускаше
+// cooldown-а при ВСЯКО обръщане на посоката, независимо от движението на
+// цената (напр. WARMING ▲ последвано от WARMING ▼ 5-10 мин по-късно на
+// практически същата цена - двоен подвеждащ сигнал в двете посоки).
+const WARMING_FLIP_MIN_MOVE_PCT = 0.5;
 
-function warmingTierAllowed(state, tier, direction) {
+function warmingTierAllowed(state, tier, direction, price) {
   const s = state.warmingCooldown?.[tier];
   if (!s) return true;
   const cooledDown = (Date.now() - s.at) >= WARMING_COOLDOWN_MIN[tier] * 60000;
-  return cooledDown || s.dir !== direction;
+  if (cooledDown) return true;
+  if (s.dir === direction) return false;
+  if (s.price == null || price == null) return true;
+  const movePct = Math.abs((price - s.price) / s.price) * 100;
+  return movePct >= WARMING_FLIP_MIN_MOVE_PCT;
 }
-function markWarmingFired(state, tier, direction) {
+function markWarmingFired(state, tier, direction, price) {
   if (!state.warmingCooldown) state.warmingCooldown = {};
-  state.warmingCooldown[tier] = { at: Date.now(), dir: direction };
+  state.warmingCooldown[tier] = { at: Date.now(), dir: direction, price };
 }
 function mmCanFire(state, key, direction, coolMin, price) {
   const s = state.mmCooldown?.[key];
@@ -907,16 +917,17 @@ async function scanSymbolSignals(env, symbol) {
   const easeFactor = boostActive ? (1 - WARMING_BOOST_PCT) : 1;
   const dumpCascade = calcDumpCascade(c15);
   const warming = calcWarmingTier(c1h, { easeFactor });
+  const warmPrice = c1h.length ? c1h[c1h.length - 1].close : null;
   let warmTier = 'none';
-  if (warming.tier !== 'none' && warmingTierAllowed(state, warming.tier, warming.direction)) {
+  if (warming.tier !== 'none' && warmingTierAllowed(state, warming.tier, warming.direction, warmPrice)) {
     warmTier = warming.tier;
-    markWarmingFired(state, warming.tier, warming.direction);
+    markWarmingFired(state, warming.tier, warming.direction, warmPrice);
   }
   const compressOK = warming.atrPct != null && warming.atrPct <= 0.75;
   const superDownDump = dumpCascade.active && warming.direction === 'down' && compressOK
     && warming.volX != null && warming.volX >= (3.0 * easeFactor * WARMING_DUMP_EASE)
-    && warmingTierAllowed(state, 'super', 'down');
-  if (superDownDump) markWarmingFired(state, 'super', 'down');
+    && warmingTierAllowed(state, 'super', 'down', warmPrice);
+  if (superDownDump) markWarmingFired(state, 'super', 'down', warmPrice);
 
   const ctx15 = calcWarmingContext(c15);
   if (ctx15.warming) state.mmArm = { until: Date.now() + MM_ARM_MINUTES * 60000 };
@@ -1137,7 +1148,10 @@ export default {
     if (path === "/tv-alert" && (request.method === "POST" || request.method === "GET")) {
       const suppliedToken = (url.searchParams.get("token") || "").trim();
       const expectedToken = (env.TV_ALERT_TOKEN || "").trim();
-      if (expectedToken && suppliedToken !== expectedToken) {
+      // fail-closed: ако TV_ALERT_TOKEN secret-ът липсва, expectedToken е "" и
+      // старата проверка `expectedToken && ...` се прескачаше изцяло, пускайки
+      // всякакви заявки без токен. Сега липсващ secret също отказва достъп.
+      if (!expectedToken || suppliedToken !== expectedToken) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
           status: 401,
           headers: { "Content-Type": "application/json" }
@@ -1167,6 +1181,21 @@ export default {
       return new Response(JSON.stringify({ ok: true, callmebot: cmResult }), { headers: { "Content-Type": "application/json" } });
     }
 
+    // Whitelist за CoinGlass прокси-то: без него ВСЕКИ path, който не съвпадне
+    // с /yahoo, /football, /apisports, /tv-alert по-горе, минаваше директно
+    // към CoinGlass с нашия платен CG_API_KEY - всеки, който знае Worker URL-а,
+    // можеше да го ползва като безплатен прокси и да изразходва квотата ни.
+    // В момента никой активен клиент (signal-scanner.html/football.html) не
+    // ползва тази прокси функция (OI данните минават директно през Binance),
+    // затова списъкът е празен - добави тук конкретни пътища, ако някога
+    // потрябва отново реален CoinGlass proxy caller.
+    const ALLOWED_COINGLASS_PATHS = [];
+    if (!ALLOWED_COINGLASS_PATHS.some(p => path.startsWith(p))) {
+      return new Response(JSON.stringify({ error: "Forbidden" }), {
+        status: 403,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
     const target = "https://open-api-v4.coinglass.com" + path + search;
     const response = await fetch(target, {
       method: request.method,
