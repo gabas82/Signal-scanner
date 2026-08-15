@@ -723,17 +723,13 @@ function markMMFired(state, key, direction, price) {
   state.mmCooldown[key] = { at: Date.now(), dir: direction, price };
 }
 
-// LIVE детектори (FLUSH/BASE/DISTRIBUTION/SQUEEZE/DUMP SQUEEZE/EARLY BUILD-UP/
-// WARMING/HOT/SUPER/MM/MM x25/MM-OSC) продължават с плоския 20-мин cooldown -
-// препращаха идентично известие на ВСЯКО 5-мин cron изпълнение, докато
-// условието на свещта остане вярно, реален случай, докладван от потребителя.
 // CONFIRMED/структурните детектори (SHIFT/SHIFT▼/IMPULSE/IMPULSE+ATR/CONFIRMED/
-// BUILD-UP CONFIRMED/PRE-IMPULSE) вместо това пазят openTime на затворената
-// свещ, която ги е задействала - "1 сигнал на затворена свещ": ако condition-ът
-// остане верен през целия 20-мин прозорец и след него на СЪЩАТА свещ, вече не
-// препраща втори път; нова свещ (нов openTime) веднага отключва нов сигнал,
-// без да чака 20 мин. tagCanFire приема candleOpenTime само за тези тагове -
-// LIVE детекторите не го подават и продължават по старата логика непроменени.
+// BUILD-UP CONFIRMED/PRE-IMPULSE) пазят openTime на затворената свещ, която ги
+// е задействала - "1 сигнал на затворена свещ": ако condition-ът остане верен
+// през целия прозорец и след него на СЪЩАТА свещ, вече не препраща втори път;
+// нова свещ (нов openTime) веднага отключва нов сигнал. tagCanFire/markTagFired
+// се ползват САМО за тези - LIVE детекторите вместо това ползват
+// isNewLiveEvent/markLiveSeen по-долу (виж бележката там).
 const SIGNAL_REPEAT_COOLDOWN_MIN = 20;
 function tagCanFire(state, label, candleOpenTime) {
   const s = state.tagCooldown?.[label];
@@ -748,6 +744,32 @@ function tagCanFire(state, label, candleOpenTime) {
 function markTagFired(state, label, candleOpenTime) {
   if (!state.tagCooldown) state.tagCooldown = {};
   state.tagCooldown[label] = candleOpenTime != null ? { at: Date.now(), candleOpenTime } : Date.now();
+}
+
+// LIVE детектори (FLUSH/BASE/DISTRIBUTION/SQUEEZE/DUMP SQUEEZE/EARLY BUILD-UP/
+// WARMING/HOT/SUPER/SUPER DOWN/MM/MM x25/MM-OSC - всички, които НЕ подават
+// candleOpenTime) преди ползваха същия плосък 20-мин cooldown като по-горе -
+// проблем: ако condition-ът остане непрекъснато вярно повече от 20 мин (напр.
+// SUPER LONG активен 13:00->13:20 без прекъсване), 20-мин таймера просто
+// изтичаше и сигналът се връщаше обратно в newFired, макар нищо ново реално
+// да не се е случило - комбинирано с Active Signal Memory това можеше да
+// прати ВТОРО WhatsApp известие за същото продължаващо състояние (виж
+// PRIORITY 1 от финалния анализ). Сега вместо "мина ли Х минути", следим
+// НЕПРЕКЪСНАТОСТ на присъствието: state.liveSignalState[label].lastSeenAt се
+// опреснява на ВСЕКИ тик, докато condition-ът е верен (за да не изтече
+// паметта на активното доказателство - виж updateActiveSignals по-долу, което
+// вече получава ВСИЧКИ текущо-верни LIVE сигнали, не само новите). Само ако
+// мине повече от LIVE_PRESENCE_GAP_MS (толерира 1 пропуснат/забавен 5-мин cron
+// тик) БЕЗ да е бил виждан, следващото му появяване се брои за NEW EVENT.
+const LIVE_PRESENCE_GAP_MS = 12 * 60000;
+function isNewLiveEvent(state, label, now) {
+  const s = state.liveSignalState?.[label];
+  if (!s) return true;
+  return (now - s.lastSeenAt) > LIVE_PRESENCE_GAP_MS;
+}
+function markLiveSeen(state, label, now) {
+  if (!state.liveSignalState) state.liveSignalState = {};
+  state.liveSignalState[label] = { lastSeenAt: now };
 }
 
 // "Mario – Build-Up Detector + EMA Filter" - Early Build-Up на 1ч отваря 18ч
@@ -996,10 +1018,12 @@ async function saveSymbolState(env, symbol, state) {
 
 // Сканира един символ, обновява/пази неговото cooldown+ACTIVE SIGNAL MEMORY
 // състояние в KV, и връща { newFired, activeFired, ... } - newFired са
-// етикетите на сигналите, които току-що са се задействали този тик (не
-// потиснати от cooldown, празен масив = "нищо ново тази обиколка"); activeFired
-// са ВСИЧКИ още неизтекли активни сигнали (newFired + запомнени от предишни
-// тикове), от които реално се смятат longScore/shortScore.
+// етикетите на ГЕНУИННО новите събития този тик (нова затворена свещ за
+// структурните тагове, ново появяване/реокуряне за LIVE тагове - виж
+// tagCanFire/isNewLiveEvent по-горе; празен масив = "нищо ново тази
+// обиколка"); activeFired са ВСИЧКИ още неизтекли активни сигнали (текущо
+// верни ОТ ТОЗИ тик, нови И продължаващи, + запомнени от предишни тикове),
+// от които реално се смятат longScore/shortScore.
 async function scanSymbolSignals(env, symbol) {
   const [k15, k5, k1h, k4h, k1d] = await Promise.all([
     // т.8 от анализа - увеличена история (от 60/40/60/210/20) за по-стабилно
@@ -1141,8 +1165,9 @@ async function scanSymbolSignals(env, symbol) {
   // сигнал в LONG/SHORT точковия резултат (не се извежда чрез повторно
   // парсене на текста на label по-долу); type сочи към SIGNAL_MEMORY_MINUTES
   // (виж ACTIVE SIGNAL MEMORY по-горе). longScore/shortScore НЕ се смятат
-  // тук - смятат се по-долу, от activeSignals (newFired + още неизтекли стари
-  // сигнали от паметта), след като newFired мине tagCanFire cooldown филтъра.
+  // тук - смятат се по-долу, от activeSignals (текущо-верни ОТ ТОЗИ тик +
+  // още неизтекли стари сигнали от паметта), след като fired се раздели на
+  // CLOSED (tagCanFire) и LIVE (isNewLiveEvent) - виж бележките там.
   const fired = [];
   if (flush) fired.push({ label: '💥 FLUSH', direction: 'long', weight: SIGNAL_WEIGHTS.flush, family: 'extreme', type: 'flush' });
   if (blowoff) fired.push({ label: '🔥 BLOWOFF', direction: 'short', weight: SIGNAL_WEIGHTS.blowoff, family: 'extreme', type: 'blowoff' });
@@ -1177,16 +1202,35 @@ async function scanSymbolSignals(env, symbol) {
   if (confirmed.long) fired.push({ label: '✅ CONFIRMED ▲', direction: 'long', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime, type: 'confirmed' });
   if (confirmed.short) fired.push({ label: '✅ CONFIRMED ▼', direction: 'short', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime, type: 'confirmed' });
 
-  const newFired = fired.filter(sig => tagCanFire(state, sig.label, sig.candleTime));
-  newFired.forEach(sig => markTagFired(state, sig.label, sig.candleTime));
+  // Разделяне CLOSED-CANDLE (candleTime != null) от LIVE (candleTime == null) -
+  // всеки тип ползва собствения си "ново ли е събитието" механизъм (виж
+  // бележките при tagCanFire и isNewLiveEvent по-горе).
+  const now = Date.now();
+  const closedFiredRaw = fired.filter(sig => sig.candleTime != null);
+  const liveFiredRaw = fired.filter(sig => sig.candleTime == null);
+
+  const newClosedFired = closedFiredRaw.filter(sig => tagCanFire(state, sig.label, sig.candleTime));
+  newClosedFired.forEach(sig => markTagFired(state, sig.label, sig.candleTime));
+
+  // ВСЕКИ текущо-верен LIVE сигнал опреснява присъствието си (markLiveSeen),
+  // независимо дали е ново или продължаващо събитие - иначе isNewLiveEvent
+  // никога няма как да "знае", че сигналът е бил непрекъснато активен.
+  const newLiveFired = liveFiredRaw.filter(sig => isNewLiveEvent(state, sig.label, now));
+  liveFiredRaw.forEach(sig => markLiveSeen(state, sig.label, now));
+
+  // newFired = само ГЕНУИННО нови събития (нова затворена свещ за структурните,
+  // ново появяване/реокуряне за LIVE) - това е единственият източник за "има
+  // ли изобщо нов сигнал" (виж checkMarketSignals), а не просто "минаха Х мин".
+  const newFired = [...newClosedFired, ...newLiveFired];
 
   // ACTIVE SIGNAL MEMORY (виж updateActiveSignals/getActiveSignals по-горе) -
-  // longScore/shortScore вече се смятат от ВСИЧКИ още неизтекли активни
-  // сигнали (нови ОТ ТОЗИ тик + запомнени от предишни тикове), не само от
-  // newFired - за да могат последователни сигнали (WARMING -> MM -> CONFIRMED)
-  // реално да се съберат в общ резултат. newFired остава отделно - той е
-  // единственият източник за "има ли изобщо нов сигнал" (виж checkMarketSignals).
-  updateActiveSignals(state, newFired);
+  // longScore/shortScore се смятат от ВСИЧКИ още неизтекли активни сигнали
+  // (текущо-верни ОТ ТОЗИ тик, нови И продължаващи, + запомнени от предишни
+  // тикове), не само от newFired - за да могат последователни сигнали
+  // (WARMING -> MM -> CONFIRMED) реално да се съберат в общ резултат, и за да
+  // не изтича паметта на едно продължаващо LIVE доказателство само защото не
+  // се брои за "ново" (виж isNewLiveEvent по-горе).
+  updateActiveSignals(state, [...newClosedFired, ...liveFiredRaw]);
   const activeSignals = getActiveSignals(state);
   const longScore = computeFamilyCappedScore(activeSignals, 'long');
   const shortScore = computeFamilyCappedScore(activeSignals, 'short');
