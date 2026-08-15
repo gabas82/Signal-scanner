@@ -848,29 +848,77 @@ function calcTakeProfitLevels(price, direction) {
   return TP_PCTS.map(pct => direction === 'long' ? price * (1 + pct / 100) : price * (1 - pct / 100));
 }
 
-// Колко пъти по-голямо трябва да е мнозинството (лонг срещу шорт контекст
-// сигнали) спрямо малцинството, за да покажем посока+TP с увереност вместо
-// предупреждение за смесени сигнали. 4 означава напр. 4:1 или 8:2 минава,
-// 3:2 или 2:1 - не (само в известието се показва %-но разпределение).
+// Колко пъти по-голям трябва да е точковият резултат на мнозинството спрямо
+// малцинството, за да покажем посока+TP с увереност вместо предупреждение за
+// смесени сигнали. 4 означава напр. 4:1 или 8:2 минава, 3:2 или 2:1 - не
+// (само в известието се показва %-но разпределение). Прагът остава 4, но
+// вече сравнява ТЕГЛОВНИ точки (виж SIGNAL_WEIGHTS/SIGNAL_FAMILY_MAX по-долу),
+// не суров брой сигнали - иначе 1 слаб EARLY BUILD-UP (0.5т) срещу 1 силен
+// CONFIRMED (2.0т) щеше да се брои 1:1 наравно, макар CONFIRMED да е 4х
+// по-силно доказателство.
 const DIRECTION_CONFIDENCE_RATIO = 4;
-// Отделен, по-строг праг само за показване на TP стълбата - самата посока
-// (Посока: LONG/SHORT) може да се покаже и при 1 потвърждение (ratioOK), но
-// TP1-5 изисква поне MIN_TP_CONFIRMATION_HITS реални (не cooldown-потиснати)
-// сигнала в мнозинството, иначе "1 от 1 сигнал LONG" изглеждаше подвеждащо
-// сигурно като "4 от 5".
-const MIN_TP_CONFIRMATION_HITS = 2;
+// Всеки сигнал носи собствена тежест вместо да брои за "1" - по-слаб/ранен
+// сигнал (EARLY BUILD-UP/WARMING) тежи по-малко от структурно потвърждение
+// (CONFIRMED/PRE-IMPULSE). Числата са по подадената спецификация; не пипай
+// без нови натрупани реални резултати.
+const SIGNAL_WEIGHTS = {
+  flush: 1.25, blowoff: 1.25, base: 1.25, distribution: 1.25,
+  squeeze: 1.00, dumpSqueeze: 1.00,
+  shift: 1.25, shiftDown: 1.25,
+  impulse: 1.75, impulseAtr: 2.00,
+  earlyBuildUp: 0.50, buildUpConfirmed: 2.00, preImpulse: 2.50,
+  warming: 0.50, hot: 1.00, super: 1.50, superDown: 1.50,
+  mm: 1.50, mmX25: 1.75, mmOscBest: 1.50, mmOscRe: 1.25,
+  confirmed: 2.00,
+};
+// Корелирани семейства - няколко детектора от едно и също семейство често
+// реагират на СЪЩОТО реално движение (volume/ATR/EMA/candle body/breakout),
+// затова не се сумират безкрайно, а се ограничават с таван на семейство: една
+// силна зелена свещ, която пали и SUPER, и MM, и MM x25 едновременно, не е 3
+// напълно независими доказателства, а 1 силно движение, видяно през 3 лещи.
+// EARLY BUILD-UP умишлено няма семейство (family: null по-долу) - той е
+// единственият тригер на отделната, защитена Build-Up верига (не пипана в
+// тази промяна) и не ползва общите volume/ATR данни на Family A.
+const SIGNAL_FAMILY_MAX = {
+  volumeMomentum: 1.50, // WARMING/HOT/SUPER/SUPER DOWN/SQUEEZE/DUMP SQUEEZE
+  mmEngine: 2.00,        // MM/MM x25/MM-OSC BEST/MM-OSC RE-ENTRY
+  impulseFamily: 2.00,   // IMPULSE/IMPULSE+ATR
+  structure: 3.00,       // SHIFT/BUILD-UP CONFIRMED/CONFIRMED/PRE-IMPULSE
+  extreme: 2.00,         // FLUSH/BASE/BLOWOFF/DISTRIBUTION
+};
+// Сумира теглата на всички newFired сигнали в дадена посока, ограничавайки
+// всяко семейство до неговия таван, преди да ги събере - сигнали БЕЗ family
+// (EARLY BUILD-UP) се броят изцяло, без таван.
+function computeFamilyCappedScore(signals, direction) {
+  const byFamily = {};
+  let uncapped = 0;
+  for (const sig of signals) {
+    if (sig.direction !== direction) continue;
+    if (sig.family) byFamily[sig.family] = (byFamily[sig.family] || 0) + sig.weight;
+    else uncapped += sig.weight;
+  }
+  let total = uncapped;
+  for (const family in byFamily) total += Math.min(byFamily[family], SIGNAL_FAMILY_MAX[family]);
+  return total;
+}
+// Заменя старото MIN_TP_CONFIRMATION_HITS (брой сигнали) - сега сравнява
+// точковия резултат на мнозинството. 1 слаб сигнал (0.5-1.25т) вече не може
+// сам да отключи TP, но 1 наистина силно структурно потвърждение (CONFIRMED/
+// PRE-IMPULSE, 2.0-2.5т) вече може - точно обратното на старата система,
+// където И двата случая се брояха еднакво като "1 сигнал".
+const MIN_TP_SCORE = 3.0;
 
-function computeDirectionConfidence(longHits, shortHits) {
-  const total = longHits + shortHits;
-  const longPct = total ? Math.round((longHits / total) * 100) : 0;
+function computeDirectionConfidence(longScore, shortScore) {
+  const total = longScore + shortScore;
+  const longPct = total ? Math.round((longScore / total) * 100) : 0;
   const shortPct = total ? 100 - longPct : 0;
-  const majority = Math.max(longHits, shortHits);
-  const minority = Math.min(longHits, shortHits);
+  const majority = Math.max(longScore, shortScore);
+  const minority = Math.min(longScore, shortScore);
   const ratioOK = total > 0 && (minority === 0 || majority >= minority * DIRECTION_CONFIDENCE_RATIO);
-  const enoughHits = majority >= MIN_TP_CONFIRMATION_HITS;
-  const confident = ratioOK && enoughHits;
-  const direction = longHits === shortHits ? null : (longHits > shortHits ? 'long' : 'short');
-  return { direction, confident, longPct, shortPct, longHits, shortHits, total, majority, ratioOK, enoughHits };
+  const enoughScore = majority >= MIN_TP_SCORE;
+  const confident = ratioOK && enoughScore;
+  const direction = longScore === shortScore ? null : (longScore > shortScore ? 'long' : 'short');
+  return { direction, confident, longPct, shortPct, longScore, shortScore, total, majority, ratioOK, enoughScore };
 }
 
 async function loadSymbolState(env, symbol) {
@@ -1001,55 +1049,55 @@ async function scanSymbolSignals(env, symbol) {
   const impulseAtr = calcImpulseAtrSignal(c5Closed);
   const confirmed = calcConfirmedSignal(c15Closed, c1hClosed);
 
-  // fired е масив от {label, direction} обекти, не голи низове - direction
-  // тук е ИЗТОЧНИКЪТ на истината за LONG/SHORT приноса на всеки сигнал (не се
-  // извежда чрез повторно парсене на емоджита/текста на label по-долу).
-  // longHits/shortHits НЕ се броят тук - броят се по-долу, САМО от newFired
-  // (сигналите, които реално минават tagCanFire cooldown филтъра), за да не
-  // влияят в %/посоката стари сигнали, потиснати заради cooldown в това
-  // конкретно известие (виж TEST 1/6 в спецификацията).
+  // fired е масив от {label, direction, weight, family, candleTime} обекти -
+  // direction/weight/family тук са ИЗТОЧНИКЪТ на истината за приноса на всеки
+  // сигнал в LONG/SHORT точковия резултат (не се извежда чрез повторно
+  // парсене на текста на label по-долу). longScore/shortScore НЕ се смятат
+  // тук - смятат се по-долу, САМО от newFired (сигналите, които реално
+  // минават tagCanFire cooldown филтъра), за да не влияят в %/посоката стари
+  // сигнали, потиснати заради cooldown в това конкретно известие.
   const fired = [];
-  if (flush) fired.push({ label: '💥 FLUSH', direction: 'long' });
-  if (blowoff) fired.push({ label: '🔥 BLOWOFF', direction: 'short' });
-  if (base) fired.push({ label: '🔵 BASE', direction: 'long' });
-  if (distribution) fired.push({ label: '🟠 DISTRIBUTION', direction: 'short' });
-  if (squeeze) fired.push({ label: '🟣 SQUEEZE', direction: 'long' });
-  if (dumpSqueeze) fired.push({ label: '🟣 DUMP SQUEEZE', direction: 'short' });
-  if (shift) fired.push({ label: '🟠 SHIFT', direction: 'long', candleTime: shiftCandleTime });
-  if (shiftDown) fired.push({ label: '🟠 SHIFT ▼', direction: 'short', candleTime: shiftCandleTime });
-  if (impulse.long) fired.push({ label: '🟢 IMPULSE LONG', direction: 'long', candleTime: shiftCandleTime });
-  if (impulse.short) fired.push({ label: '🔴 IMPULSE SHORT', direction: 'short', candleTime: shiftCandleTime });
-  if (early.long) fired.push({ label: '🟡 EARLY BUILD-UP ▲', direction: 'long' });
-  if (early.short) fired.push({ label: '🟡 EARLY BUILD-UP ▼', direction: 'short' });
-  if (buildUpConfirmLong) fired.push({ label: '🟢 BUILD-UP CONFIRMED ▲', direction: 'long', candleTime: buildUpCandleTime });
-  if (buildUpConfirmShort) fired.push({ label: '🔴 BUILD-UP CONFIRMED ▼', direction: 'short', candleTime: buildUpCandleTime });
-  if (preImpulseLong) fired.push({ label: '🚀 PRE-IMPULSE ▲', direction: 'long', candleTime: buildUpCandleTime });
-  if (preImpulseShort) fired.push({ label: '💥 PRE-IMPULSE ▼', direction: 'short', candleTime: buildUpCandleTime });
-  if (warmTier === 'warm') fired.push({ label: `🔵 WARMING ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short' });
-  if (warmTier === 'hot') fired.push({ label: `🟠 HOT ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short' });
-  if (warmTier === 'super') fired.push({ label: `${warming.direction === 'up' ? '🟢' : '🔴'} SUPER ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short' });
-  if (superDownDump) fired.push({ label: '🚨 SUPER DOWN (DUMP)', direction: 'short' });
-  if (mmLong) fired.push({ label: '🟢 MM LONG', direction: 'long' });
-  if (mmShort) fired.push({ label: '🔴 MM SHORT', direction: 'short' });
-  if (mmX25Long) fired.push({ label: '💎 MM x25 LONG', direction: 'long' });
-  if (mmX25Short) fired.push({ label: '💀 MM x25 SHORT', direction: 'short' });
-  if (oscBestLong) fired.push({ label: '🟢▲ MM-OSC BEST LONG', direction: 'long' });
-  if (oscBestShort) fired.push({ label: '🔴▼ MM-OSC BEST SHORT', direction: 'short' });
-  if (oscReLong) fired.push({ label: '🟢△ MM-OSC RE-LONG', direction: 'long' });
-  if (oscReShort) fired.push({ label: '🔴▽ MM-OSC RE-SHORT', direction: 'short' });
-  if (impulseAtr.long) fired.push({ label: '⚡ IMPULSE+ATR ▲', direction: 'long', candleTime: impulseAtrCandleTime });
-  if (impulseAtr.short) fired.push({ label: '⚡ IMPULSE+ATR ▼', direction: 'short', candleTime: impulseAtrCandleTime });
-  if (confirmed.long) fired.push({ label: '✅ CONFIRMED ▲', direction: 'long', candleTime: confirmedCandleTime });
-  if (confirmed.short) fired.push({ label: '✅ CONFIRMED ▼', direction: 'short', candleTime: confirmedCandleTime });
+  if (flush) fired.push({ label: '💥 FLUSH', direction: 'long', weight: SIGNAL_WEIGHTS.flush, family: 'extreme' });
+  if (blowoff) fired.push({ label: '🔥 BLOWOFF', direction: 'short', weight: SIGNAL_WEIGHTS.blowoff, family: 'extreme' });
+  if (base) fired.push({ label: '🔵 BASE', direction: 'long', weight: SIGNAL_WEIGHTS.base, family: 'extreme' });
+  if (distribution) fired.push({ label: '🟠 DISTRIBUTION', direction: 'short', weight: SIGNAL_WEIGHTS.distribution, family: 'extreme' });
+  if (squeeze) fired.push({ label: '🟣 SQUEEZE', direction: 'long', weight: SIGNAL_WEIGHTS.squeeze, family: 'volumeMomentum' });
+  if (dumpSqueeze) fired.push({ label: '🟣 DUMP SQUEEZE', direction: 'short', weight: SIGNAL_WEIGHTS.dumpSqueeze, family: 'volumeMomentum' });
+  if (shift) fired.push({ label: '🟠 SHIFT', direction: 'long', weight: SIGNAL_WEIGHTS.shift, family: 'structure', candleTime: shiftCandleTime });
+  if (shiftDown) fired.push({ label: '🟠 SHIFT ▼', direction: 'short', weight: SIGNAL_WEIGHTS.shiftDown, family: 'structure', candleTime: shiftCandleTime });
+  if (impulse.long) fired.push({ label: '🟢 IMPULSE LONG', direction: 'long', weight: SIGNAL_WEIGHTS.impulse, family: 'impulseFamily', candleTime: shiftCandleTime });
+  if (impulse.short) fired.push({ label: '🔴 IMPULSE SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.impulse, family: 'impulseFamily', candleTime: shiftCandleTime });
+  if (early.long) fired.push({ label: '🟡 EARLY BUILD-UP ▲', direction: 'long', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null });
+  if (early.short) fired.push({ label: '🟡 EARLY BUILD-UP ▼', direction: 'short', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null });
+  if (buildUpConfirmLong) fired.push({ label: '🟢 BUILD-UP CONFIRMED ▲', direction: 'long', weight: SIGNAL_WEIGHTS.buildUpConfirmed, family: 'structure', candleTime: buildUpCandleTime });
+  if (buildUpConfirmShort) fired.push({ label: '🔴 BUILD-UP CONFIRMED ▼', direction: 'short', weight: SIGNAL_WEIGHTS.buildUpConfirmed, family: 'structure', candleTime: buildUpCandleTime });
+  if (preImpulseLong) fired.push({ label: '🚀 PRE-IMPULSE ▲', direction: 'long', weight: SIGNAL_WEIGHTS.preImpulse, family: 'structure', candleTime: buildUpCandleTime });
+  if (preImpulseShort) fired.push({ label: '💥 PRE-IMPULSE ▼', direction: 'short', weight: SIGNAL_WEIGHTS.preImpulse, family: 'structure', candleTime: buildUpCandleTime });
+  if (warmTier === 'warm') fired.push({ label: `🔵 WARMING ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.warming, family: 'volumeMomentum' });
+  if (warmTier === 'hot') fired.push({ label: `🟠 HOT ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.hot, family: 'volumeMomentum' });
+  if (warmTier === 'super') fired.push({ label: `${warming.direction === 'up' ? '🟢' : '🔴'} SUPER ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.super, family: 'volumeMomentum' });
+  if (superDownDump) fired.push({ label: '🚨 SUPER DOWN (DUMP)', direction: 'short', weight: SIGNAL_WEIGHTS.superDown, family: 'volumeMomentum' });
+  if (mmLong) fired.push({ label: '🟢 MM LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mm, family: 'mmEngine' });
+  if (mmShort) fired.push({ label: '🔴 MM SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mm, family: 'mmEngine' });
+  if (mmX25Long) fired.push({ label: '💎 MM x25 LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine' });
+  if (mmX25Short) fired.push({ label: '💀 MM x25 SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine' });
+  if (oscBestLong) fired.push({ label: '🟢▲ MM-OSC BEST LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmOscBest, family: 'mmEngine' });
+  if (oscBestShort) fired.push({ label: '🔴▼ MM-OSC BEST SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmOscBest, family: 'mmEngine' });
+  if (oscReLong) fired.push({ label: '🟢△ MM-OSC RE-LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmOscRe, family: 'mmEngine' });
+  if (oscReShort) fired.push({ label: '🔴▽ MM-OSC RE-SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmOscRe, family: 'mmEngine' });
+  if (impulseAtr.long) fired.push({ label: '⚡ IMPULSE+ATR ▲', direction: 'long', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime });
+  if (impulseAtr.short) fired.push({ label: '⚡ IMPULSE+ATR ▼', direction: 'short', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime });
+  if (confirmed.long) fired.push({ label: '✅ CONFIRMED ▲', direction: 'long', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime });
+  if (confirmed.short) fired.push({ label: '✅ CONFIRMED ▼', direction: 'short', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime });
 
   const newFired = fired.filter(sig => tagCanFire(state, sig.label, sig.candleTime));
   newFired.forEach(sig => markTagFired(state, sig.label, sig.candleTime));
-  const longHits = newFired.filter(sig => sig.direction === 'long').length;
-  const shortHits = newFired.filter(sig => sig.direction === 'short').length;
+  const longScore = computeFamilyCappedScore(newFired, 'long');
+  const shortScore = computeFamilyCappedScore(newFired, 'short');
 
   const price = c5.length ? c5[c5.length - 1].close : null;
   const { support, resistance } = calcSupportResistance(c1h, 20);
-  const confidence = computeDirectionConfidence(longHits, shortHits);
+  const confidence = computeDirectionConfidence(longScore, shortScore);
 
   await saveSymbolState(env, symbol, state);
 
@@ -1062,33 +1110,35 @@ async function scanSymbolSignals(env, symbol) {
 async function checkMarketSignals(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
     try {
-      const { fired, price, support, resistance, direction, longPct, shortPct, longHits, shortHits, majority, ratioOK, enoughHits } = await scanSymbolSignals(env, pos.symbol);
+      const { fired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore } = await scanSymbolSignals(env, pos.symbol);
       if (fired.length > 0) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
         const longShort = await fetchLongShortWorker(env, pos.symbol);
         const lines = [`🔥 ${symbolNoUsdt}`];
         if (price != null) lines.push(`💰 Цена: ${formatPrice(price)} USD`);
-        // Три ясни състояния (виж спецификацията, т.13): A) ясна посока + доста
-        // потвърждения -> Посока+Сигнали%+Потвърждения+TP1-5; B) ясна посока, но
-        // под MIN_TP_CONFIRMATION_HITS -> същото без TP, вместо това предупреждение;
-        // C) смесени сигнали (ratio не минава) -> "СМЕСЕНИ СИГНАЛИ", без TP.
-        // "% от сигналите"/"100% увереност" НЕ се пише никъде - процентът е ясно
-        // надписан "Сигнали: LONG X% / SHORT Y%", не вероятност за успех.
+        // Три ясни състояния (виж спецификацията, т.13, вече на точкова база -
+        // виж SIGNAL_WEIGHTS/SIGNAL_FAMILY_MAX): A) ясна посока + достатъчно
+        // точки (>= MIN_TP_SCORE) -> Посока+Сигнали%+Точки+TP1-5; B) ясна
+        // посока, но под MIN_TP_SCORE -> същото без TP, вместо това
+        // предупреждение; C) смесени сигнали (ratio не минава) -> "СМЕСЕНИ
+        // СИГНАЛИ", без TP. "% от сигналите"/"100% увереност" НЕ се пише
+        // никъде - процентът е ясно надписан "Сигнали: LONG X% / SHORT Y%",
+        // не вероятност за успех.
         if (direction && ratioOK) {
           lines.push(`📍 Посока: ${direction === 'long' ? 'LONG 🔵' : 'SHORT 🔴'}`);
           lines.push(`📊 Сигнали: LONG ${longPct}% / SHORT ${shortPct}%`);
-          lines.push(`✅ Потвърждения: ${longHits} LONG / ${shortHits} SHORT`);
-          if (enoughHits) {
+          lines.push(`✅ Точки: ${longScore.toFixed(2)} LONG / ${shortScore.toFixed(2)} SHORT`);
+          if (enoughScore) {
             if (price != null) {
               calcTakeProfitLevels(price, direction).forEach((tp, i) => lines.push(`🎯 TP${i + 1}: ${formatPrice(tp)} USD`));
             }
           } else {
-            lines.push(`⚠️ Само ${majority} потвърждение — TP не се показва`);
+            lines.push(`⚠️ Само ${majority.toFixed(2)} точки — TP не се показва`);
           }
         } else {
           lines.push(`⚠️ СМЕСЕНИ СИГНАЛИ`);
           lines.push(`📊 Сигнали: LONG ${longPct}% / SHORT ${shortPct}%`);
-          lines.push(`✅ Потвърждения: ${longHits} LONG / ${shortHits} SHORT`);
+          lines.push(`✅ Точки: ${longScore.toFixed(2)} LONG / ${shortScore.toFixed(2)} SHORT`);
         }
         if (resistance != null) lines.push(`🔺 Съпротива: ${formatPrice(resistance)} USD`);
         if (support != null) lines.push(`🔻 Подкрепа: ${formatPrice(support)} USD`);
