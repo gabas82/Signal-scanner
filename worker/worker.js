@@ -1103,7 +1103,28 @@ async function scanSymbolSignals(env, symbol) {
   }
   const boost = state.warmingBoost;
   const boostActive = !!boost && Date.now() < boost.until;
-  const easeFactor = boostActive ? (1 - WARMING_BOOST_PCT) : 1;
+  // Directional Warming Boost (PRIORITY 2 от финалния анализ) - boostActive
+  // сам по себе си не казва НИЩО за посоката на текущото движение, само че
+  // ИМА активен 4H BIG VOLUME boost в НЯКАКВА посока (boost.dir). Старият код
+  // прилагаше easeFactor безусловно щом boostActive е true, независимо дали
+  // boost.dir съвпада с посоката на свещта, която calcWarmingTier/superDownDump
+  // всъщност оценяват в момента - 4H BIG VOLUME UP можеше да улесни прага и за
+  // WARMING/SUPER DOWN движение, което е нелогично (up обем не би трябвало да
+  // прави down движенията по-лесни за отключване). Директната посока на
+  // ТЕКУЩАТА последна 1ч свещ се смята тук по същата формула като вътре в
+  // calcWarmingTier (last.close > last.open), за да може easeFactor да се
+  // прецени ПРЕДИ извикването - warmingPreviewDirection винаги съвпада с
+  // warming.direction по-долу, защото е точно същото сравнение върху същата
+  // свещ.
+  const warmingLastCandle = c1h.length ? c1h[c1h.length - 1] : null;
+  const warmingPreviewDirection = warmingLastCandle
+    ? (warmingLastCandle.close > warmingLastCandle.open ? 'up' : warmingLastCandle.close < warmingLastCandle.open ? 'down' : 'flat')
+    : 'flat';
+  const boostMatchesDirection = boostActive && (
+    (boost.dir === 1 && warmingPreviewDirection === 'up') ||
+    (boost.dir === -1 && warmingPreviewDirection === 'down')
+  );
+  const easeFactor = boostMatchesDirection ? (1 - WARMING_BOOST_PCT) : 1;
   const dumpCascade = calcDumpCascade(c15);
   const warming = calcWarmingTier(c1h, { easeFactor });
   const warmPrice = c1h.length ? c1h[c1h.length - 1].close : null;
