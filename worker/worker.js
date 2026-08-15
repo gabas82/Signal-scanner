@@ -673,7 +673,7 @@ function klinesToCandles(klines) {
 // ---- Cooldown/ARM state - в браузъра живее в module-scope обекти (survive
 // while the tab is open); тук ВСЯКО cron извикване е нов isolate, затова
 // състоянието се пази в KV между извикванията (по символ, JSON blob).
-const WARMING_COOLDOWN_MIN = { warm: 60, hot: 60, super: 120 };
+const WARMING_COOLDOWN_MIN = { warm: 60, hot: 60, super: 120, superDown: 120 };
 const WARMING_BOOST_HOURS = 4;
 const WARMING_BOOST_PCT = 0.10;
 const WARMING_DUMP_EASE = 0.85;
@@ -1048,7 +1048,13 @@ async function scanSymbolSignals(env, symbol) {
   const state = await loadSymbolState(env, symbol);
 
   const early = calcBuildUpEarly(c1h);
-  if ((early.long || early.short) && buildUpCanArm(state)) {
+  // т.9 - early.long и early.short теоретично могат да са ВЕДНЪЖ и двете true
+  // (независими условия), при което старото `dir: early.long ? 1 : -1` тихо
+  // предпочиташе LONG без основание. Сега арминг на Build-Up прозореца става
+  // само при ЕДНОЗНАЧНА посока (long !== short) - EARLY BUILD-UP сигналите
+  // по-долу (fired.push) продължават да излизат и в двете посоки нормално,
+  // само самият прозорец не се арм-ва в двусмисления случай.
+  if ((early.long !== early.short) && buildUpCanArm(state)) {
     state.buildUpWindow = { until: Date.now() + BUILDUP_MAX_HOURS * 3600000, dir: early.long ? 1 : -1 };
     markBuildUpArmed(state);
   }
@@ -1074,16 +1080,28 @@ async function scanSymbolSignals(env, symbol) {
   const dumpCascade = calcDumpCascade(c15);
   const warming = calcWarmingTier(c1h, { easeFactor });
   const warmPrice = c1h.length ? c1h[c1h.length - 1].close : null;
-  let warmTier = 'none';
-  if (warming.tier !== 'none' && warmingTierAllowed(state, warming.tier, warming.direction, warmPrice)) {
-    warmTier = warming.tier;
-    markWarmingFired(state, warming.tier, warming.direction, warmPrice);
-  }
+  // SUPER DOWN (DUMP) приоритет (т.10) - проверяваме ПЪРВО, с ОТДЕЛЕН cooldown
+  // ключ ('superDown', не 'super'). Старият ред проверяваше/палеше нормалния
+  // SUPER тир ПЪРВИ, който маркираше cooldown ключ 'super' с dir='down' В
+  // СЪЩИЯ тик, преди superDownDump въобще да е бил проверен - warmingTierAllowed
+  // за 'super'/'down' веднага виждаше s.dir === direction и връщаше false, така
+  // че DUMP вариантът структурно никога не можеше да гръмне заедно с нормален
+  // SUPER▼ на едно и също движение (споделен cooldown ключ = race). Сега DUMP
+  // се проверява първо на собствен ключ, и ако гръмне, потиска нормалния
+  // SUPER за СЪЩОТО движение (super+down) - не и HOT/WARM, които остават
+  // независими и могат да гърмят паралелно с DUMP нормално.
   const compressOK = warming.atrPct != null && warming.atrPct <= 0.75;
   const superDownDump = dumpCascade.active && warming.direction === 'down' && compressOK
     && warming.volX != null && warming.volX >= (3.0 * easeFactor * WARMING_DUMP_EASE)
-    && warmingTierAllowed(state, 'super', 'down', warmPrice);
-  if (superDownDump) markWarmingFired(state, 'super', 'down', warmPrice);
+    && warmingTierAllowed(state, 'superDown', 'down', warmPrice);
+  if (superDownDump) markWarmingFired(state, 'superDown', 'down', warmPrice);
+
+  let warmTier = 'none';
+  const superSuppressedByDump = superDownDump && warming.tier === 'super' && warming.direction === 'down';
+  if (warming.tier !== 'none' && !superSuppressedByDump && warmingTierAllowed(state, warming.tier, warming.direction, warmPrice)) {
+    warmTier = warming.tier;
+    markWarmingFired(state, warming.tier, warming.direction, warmPrice);
+  }
 
   const ctx15 = calcWarmingContext(c15);
   if (ctx15.warming) state.mmArm = { until: Date.now() + MM_ARM_MINUTES * 60000 };
