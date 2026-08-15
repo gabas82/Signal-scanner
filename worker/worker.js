@@ -118,16 +118,32 @@ function calcSMA(closes, period) {
   return closes.slice(-period).reduce((a,b) => a+b, 0) / period;
 }
 
+// Wilder RMA изглаждане (alpha = 1/period), не обикновена SMA на последните
+// `period` разлики - TradingView ta.rsi() ползва точно тази смяна и носи
+// напред цялата история с експоненциално затихващо тегло, докато старата
+// версия гледаше само последния прозорец без памет отвъд него (реален пример:
+// Worker RSI 28.8 vs TradingView RSI 30.3 на един и същ момент). За масив с
+// точно period+1 стойности резултатът е идентичен на старата SMA версия
+// (само seed стъпката, без допълнително изглаждане). Byte-identical копие на
+// същата промяна в signal-logic.js.
 function calcRSI(closes, period) {
-  if (closes.length < period + 1) return null;
-  let gains = 0, losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i-1];
-    if (diff > 0) gains += diff; else losses += Math.abs(diff);
+  const n = closes.length;
+  if (n < period + 1) return null;
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) avgGain += diff; else avgLoss += Math.abs(diff);
   }
-  const avgGain = gains / period; const avgLoss = losses / period;
+  avgGain /= period; avgLoss /= period;
+  for (let i = period + 1; i < n; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? Math.abs(diff) : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
   if (avgLoss === 0) return 100;
-  return 100 - (100 / (1 + avgGain/avgLoss));
+  return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
 function calcRSISeries(closes, period) {
@@ -340,8 +356,20 @@ function calcTrueRangeSeries(candles) {
     return Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose));
   });
 }
+// Wilder RMA на True Range (същото изглаждане като calcRSI по-горе, а не
+// плъзгаща SMA само на последния прозорец) - за да съвпада с TradingView
+// ta.atr(). При масив с точно `period` TR стойности резултатът е идентичен
+// на старата SMA версия (само seed, без допълнително изглаждане). Byte-identical
+// копие на същата промяна в signal-logic.js.
 function calcATR(candles, period) {
-  return calcSMA(calcTrueRangeSeries(candles), period);
+  const tr = calcTrueRangeSeries(candles);
+  const n = tr.length;
+  if (n < period) return null;
+  let atr = tr.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < n; i++) {
+    atr = (atr * (period - 1) + tr[i]) / period;
+  }
+  return atr;
 }
 
 function calcWarmingTier(candles, opts = {}) {
