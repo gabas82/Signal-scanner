@@ -1384,8 +1384,25 @@ export default {
       });
     }
 
+    // Whitelist за /football/ (PRIORITY 3 от финалния анализ): без него ВСЕКИ
+    // path зад /football/ минаваше директно към football-data.org с нашия
+    // FOOTBALL_DATA_TOKEN - всеки, който знае Worker URL-а, можеше да го
+    // ползва като безплатен прокси и да изразходва квотата ни (аналогично на
+    // вече фиксираната CoinGlass дупка). Токен (PROXY_TOKEN) НЕ е добавен
+    // умишлено - football.html е публична страница на gabas82.github.io,
+    // токен, вграден в публичен клиентски JS, се вижда веднага през
+    // view-source и не крие нищо реално (същата причина, поради която
+    // CoinGlass защитата по-долу също е чист whitelist, не token). Пътищата
+    // тук са изведени директно от реалната употреба в football.html.
+    const ALLOWED_FOOTBALL_PATHS = ['/competitions/', '/matches'];
     if (path.startsWith("/football/")) {
       const footballPath = path.replace("/football", "");
+      if (!ALLOWED_FOOTBALL_PATHS.some(p => footballPath.startsWith(p))) {
+        return new Response(JSON.stringify({ error: "Forbidden" }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
       const footballUrl = `https://api.football-data.org/v4${footballPath}${search}`;
       const response = await fetch(footballUrl, {
         headers: {
@@ -1401,8 +1418,16 @@ export default {
       });
     }
 
+    // Whitelist за /apisports/ - същата причина/подход като /football/ по-горе.
+    const ALLOWED_APISPORTS_PATHS = ['/fixtures', '/players/', '/standings'];
     if (path.startsWith("/apisports/")) {
       const apiPath = path.replace("/apisports", "");
+      if (!ALLOWED_APISPORTS_PATHS.some(p => apiPath.startsWith(p))) {
+        return new Response(JSON.stringify({ error: "Forbidden" }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
       const apiUrl = `https://v3.football.api-sports.io${apiPath}${search}`;
       const response = await fetch(apiUrl, {
         headers: {
