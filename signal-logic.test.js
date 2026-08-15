@@ -490,8 +490,13 @@ describe('calcBaseDivergenceStrength', () => {
     expect(r.priceDropPct).toBe(0);
   });
   it('улавя растящ RSI въпреки по-ниските нива на цената (скрита bullish дивергенция)', () => {
+    // Прагът е 40, не 50 - откакто calcRSI ползва Wilder RMA (носи напред памет
+    // от преди локалния прозорец) вместо memoryless SMA на последните `period`
+    // разлики, rsiGain на този fixture-точно изчислен пример е ~45 вместо ~52.
+    // Полето е чисто информационно (виж signal-scanner.html - показва се само
+    // след като BASE вече е задействал), не гейтва производствен сигнал.
     const r = calcBaseDivergenceStrength(candlesVShapeCloses());
-    expect(r.rsiGain).toBeGreaterThan(50);
+    expect(r.rsiGain).toBeGreaterThan(40);
     expect(r.score).toBeGreaterThan(0);
   });
 });
