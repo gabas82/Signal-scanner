@@ -1002,14 +1002,17 @@ async function saveSymbolState(env, symbol, state) {
 // тикове), от които реално се смятат longScore/shortScore.
 async function scanSymbolSignals(env, symbol) {
   const [k15, k5, k1h, k4h, k1d] = await Promise.all([
-    // 60 (не 40) - calcConfirmedSignal изисква поне 52 15м свещи (emaMidLen 50 + 2)
-    // след затворената свещ (c15Closed = 59 свещи); с 40 CONFIRMED структурно
-    // никога не можеше да се задейства.
-    fetchKlinesWorker(env, symbol, '15m', 60),
-    fetchKlinesWorker(env, symbol, '5m', 40),
-    fetchKlinesWorker(env, symbol, '1h', 60),
-    fetchKlinesWorker(env, symbol, '4h', 210), // 210 - нужни за EMA200 филтъра на Build-Up Detector-а
-    fetchKlinesWorker(env, symbol, '1d', 20),
+    // т.8 от анализа - увеличена история (от 60/40/60/210/20) за по-стабилно
+    // Wilder RSI/ATR "warm-up" (Wilder RMA носи затихваща памет от ЦЯЛАТА
+    // подадена история, не само последния period+1 прозорец - колкото повече
+    // свещи назад, толкова по-близо до TradingView стойността за същия момент)
+    // и по-стабилни EMA20/EMA50/EMA200. Самите Wilder формули (calcRSI/calcATR)
+    // НЕ са пипнати тук - само броят подадени свещи.
+    fetchKlinesWorker(env, symbol, '15m', 200),
+    fetchKlinesWorker(env, symbol, '5m', 200),
+    fetchKlinesWorker(env, symbol, '1h', 250),
+    fetchKlinesWorker(env, symbol, '4h', 500), // нужни за EMA200 филтъра на Build-Up Detector-а
+    fetchKlinesWorker(env, symbol, '1d', 200),
   ]);
   const c15 = klinesToCandles(k15), c5 = klinesToCandles(k5), c1h = klinesToCandles(k1h);
   const c4h = klinesToCandles(k4h), c1d = klinesToCandles(k1d);
