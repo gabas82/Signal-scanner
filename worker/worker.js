@@ -871,6 +871,20 @@ const SIGNAL_WEIGHTS = {
   mm: 1.50, mmX25: 1.75, mmOscBest: 1.50, mmOscRe: 1.25,
   confirmed: 2.00,
 };
+// Колко минути даден сигнал остава "активен" в ACTIVE SIGNAL MEMORY (виж
+// updateActiveSignals/getActiveSignals по-долу) - LIVE детектори по-кратко
+// (60 мин), структурни/по-бавни таймфреймове по-дълго (90 мин на 1ч/15м база,
+// 240 мин = 4ч за BUILD-UP CONFIRMED/PRE-IMPULSE, които стъпват на 4ч свещи).
+const SIGNAL_MEMORY_MINUTES = {
+  warming: 60, hot: 60, super: 60, superDown: 60,
+  mm: 60, mmX25: 60, mmOscBest: 60, mmOscRe: 60,
+  impulse: 60, impulseAtr: 60,
+  shift: 90, shiftDown: 90, confirmed: 90,
+  earlyBuildUp: 90,
+  buildUpConfirmed: 240, preImpulse: 240,
+  flush: 90, blowoff: 90, base: 90, distribution: 90,
+  squeeze: 60, dumpSqueeze: 60,
+};
 // Корелирани семейства - няколко детектора от едно и също семейство често
 // реагират на СЪЩОТО реално движение (volume/ATR/EMA/candle body/breakout),
 // затова не се сумират безкрайно, а се ограничават с таван на семейство: една
@@ -900,6 +914,44 @@ function computeFamilyCappedScore(signals, direction) {
   let total = uncapped;
   for (const family in byFamily) total += Math.min(byFamily[family], SIGNAL_FAMILY_MAX[family]);
   return total;
+}
+
+// ACTIVE SIGNAL MEMORY - преди тази промяна longScore/shortScore се смятаха
+// само от newFired (тик по тик), затова последователно развиващо се движение
+// (WARMING @13:00 -> MM @13:05 -> CONFIRMED @13:15) никога не се комбинираше
+// в общ резултат - всеки сигнал сам пали cooldown-а си и излиза от newFired
+// на следващите тикове, преди да успее да се "срещне" с останалите. Сега
+// всеки нов сигнал се пази в state.activeSignals (keyed по label, за dedup -
+// повторен fire на СЪЩИЯ label просто обновява timestamp/expiresAt, не се
+// трупа многократно), с изтичане според типа му (SIGNAL_MEMORY_MINUTES).
+// longScore/shortScore се смятат от ВСИЧКИ още неизтекли активни сигнали (нови
+// + запомнени), но family caps продължават да важат непроменени - паметта не
+// заобикаля SIGNAL_FAMILY_MAX. Разни посоки (LONG memory + нов SHORT сигнал)
+// НЕ се трият автоматично една друга - и двете участват в computeDirectionConfidence,
+// за да могат да покажат СМЕСЕНИ СИГНАЛИ коректно.
+function updateActiveSignals(state, newFired) {
+  if (!state.activeSignals) state.activeSignals = {};
+  const now = Date.now();
+  for (const sig of newFired) {
+    const minutes = SIGNAL_MEMORY_MINUTES[sig.type] ?? SIGNAL_REPEAT_COOLDOWN_MIN;
+    state.activeSignals[sig.label] = {
+      label: sig.label, direction: sig.direction, weight: sig.weight, family: sig.family,
+      at: now, expiresAt: now + minutes * 60000,
+    };
+  }
+}
+// Връща масив от още неизтеклите активни сигнали (за computeFamilyCappedScore)
+// и същевременно чисти изтеклите записи от state (не растат безкрайно в KV).
+function getActiveSignals(state) {
+  if (!state.activeSignals) return [];
+  const now = Date.now();
+  const active = [];
+  for (const label in state.activeSignals) {
+    const s = state.activeSignals[label];
+    if (s.expiresAt > now) active.push(s);
+    else delete state.activeSignals[label];
+  }
+  return active;
 }
 // Заменя старото MIN_TP_CONFIRMATION_HITS (брой сигнали) - сега сравнява
 // точковия резултат на мнозинството. 1 слаб сигнал (0.5-1.25т) вече не може
@@ -942,9 +994,12 @@ async function saveSymbolState(env, symbol, state) {
   await env.ALERT_STATE.put(`sigstate:${symbol}`, JSON.stringify(state));
 }
 
-// Сканира един символ, обновява/пази неговото cooldown състояние в KV, и
-// връща списък от ЕТИКЕТИ на сигналите, които току-що са се задействали (не
-// потиснати от cooldown) - празен масив означава "нищо ново тази обиколка".
+// Сканира един символ, обновява/пази неговото cooldown+ACTIVE SIGNAL MEMORY
+// състояние в KV, и връща { newFired, activeFired, ... } - newFired са
+// етикетите на сигналите, които току-що са се задействали този тик (не
+// потиснати от cooldown, празен масив = "нищо ново тази обиколка"); activeFired
+// са ВСИЧКИ още неизтекли активни сигнали (newFired + запомнени от предишни
+// тикове), от които реално се смятат longScore/shortScore.
 async function scanSymbolSignals(env, symbol) {
   const [k15, k5, k1h, k4h, k1d] = await Promise.all([
     // 60 (не 40) - calcConfirmedSignal изисква поне 52 15м свещи (emaMidLen 50 + 2)
@@ -1060,51 +1115,60 @@ async function scanSymbolSignals(env, symbol) {
   const impulseAtr = calcImpulseAtrSignal(c5Closed);
   const confirmed = calcConfirmedSignal(c15Closed, c1hClosed);
 
-  // fired е масив от {label, direction, weight, family, candleTime} обекти -
+  // fired е масив от {label, direction, weight, family, candleTime, type} обекти -
   // direction/weight/family тук са ИЗТОЧНИКЪТ на истината за приноса на всеки
   // сигнал в LONG/SHORT точковия резултат (не се извежда чрез повторно
-  // парсене на текста на label по-долу). longScore/shortScore НЕ се смятат
-  // тук - смятат се по-долу, САМО от newFired (сигналите, които реално
-  // минават tagCanFire cooldown филтъра), за да не влияят в %/посоката стари
-  // сигнали, потиснати заради cooldown в това конкретно известие.
+  // парсене на текста на label по-долу); type сочи към SIGNAL_MEMORY_MINUTES
+  // (виж ACTIVE SIGNAL MEMORY по-горе). longScore/shortScore НЕ се смятат
+  // тук - смятат се по-долу, от activeSignals (newFired + още неизтекли стари
+  // сигнали от паметта), след като newFired мине tagCanFire cooldown филтъра.
   const fired = [];
-  if (flush) fired.push({ label: '💥 FLUSH', direction: 'long', weight: SIGNAL_WEIGHTS.flush, family: 'extreme' });
-  if (blowoff) fired.push({ label: '🔥 BLOWOFF', direction: 'short', weight: SIGNAL_WEIGHTS.blowoff, family: 'extreme' });
-  if (base) fired.push({ label: '🔵 BASE', direction: 'long', weight: SIGNAL_WEIGHTS.base, family: 'extreme' });
-  if (distribution) fired.push({ label: '🟠 DISTRIBUTION', direction: 'short', weight: SIGNAL_WEIGHTS.distribution, family: 'extreme' });
-  if (squeeze) fired.push({ label: '🟣 SQUEEZE', direction: 'long', weight: SIGNAL_WEIGHTS.squeeze, family: 'volumeMomentum' });
-  if (dumpSqueeze) fired.push({ label: '🟣 DUMP SQUEEZE', direction: 'short', weight: SIGNAL_WEIGHTS.dumpSqueeze, family: 'volumeMomentum' });
-  if (shift) fired.push({ label: '🟠 SHIFT', direction: 'long', weight: SIGNAL_WEIGHTS.shift, family: 'structure', candleTime: shiftCandleTime });
-  if (shiftDown) fired.push({ label: '🟠 SHIFT ▼', direction: 'short', weight: SIGNAL_WEIGHTS.shiftDown, family: 'structure', candleTime: shiftCandleTime });
-  if (impulse.long) fired.push({ label: '🟢 IMPULSE LONG', direction: 'long', weight: SIGNAL_WEIGHTS.impulse, family: 'impulseFamily', candleTime: shiftCandleTime });
-  if (impulse.short) fired.push({ label: '🔴 IMPULSE SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.impulse, family: 'impulseFamily', candleTime: shiftCandleTime });
-  if (early.long) fired.push({ label: '🟡 EARLY BUILD-UP ▲', direction: 'long', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null });
-  if (early.short) fired.push({ label: '🟡 EARLY BUILD-UP ▼', direction: 'short', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null });
-  if (buildUpConfirmLong) fired.push({ label: '🟢 BUILD-UP CONFIRMED ▲', direction: 'long', weight: SIGNAL_WEIGHTS.buildUpConfirmed, family: 'structure', candleTime: buildUpCandleTime });
-  if (buildUpConfirmShort) fired.push({ label: '🔴 BUILD-UP CONFIRMED ▼', direction: 'short', weight: SIGNAL_WEIGHTS.buildUpConfirmed, family: 'structure', candleTime: buildUpCandleTime });
-  if (preImpulseLong) fired.push({ label: '🚀 PRE-IMPULSE ▲', direction: 'long', weight: SIGNAL_WEIGHTS.preImpulse, family: 'structure', candleTime: buildUpCandleTime });
-  if (preImpulseShort) fired.push({ label: '💥 PRE-IMPULSE ▼', direction: 'short', weight: SIGNAL_WEIGHTS.preImpulse, family: 'structure', candleTime: buildUpCandleTime });
-  if (warmTier === 'warm') fired.push({ label: `🔵 WARMING ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.warming, family: 'volumeMomentum' });
-  if (warmTier === 'hot') fired.push({ label: `🟠 HOT ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.hot, family: 'volumeMomentum' });
-  if (warmTier === 'super') fired.push({ label: `${warming.direction === 'up' ? '🟢' : '🔴'} SUPER ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.super, family: 'volumeMomentum' });
-  if (superDownDump) fired.push({ label: '🚨 SUPER DOWN (DUMP)', direction: 'short', weight: SIGNAL_WEIGHTS.superDown, family: 'volumeMomentum' });
-  if (mmLong) fired.push({ label: '🟢 MM LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mm, family: 'mmEngine' });
-  if (mmShort) fired.push({ label: '🔴 MM SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mm, family: 'mmEngine' });
-  if (mmX25Long) fired.push({ label: '💎 MM x25 LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine' });
-  if (mmX25Short) fired.push({ label: '💀 MM x25 SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine' });
-  if (oscBestLong) fired.push({ label: '🟢▲ MM-OSC BEST LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmOscBest, family: 'mmEngine' });
-  if (oscBestShort) fired.push({ label: '🔴▼ MM-OSC BEST SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmOscBest, family: 'mmEngine' });
-  if (oscReLong) fired.push({ label: '🟢△ MM-OSC RE-LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmOscRe, family: 'mmEngine' });
-  if (oscReShort) fired.push({ label: '🔴▽ MM-OSC RE-SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmOscRe, family: 'mmEngine' });
-  if (impulseAtr.long) fired.push({ label: '⚡ IMPULSE+ATR ▲', direction: 'long', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime });
-  if (impulseAtr.short) fired.push({ label: '⚡ IMPULSE+ATR ▼', direction: 'short', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime });
-  if (confirmed.long) fired.push({ label: '✅ CONFIRMED ▲', direction: 'long', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime });
-  if (confirmed.short) fired.push({ label: '✅ CONFIRMED ▼', direction: 'short', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime });
+  if (flush) fired.push({ label: '💥 FLUSH', direction: 'long', weight: SIGNAL_WEIGHTS.flush, family: 'extreme', type: 'flush' });
+  if (blowoff) fired.push({ label: '🔥 BLOWOFF', direction: 'short', weight: SIGNAL_WEIGHTS.blowoff, family: 'extreme', type: 'blowoff' });
+  if (base) fired.push({ label: '🔵 BASE', direction: 'long', weight: SIGNAL_WEIGHTS.base, family: 'extreme', type: 'base' });
+  if (distribution) fired.push({ label: '🟠 DISTRIBUTION', direction: 'short', weight: SIGNAL_WEIGHTS.distribution, family: 'extreme', type: 'distribution' });
+  if (squeeze) fired.push({ label: '🟣 SQUEEZE', direction: 'long', weight: SIGNAL_WEIGHTS.squeeze, family: 'volumeMomentum', type: 'squeeze' });
+  if (dumpSqueeze) fired.push({ label: '🟣 DUMP SQUEEZE', direction: 'short', weight: SIGNAL_WEIGHTS.dumpSqueeze, family: 'volumeMomentum', type: 'dumpSqueeze' });
+  if (shift) fired.push({ label: '🟠 SHIFT', direction: 'long', weight: SIGNAL_WEIGHTS.shift, family: 'structure', candleTime: shiftCandleTime, type: 'shift' });
+  if (shiftDown) fired.push({ label: '🟠 SHIFT ▼', direction: 'short', weight: SIGNAL_WEIGHTS.shiftDown, family: 'structure', candleTime: shiftCandleTime, type: 'shiftDown' });
+  if (impulse.long) fired.push({ label: '🟢 IMPULSE LONG', direction: 'long', weight: SIGNAL_WEIGHTS.impulse, family: 'impulseFamily', candleTime: shiftCandleTime, type: 'impulse' });
+  if (impulse.short) fired.push({ label: '🔴 IMPULSE SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.impulse, family: 'impulseFamily', candleTime: shiftCandleTime, type: 'impulse' });
+  if (early.long) fired.push({ label: '🟡 EARLY BUILD-UP ▲', direction: 'long', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null, type: 'earlyBuildUp' });
+  if (early.short) fired.push({ label: '🟡 EARLY BUILD-UP ▼', direction: 'short', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null, type: 'earlyBuildUp' });
+  if (buildUpConfirmLong) fired.push({ label: '🟢 BUILD-UP CONFIRMED ▲', direction: 'long', weight: SIGNAL_WEIGHTS.buildUpConfirmed, family: 'structure', candleTime: buildUpCandleTime, type: 'buildUpConfirmed' });
+  if (buildUpConfirmShort) fired.push({ label: '🔴 BUILD-UP CONFIRMED ▼', direction: 'short', weight: SIGNAL_WEIGHTS.buildUpConfirmed, family: 'structure', candleTime: buildUpCandleTime, type: 'buildUpConfirmed' });
+  if (preImpulseLong) fired.push({ label: '🚀 PRE-IMPULSE ▲', direction: 'long', weight: SIGNAL_WEIGHTS.preImpulse, family: 'structure', candleTime: buildUpCandleTime, type: 'preImpulse' });
+  if (preImpulseShort) fired.push({ label: '💥 PRE-IMPULSE ▼', direction: 'short', weight: SIGNAL_WEIGHTS.preImpulse, family: 'structure', candleTime: buildUpCandleTime, type: 'preImpulse' });
+  if (warmTier === 'warm') fired.push({ label: `🔵 WARMING ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.warming, family: 'volumeMomentum', type: 'warming' });
+  if (warmTier === 'hot') fired.push({ label: `🟠 HOT ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.hot, family: 'volumeMomentum', type: 'hot' });
+  if (warmTier === 'super') fired.push({ label: `${warming.direction === 'up' ? '🟢' : '🔴'} SUPER ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.super, family: 'volumeMomentum', type: 'super' });
+  if (superDownDump) fired.push({ label: '🚨 SUPER DOWN (DUMP)', direction: 'short', weight: SIGNAL_WEIGHTS.superDown, family: 'volumeMomentum', type: 'superDown' });
+  if (mmLong) fired.push({ label: '🟢 MM LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mm, family: 'mmEngine', type: 'mm' });
+  if (mmShort) fired.push({ label: '🔴 MM SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mm, family: 'mmEngine', type: 'mm' });
+  if (mmX25Long) fired.push({ label: '💎 MM x25 LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine', type: 'mmX25' });
+  if (mmX25Short) fired.push({ label: '💀 MM x25 SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine', type: 'mmX25' });
+  if (oscBestLong) fired.push({ label: '🟢▲ MM-OSC BEST LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmOscBest, family: 'mmEngine', type: 'mmOscBest' });
+  if (oscBestShort) fired.push({ label: '🔴▼ MM-OSC BEST SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmOscBest, family: 'mmEngine', type: 'mmOscBest' });
+  if (oscReLong) fired.push({ label: '🟢△ MM-OSC RE-LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmOscRe, family: 'mmEngine', type: 'mmOscRe' });
+  if (oscReShort) fired.push({ label: '🔴▽ MM-OSC RE-SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmOscRe, family: 'mmEngine', type: 'mmOscRe' });
+  if (impulseAtr.long) fired.push({ label: '⚡ IMPULSE+ATR ▲', direction: 'long', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime, type: 'impulseAtr' });
+  if (impulseAtr.short) fired.push({ label: '⚡ IMPULSE+ATR ▼', direction: 'short', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime, type: 'impulseAtr' });
+  if (confirmed.long) fired.push({ label: '✅ CONFIRMED ▲', direction: 'long', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime, type: 'confirmed' });
+  if (confirmed.short) fired.push({ label: '✅ CONFIRMED ▼', direction: 'short', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime, type: 'confirmed' });
 
   const newFired = fired.filter(sig => tagCanFire(state, sig.label, sig.candleTime));
   newFired.forEach(sig => markTagFired(state, sig.label, sig.candleTime));
-  const longScore = computeFamilyCappedScore(newFired, 'long');
-  const shortScore = computeFamilyCappedScore(newFired, 'short');
+
+  // ACTIVE SIGNAL MEMORY (виж updateActiveSignals/getActiveSignals по-горе) -
+  // longScore/shortScore вече се смятат от ВСИЧКИ още неизтекли активни
+  // сигнали (нови ОТ ТОЗИ тик + запомнени от предишни тикове), не само от
+  // newFired - за да могат последователни сигнали (WARMING -> MM -> CONFIRMED)
+  // реално да се съберат в общ резултат. newFired остава отделно - той е
+  // единственият източник за "има ли изобщо нов сигнал" (виж checkMarketSignals).
+  updateActiveSignals(state, newFired);
+  const activeSignals = getActiveSignals(state);
+  const longScore = computeFamilyCappedScore(activeSignals, 'long');
+  const shortScore = computeFamilyCappedScore(activeSignals, 'short');
 
   const price = c5.length ? c5[c5.length - 1].close : null;
   const { support, resistance } = calcSupportResistance(c1h, 20);
@@ -1112,7 +1176,11 @@ async function scanSymbolSignals(env, symbol) {
 
   await saveSymbolState(env, symbol, state);
 
-  return { fired: newFired.map(sig => sig.label), price, support, resistance, ...confidence };
+  return {
+    newFired: newFired.map(sig => sig.label),
+    activeFired: activeSignals.map(sig => sig.label),
+    price, support, resistance, ...confidence,
+  };
 }
 
 // ---- Пазарни сигнали следене (извиква се от scheduled()) -------------------
@@ -1121,10 +1189,14 @@ async function scanSymbolSignals(env, symbol) {
 async function checkMarketSignals(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
     try {
-      const { fired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore } = await scanSymbolSignals(env, pos.symbol);
       // MIN_NOTIFY_SCORE - самотен слаб сигнал вече не праща цяло известие,
-      // само защото fired.length > 0 (виж бележката при MIN_NOTIFY_SCORE).
-      if (fired.length > 0 && majority >= MIN_NOTIFY_SCORE) {
+      // само защото нещо е "активно" (виж бележката при MIN_NOTIFY_SCORE).
+      // ACTIVE SIGNAL MEMORY (т.4 от спецификацията) - стари сигнали от паметта
+      // могат да УСИЛЯТ резултата (влизат в longScore/shortScore чрез
+      // activeFired), но САМИ по себе си НЕ могат да породят ново известие -
+      // задължително трябва да има поне един НОВ сигнал (newFired) в този тик.
+      if (newFired.length > 0 && majority >= MIN_NOTIFY_SCORE) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
         const longShort = await fetchLongShortWorker(env, pos.symbol);
         const lines = [`🔥 ${symbolNoUsdt}`];
@@ -1157,7 +1229,17 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
         if (support != null) lines.push(`🔻 Подкрепа: ${formatPrice(support)} USD`);
         if (longShort) lines.push(`⚖️ Long/Short: ${longShort.longPct}% / ${longShort.shortPct}%`);
         lines.push('──────────');
-        lines.push(...fired);
+        // Две отделни секции (т.17) - "Нов сигнал" е ПРИЧИНАТА за това известие
+        // точно сега; "Активни потвърждения" са по-стари сигнали от паметта
+        // (виж ACTIVE SIGNAL MEMORY), които все още усилват точковия резултат,
+        // но сами не биха пратили известие - за да е ясно кое е новото.
+        lines.push('🆕 Нов сигнал:');
+        lines.push(...newFired);
+        const previouslyActive = activeFired.filter(label => !newFired.includes(label));
+        if (previouslyActive.length > 0) {
+          lines.push('🧠 Активни потвърждения:');
+          lines.push(...previouslyActive);
+        }
         await sendWhatsApp(env, lines.join('\n'));
       }
     } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }
