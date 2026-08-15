@@ -907,6 +907,17 @@ function computeFamilyCappedScore(signals, direction) {
 // PRE-IMPULSE, 2.0-2.5т) вече може - точно обратното на старата система,
 // където И двата случая се брояха еднакво като "1 сигнал".
 const MIN_TP_SCORE = 3.0;
+// Отделен, по-нисък праг само за ДАЛИ изобщо да пратим WhatsApp известие -
+// самотен слаб/ранен сигнал (WARMING/EARLY BUILD-UP 0.5т, MM 1.5т, MM x25
+// 1.75т) вече не праща цяло известие (с цена/съпротива/подкрепа/Long-Short)
+// сам по себе си - реален случай, докладван от потребителя: ~100 известия
+// от 10ч насам, повечето под този праг, чист шум. WARMING/EARLY BUILD-UP си
+// остават "рано предупреждение" - продължават да се смятат/пазят в KV
+// cooldown-а нормално, само НЕ пращат известие, докато не се съберат с още
+// нещо (или сами по себе си не достигнат по-силен сигнал като CONFIRMED/
+// PRE-IMPULSE, 2.0-2.5т). Различен от MIN_TP_SCORE (3.0), който само решава
+// дали TP1-5 се показват В известие, което вече се праща.
+const MIN_NOTIFY_SCORE = 2.5;
 
 function computeDirectionConfidence(longScore, shortScore) {
   const total = longScore + shortScore;
@@ -1111,7 +1122,9 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
     try {
       const { fired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore } = await scanSymbolSignals(env, pos.symbol);
-      if (fired.length > 0) {
+      // MIN_NOTIFY_SCORE - самотен слаб сигнал вече не праща цяло известие,
+      // само защото fired.length > 0 (виж бележката при MIN_NOTIFY_SCORE).
+      if (fired.length > 0 && majority >= MIN_NOTIFY_SCORE) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
         const longShort = await fetchLongShortWorker(env, pos.symbol);
         const lines = [`🔥 ${symbolNoUsdt}`];
