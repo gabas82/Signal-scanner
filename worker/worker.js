@@ -146,10 +146,35 @@ function calcRSI(closes, period) {
   return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
+// PRIORITY 4 от финалния анализ - линейна O(n) версия вместо предишната
+// O(n^2): старата имплементация викаше calcRSI(closes.slice(0, i + 1), period)
+// за ВСЯКА позиция, което означава пълно преизчисляване на Wilder RMA
+// изглаждането от началото на масива на всеки индекс (нарастващо quadratic
+// с по-голямата история от PRIORITY 3/т.8 - 200-500 свещи вместо 20-60).
+// Тук seed стъпката (avgGain/avgLoss от closes[1..period]) се прави ВЕДНЪЖ,
+// после Wilder RMA се пренася напред инкрементално - същата рекурсия като
+// calcRSI по-горе, само изчислена веднъж, не преповторена за всеки индекс.
+// Резултатът е byte-identical на старата версия (проверено с === сравнение
+// на всеки индекс за няколко дължини/периода в отделен sanity скрипт) -
+// самата Wilder формула не е променена, само начинът на изчисление.
 function calcRSISeries(closes, period) {
-  const series = new Array(closes.length).fill(null);
-  for (let i = period; i < closes.length; i++) {
-    series[i] = calcRSI(closes.slice(0, i + 1), period);
+  const n = closes.length;
+  const series = new Array(n).fill(null);
+  if (n < period + 1) return series;
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) avgGain += diff; else avgLoss += Math.abs(diff);
+  }
+  avgGain /= period; avgLoss /= period;
+  series[period] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+  for (let i = period + 1; i < n; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? Math.abs(diff) : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    series[i] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
   }
   return series;
 }
