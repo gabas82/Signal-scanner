@@ -639,7 +639,7 @@ function calcConfirmedSignal(candles15, candles1h, opts = {}) {
 }
 
 function klinesToCandles(klines) {
-  return (klines||[]).map(k => ({ open: parseFloat(k[1]), high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]) }));
+  return (klines||[]).map(k => ({ openTime: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]) }));
 }
 
 // ---- Cooldown/ARM state - в браузъра живее в module-scope обекти (survive
@@ -695,24 +695,31 @@ function markMMFired(state, key, direction, price) {
   state.mmCooldown[key] = { at: Date.now(), dir: direction, price };
 }
 
-// Всички детектори БЕЗ собствен cooldown (FLUSH/BASE/DISTRIBUTION/SQUEEZE/
-// DUMP SQUEEZE/SHIFT/SHIFT▼/IMPULSE/IMPULSE+ATR/CONFIRMED/EARLY BUILD-UP)
+// LIVE детектори (FLUSH/BASE/DISTRIBUTION/SQUEEZE/DUMP SQUEEZE/EARLY BUILD-UP/
+// WARMING/HOT/SUPER/MM/MM x25/MM-OSC) продължават с плоския 20-мин cooldown -
 // препращаха идентично известие на ВСЯКО 5-мин cron изпълнение, докато
-// условието на свещта остане вярно (може да е с часове при 1ч/4ч свещи) -
-// реален случай, докладван от потребителя. Тук пазим кога за последно е
-// пратен ВСЕКИ конкретен таг за дадена монета и потискаме повторение по-рано
-// от SIGNAL_REPEAT_COOLDOWN_MIN. MM/MM x25/WARMING/MMOSC вече имат собствен
-// cooldown преди изобщо да стигнат до fired[] - този филтър просто минава
-// и през тях безвредно (те никога не са в tagCooldown при първо влизане).
+// условието на свещта остане вярно, реален случай, докладван от потребителя.
+// CONFIRMED/структурните детектори (SHIFT/SHIFT▼/IMPULSE/IMPULSE+ATR/CONFIRMED/
+// BUILD-UP CONFIRMED/PRE-IMPULSE) вместо това пазят openTime на затворената
+// свещ, която ги е задействала - "1 сигнал на затворена свещ": ако condition-ът
+// остане верен през целия 20-мин прозорец и след него на СЪЩАТА свещ, вече не
+// препраща втори път; нова свещ (нов openTime) веднага отключва нов сигнал,
+// без да чака 20 мин. tagCanFire приема candleOpenTime само за тези тагове -
+// LIVE детекторите не го подават и продължават по старата логика непроменени.
 const SIGNAL_REPEAT_COOLDOWN_MIN = 20;
-function tagCanFire(state, label) {
+function tagCanFire(state, label, candleOpenTime) {
   const s = state.tagCooldown?.[label];
   if (!s) return true;
-  return (Date.now() - s) >= SIGNAL_REPEAT_COOLDOWN_MIN * 60000;
+  const sAt = typeof s === 'number' ? s : s.at;
+  const sCandleOpenTime = typeof s === 'number' ? undefined : s.candleOpenTime;
+  if (candleOpenTime != null && sCandleOpenTime != null) {
+    return sCandleOpenTime !== candleOpenTime;
+  }
+  return (Date.now() - sAt) >= SIGNAL_REPEAT_COOLDOWN_MIN * 60000;
 }
-function markTagFired(state, label) {
+function markTagFired(state, label, candleOpenTime) {
   if (!state.tagCooldown) state.tagCooldown = {};
-  state.tagCooldown[label] = Date.now();
+  state.tagCooldown[label] = candleOpenTime != null ? { at: Date.now(), candleOpenTime } : Date.now();
 }
 
 // "Mario – Build-Up Detector + EMA Filter" - Early Build-Up на 1ч отваря 18ч
@@ -888,6 +895,13 @@ async function scanSymbolSignals(env, symbol) {
   const shift = calcShiftSignal(c1hClosed);
   const shiftDown = calcShiftDownSignal(c1hClosed);
   const impulse = calcImpulseSignal(c1hClosed, flush);
+  // openTime на съответната затворена свещ за всеки CONFIRMED/структурен таг -
+  // ползва се от tagCanFire/markTagFired за "1 сигнал на затворена свещ" (виж
+  // бележката там). LIVE таговете по-долу не пращат candleTime.
+  const shiftCandleTime = c1hClosed.length ? c1hClosed[c1hClosed.length - 1].openTime : null;
+  const confirmedCandleTime = c15Closed.length ? c15Closed[c15Closed.length - 1].openTime : null;
+  const impulseAtrCandleTime = c5Closed.length ? c5Closed[c5Closed.length - 1].openTime : null;
+  const buildUpCandleTime = c4hClosed.length ? c4hClosed[c4hClosed.length - 1].openTime : null;
 
   const state = await loadSymbolState(env, symbol);
 
@@ -973,16 +987,16 @@ async function scanSymbolSignals(env, symbol) {
   if (distribution) fired.push({ label: '🟠 DISTRIBUTION', direction: 'short' });
   if (squeeze) fired.push({ label: '🟣 SQUEEZE', direction: 'long' });
   if (dumpSqueeze) fired.push({ label: '🟣 DUMP SQUEEZE', direction: 'short' });
-  if (shift) fired.push({ label: '🟠 SHIFT', direction: 'long' });
-  if (shiftDown) fired.push({ label: '🟠 SHIFT ▼', direction: 'short' });
-  if (impulse.long) fired.push({ label: '🟢 IMPULSE LONG', direction: 'long' });
-  if (impulse.short) fired.push({ label: '🔴 IMPULSE SHORT', direction: 'short' });
+  if (shift) fired.push({ label: '🟠 SHIFT', direction: 'long', candleTime: shiftCandleTime });
+  if (shiftDown) fired.push({ label: '🟠 SHIFT ▼', direction: 'short', candleTime: shiftCandleTime });
+  if (impulse.long) fired.push({ label: '🟢 IMPULSE LONG', direction: 'long', candleTime: shiftCandleTime });
+  if (impulse.short) fired.push({ label: '🔴 IMPULSE SHORT', direction: 'short', candleTime: shiftCandleTime });
   if (early.long) fired.push({ label: '🟡 EARLY BUILD-UP ▲', direction: 'long' });
   if (early.short) fired.push({ label: '🟡 EARLY BUILD-UP ▼', direction: 'short' });
-  if (buildUpConfirmLong) fired.push({ label: '🟢 BUILD-UP CONFIRMED ▲', direction: 'long' });
-  if (buildUpConfirmShort) fired.push({ label: '🔴 BUILD-UP CONFIRMED ▼', direction: 'short' });
-  if (preImpulseLong) fired.push({ label: '🚀 PRE-IMPULSE ▲', direction: 'long' });
-  if (preImpulseShort) fired.push({ label: '💥 PRE-IMPULSE ▼', direction: 'short' });
+  if (buildUpConfirmLong) fired.push({ label: '🟢 BUILD-UP CONFIRMED ▲', direction: 'long', candleTime: buildUpCandleTime });
+  if (buildUpConfirmShort) fired.push({ label: '🔴 BUILD-UP CONFIRMED ▼', direction: 'short', candleTime: buildUpCandleTime });
+  if (preImpulseLong) fired.push({ label: '🚀 PRE-IMPULSE ▲', direction: 'long', candleTime: buildUpCandleTime });
+  if (preImpulseShort) fired.push({ label: '💥 PRE-IMPULSE ▼', direction: 'short', candleTime: buildUpCandleTime });
   if (warmTier === 'warm') fired.push({ label: `🔵 WARMING ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short' });
   if (warmTier === 'hot') fired.push({ label: `🟠 HOT ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short' });
   if (warmTier === 'super') fired.push({ label: `${warming.direction === 'up' ? '🟢' : '🔴'} SUPER ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short' });
@@ -995,13 +1009,13 @@ async function scanSymbolSignals(env, symbol) {
   if (oscBestShort) fired.push({ label: '🔴▼ MM-OSC BEST SHORT', direction: 'short' });
   if (oscReLong) fired.push({ label: '🟢△ MM-OSC RE-LONG', direction: 'long' });
   if (oscReShort) fired.push({ label: '🔴▽ MM-OSC RE-SHORT', direction: 'short' });
-  if (impulseAtr.long) fired.push({ label: '⚡ IMPULSE+ATR ▲', direction: 'long' });
-  if (impulseAtr.short) fired.push({ label: '⚡ IMPULSE+ATR ▼', direction: 'short' });
-  if (confirmed.long) fired.push({ label: '✅ CONFIRMED ▲', direction: 'long' });
-  if (confirmed.short) fired.push({ label: '✅ CONFIRMED ▼', direction: 'short' });
+  if (impulseAtr.long) fired.push({ label: '⚡ IMPULSE+ATR ▲', direction: 'long', candleTime: impulseAtrCandleTime });
+  if (impulseAtr.short) fired.push({ label: '⚡ IMPULSE+ATR ▼', direction: 'short', candleTime: impulseAtrCandleTime });
+  if (confirmed.long) fired.push({ label: '✅ CONFIRMED ▲', direction: 'long', candleTime: confirmedCandleTime });
+  if (confirmed.short) fired.push({ label: '✅ CONFIRMED ▼', direction: 'short', candleTime: confirmedCandleTime });
 
-  const newFired = fired.filter(sig => tagCanFire(state, sig.label));
-  newFired.forEach(sig => markTagFired(state, sig.label));
+  const newFired = fired.filter(sig => tagCanFire(state, sig.label, sig.candleTime));
+  newFired.forEach(sig => markTagFired(state, sig.label, sig.candleTime));
   const longHits = newFired.filter(sig => sig.direction === 'long').length;
   const shortHits = newFired.filter(sig => sig.direction === 'short').length;
 
