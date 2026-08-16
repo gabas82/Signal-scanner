@@ -871,6 +871,26 @@ async function fetchLongShortWorker(env, symbol) {
   }
 }
 
+// Funding rate (Binance USDT-M futures) - през relay-я по същата причина като
+// klines/ticker/longshort. Връща процент (fundingRate*100, напр. 0.075 значи
+// 0.075%), byte-identical единица на coin.funding в signal-scanner.html
+// (`parseFloat(fundR[0].fundingRate)*100`). Връща null при грешка/липсващи
+// данни, за да не чупи checkMacroSqueeze заради спомагателна инфо.
+async function fetchFundingWorker(env, symbol) {
+  try {
+    const r = await fetch(`${env.RELAY_URL}/funding?symbol=${symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const entry = Array.isArray(data) ? data[0] : null;
+    if (!entry) return null;
+    const funding = parseFloat(entry.fundingRate);
+    if (!isFinite(funding)) return null;
+    return funding * 100;
+  } catch (e) {
+    return null;
+  }
+}
+
 // WhatsApp/Android понякога разпознава "$" залепено директно за низ от цифри
 // като телефонен/тракинг номер и чупи и визуализацията, и copy-paste (изяжда
 // водещи символи - напр. "$65061.30" стана "5061.30", "$0.3520" стана
@@ -1370,6 +1390,72 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   }
 }
 
+// ---- Macro SQUEEZE следене (извиква се от scheduled()) ---------------------
+// Вариант 2 от предложението "ПРЕДЛОЖЕНИЯ ЗА СЛЕДВАЩА АКТУАЛИЗАЦИЯ" (Priority 1,
+// FINAL STATE ENGINE) - Scanner UI (calcSignal() в signal-logic.js) и Worker-ът
+// мерят фундаментално различни неща (macro/funding-базирано срещу candle-
+// детектори + SIGNAL_WEIGHTS), затова пълно обединяване в единна логика не е
+// прост рефакторинг (виж PR #56). Вместо да пипаме съществуващите детектори/
+// SIGNAL_WEIGHTS/SIGNAL_FAMILY_MAX/cooldown-и, Worker-ът получава ТОЧНО СЪЩАТА
+// SQUEEZE проверка като Scanner UI-то (funding rate + балансирани Long/Short
+// позиции), напълно отделна и независима от съществуващия LONG/SHORT поток -
+// собствен KV state ключ (macrosqueeze:SYMBOL, не sigstate:SYMBOL), собствен
+// cooldown, собствено WhatsApp известие. НЕ участва в MIN_NOTIFY_SCORE/
+// newFired/longScore/shortScore на checkMarketSignals по-горе.
+const MACRO_SQUEEZE_FUNDING_MIN = 0.06; // същия праг като calcSignal() в signal-logic.js:570
+const MACRO_SQUEEZE_BALANCE_MAX_DEV = 15; // |longPct-50| < 15, същия праг
+// Funding rate се обновява на Binance на всеки 8ч, а не при всеки 5-мин cron
+// тик - 4ч cooldown е достатъчен да не спамва многократно, докато условието
+// остане вярно между две funding обновявания.
+const MACRO_SQUEEZE_COOLDOWN_MIN = 240;
+
+function macroSqueezeCanFire(state) {
+  const s = state.macroSqueezeCooldown;
+  if (!s) return true;
+  return (Date.now() - s.at) >= MACRO_SQUEEZE_COOLDOWN_MIN * 60000;
+}
+function markMacroSqueezeFired(state) {
+  state.macroSqueezeCooldown = { at: Date.now() };
+}
+async function loadMacroSqueezeState(env, symbol) {
+  if (!env.ALERT_STATE) return {};
+  const raw = await env.ALERT_STATE.get(`macrosqueeze:${symbol}`);
+  return raw ? JSON.parse(raw) : {};
+}
+async function saveMacroSqueezeState(env, symbol, state) {
+  if (!env.ALERT_STATE) return;
+  await env.ALERT_STATE.put(`macrosqueeze:${symbol}`, JSON.stringify(state));
+}
+
+async function checkMacroSqueeze(env, watchlist = WATCHLIST) {
+  for (const pos of watchlist) {
+    try {
+      const [funding, longShort] = await Promise.all([
+        fetchFundingWorker(env, pos.symbol),
+        fetchLongShortWorker(env, pos.symbol),
+      ]);
+      if (funding == null || !longShort) continue;
+      const longPct = parseFloat(longShort.longPct);
+      const isSqueeze = funding > MACRO_SQUEEZE_FUNDING_MIN && Math.abs(longPct - 50) < MACRO_SQUEEZE_BALANCE_MAX_DEV;
+      if (!isSqueeze) continue;
+      const state = await loadMacroSqueezeState(env, pos.symbol);
+      if (!macroSqueezeCanFire(state)) continue;
+      const symbolNoUsdt = pos.symbol.replace('USDT', '');
+      const lines = [
+        '🟡 SQUEEZE',
+        symbolNoUsdt,
+        `⚡ Funding: ${funding.toFixed(4)}%`,
+        `⚖️ Long/Short: ${longShort.longPct}% / ${longShort.shortPct}%`,
+        '──────────',
+        'Натрупване/напрежение (екстремен funding + балансирани позиции), без ясна LONG/SHORT посока още',
+      ];
+      await sendWhatsApp(env, lines.join('\n'));
+      markMacroSqueezeFired(state);
+      await saveMacroSqueezeState(env, pos.symbol, state);
+    } catch (e) { console.error(`Macro squeeze check error for ${pos.symbol}: ${e.message}`); }
+  }
+}
+
 // ---- DCA ниво следене (извиква се от scheduled()) --------------------------
 async function checkDcaLevels(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
@@ -1396,7 +1482,7 @@ async function checkDcaLevels(env, watchlist = WATCHLIST) {
   }
 }
 
-export { calcDCALevels, checkDcaLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals };
+export { calcDCALevels, checkDcaLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals, checkMacroSqueeze };
 
 export default {
   async fetch(request, env) {
@@ -1550,6 +1636,6 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env)]));
+    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env)]));
   }
 };
