@@ -1225,8 +1225,17 @@ async function scanSymbolSignals(env, symbol) {
   if (shiftDown) fired.push({ label: '🟠 SHIFT ▼', direction: 'short', weight: SIGNAL_WEIGHTS.shiftDown, family: 'structure', candleTime: shiftCandleTime, type: 'shiftDown' });
   if (impulse.long) fired.push({ label: '🟢 IMPULSE LONG', direction: 'long', weight: SIGNAL_WEIGHTS.impulse, family: 'impulseFamily', candleTime: shiftCandleTime, type: 'impulse' });
   if (impulse.short) fired.push({ label: '🔴 IMPULSE SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.impulse, family: 'impulseFamily', candleTime: shiftCandleTime, type: 'impulse' });
-  if (early.long) fired.push({ label: '🟡 EARLY BUILD-UP ▲', direction: 'long', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null, type: 'earlyBuildUp' });
-  if (early.short) fired.push({ label: '🟡 EARLY BUILD-UP ▼', direction: 'short', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null, type: 'earlyBuildUp' });
+  // т.9 продължение - buildUpCanArm по-горе вече пази арминга на Build-Up
+  // прозореца от двусмисления случай early.long===early.short===true, но
+  // самите EARLY BUILD-UP▲/▼ сигнали по-долу бяха независими if-ове и
+  // продължаваха да могат да гръмнат ЕДНОВРЕМЕННО в такъв случай - реално
+  // наблюдавано в известие за INJ (choppy/свиващ се пазар), добавяйки 0.50т
+  // едновременно в LONG и SHORT без реално основание (двете "ранни
+  // предупреждения" са взаимно противоречиви, не независими доказателства).
+  // Сега EARLY BUILD-UP гърми само при еднозначна посока, като арминга.
+  const earlyUnambiguous = early.long !== early.short;
+  if (earlyUnambiguous && early.long) fired.push({ label: '🟡 EARLY BUILD-UP ▲', direction: 'long', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null, type: 'earlyBuildUp' });
+  if (earlyUnambiguous && early.short) fired.push({ label: '🟡 EARLY BUILD-UP ▼', direction: 'short', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null, type: 'earlyBuildUp' });
   if (buildUpConfirmLong) fired.push({ label: '🟢 BUILD-UP CONFIRMED ▲', direction: 'long', weight: SIGNAL_WEIGHTS.buildUpConfirmed, family: 'structure', candleTime: buildUpCandleTime, type: 'buildUpConfirmed' });
   if (buildUpConfirmShort) fired.push({ label: '🔴 BUILD-UP CONFIRMED ▼', direction: 'short', weight: SIGNAL_WEIGHTS.buildUpConfirmed, family: 'structure', candleTime: buildUpCandleTime, type: 'buildUpConfirmed' });
   if (preImpulseLong) fired.push({ label: '🚀 PRE-IMPULSE ▲', direction: 'long', weight: SIGNAL_WEIGHTS.preImpulse, family: 'structure', candleTime: buildUpCandleTime, type: 'preImpulse' });
