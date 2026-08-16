@@ -81,6 +81,19 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (url.pathname === '/funding') {
+    if (!requireToken(url, res)) return;
+    const symbol = url.searchParams.get('symbol');
+    if (!symbol) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'symbol is required' }));
+      return;
+    }
+    const target = `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=1`;
+    proxyToBinance(target, res);
+    return;
+  }
+
   if (url.pathname === '/longshort') {
     if (!requireToken(url, res)) return;
     const symbol = url.searchParams.get('symbol');
