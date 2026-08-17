@@ -32,6 +32,14 @@ const WATCHLIST = [
   { symbol: 'WLDUSDT' },
   { symbol: 'OPUSDT' },
   { symbol: 'ARKMUSDT' },
+  { symbol: 'BNBUSDT' },
+  { symbol: 'XRPUSDT' },
+  { symbol: 'LINKUSDT' },
+  { symbol: 'NEARUSDT' },
+  { symbol: 'ETCUSDT' },
+  { symbol: 'AAVEUSDT' },
+  { symbol: 'RENDERUSDT' },
+  { symbol: 'ALGOUSDT' },
 ];
 
 const DCA_ALERT_COOLDOWN_MS = 24 * 3600000; // не повтаря едно и също DCA ниво по-често от 24ч
