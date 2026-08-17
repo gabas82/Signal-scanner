@@ -1,0 +1,225 @@
+//@version=6
+indicator("Signal Scanner - Entries (IMPULSE+ATR / CONFIRMED)", shorttitle="SigScan Entries", overlay=true, max_labels_count=200)
+
+// ============================================================
+// ENTRY SIGNAL SCANNER
+// Pine порт на IMPULSE+ATR (calcImpulseAtrSignal) и CONFIRMED
+// (calcConfirmedSignal) от ../signal-logic.js - двата "структурни"
+// детектора в Worker-а, които гледат само ЗАТВОРЕНИ свещи (за разлика
+// от WARMING/HOT/MM-OSC, които са "LIVE" и реагират на текущата,
+// още отворена свещ). Тук: LONG/SHORT стрелка на входа + TP1/TP2/TP3
+// (по подразбиране % стълбата от TP_PCTS в worker.js) + ATR chandelier
+// trailing stop, който стъпва само в полза на позицията (никога назад),
+// визуално в стила на платените "GG-Shot" сигнални канали, само за
+// лична употреба.
+//
+// ta.rsi()/ta.atr()/ta.ema() в Pine вече са Wilder RMA/експоненциално
+// изгладени по подразбиране - точно затова worker.js/signal-logic.js
+// бяха пренаписани да ползват Wilder RMA (виж коментарите там) - тук
+// не се налага ръчно RSI/ATR преизчисляване, вградените функции вече
+// съвпадат.
+// ============================================================
+
+// ---------------- IMPULSE+ATR ----------------
+grpImpulse = "IMPULSE+ATR"
+volLen         = input.int(20, "Обемен MA период", group=grpImpulse)
+impulseVolMult = input.float(2.5, "Обемен spike множител", group=grpImpulse)
+impulseBodyPct = input.float(0.6, "Мин. тяло/диапазон дял (0-1)", minval=0, maxval=1, group=grpImpulse)
+atrLen         = input.int(14, "ATR период (gate)", group=grpImpulse)
+atrMinPct      = input.float(0.15, "Мин. ATR% ('не е твърде тихо')", group=grpImpulse)
+atrMaxPct      = input.float(3.0, "Макс. ATR% ('не е екстремна волатилност')", group=grpImpulse)
+
+// ---------------- CONFIRMED ----------------
+grpConfirmed = "CONFIRMED (pullback continuation)"
+useConfirmed = input.bool(true, "Включи CONFIRMED тригер", group=grpConfirmed)
+entryTF      = input.timeframe("15", "Confirm timeframe (EMA20 cross)", group=grpConfirmed)
+regimeTF     = input.timeframe("60", "HTF regime timeframe", group=grpConfirmed)
+emaFastLen   = input.int(20, "EMA бърза", group=grpConfirmed)
+emaMidLen    = input.int(50, "EMA бавна", group=grpConfirmed)
+useHTFRegime = input.bool(true, "Изисквай HTF regime sync", group=grpConfirmed)
+
+// ---------------- TAKE PROFIT ----------------
+grpTP = "Take Profit"
+useFixedPct = input.bool(true, "Фиксирана % стълба (TP_PCTS стил)", group=grpTP)
+tp1Pct = input.float(1.26, "TP1 %", group=grpTP)
+tp2Pct = input.float(2.34, "TP2 %", group=grpTP)
+tp3Pct = input.float(3.58, "TP3 %", group=grpTP)
+tp1AtrMult = input.float(1.5, "TP1 x ATR (ако не е фиксиран %)", group=grpTP)
+tp2AtrMult = input.float(2.5, "TP2 x ATR", group=grpTP)
+tp3AtrMult = input.float(4.0, "TP3 x ATR", group=grpTP)
+closeOnTp3 = input.bool(true, "Затвори позицията напълно при TP3", group=grpTP)
+moveToBreakevenAtTp1 = input.bool(true, "Стопа -> breakeven след TP1", group=grpTP)
+
+// ---------------- TRAILING STOP ----------------
+grpStop = "Trailing Stop"
+trailAtrLen  = input.int(14, "ATR период (trail)", group=grpStop)
+trailAtrMult = input.float(2.5, "ATR множител (chandelier)", group=grpStop)
+
+// ---------------- ALERTS ----------------
+grpAlert = "Alerts"
+sendAlerts = input.bool(true, "Прати alert() JSON при всяко събитие", group=grpAlert)
+
+// ============================================================
+// IMPULSE+ATR (текущия chart timeframe, само затворена свещ)
+// ============================================================
+volMA = ta.sma(volume, volLen)
+atr   = ta.atr(atrLen)
+atrPct = atr / close * 100
+volatilityOK = atrPct >= atrMinPct and atrPct <= atrMaxPct
+rng = math.max(high - low, syminfo.mintick)
+impulseCandle = math.abs(close - open) / rng >= impulseBodyPct
+impulseVol = volume >= volMA * impulseVolMult
+impulseGate = impulseCandle and impulseVol and volatilityOK
+impulseLongRaw  = impulseGate and close > high[1]
+impulseShortRaw = impulseGate and close < low[1]
+impulseLong  = impulseLongRaw  and barstate.isconfirmed
+impulseShort = impulseShortRaw and barstate.isconfirmed
+
+// ============================================================
+// CONFIRMED (entryTF EMA20 cross + regimeTF EMA sync)
+// ============================================================
+f_confirmedLong() =>
+    e20 = ta.ema(close, emaFastLen)
+    e50 = ta.ema(close, emaMidLen)
+    ta.crossover(close, e20) and e20 > e50
+
+f_confirmedShort() =>
+    e20 = ta.ema(close, emaFastLen)
+    e50 = ta.ema(close, emaMidLen)
+    ta.crossunder(close, e20) and e20 < e50
+
+confirmedLongRaw  = useConfirmed ? request.security(syminfo.tickerid, entryTF, f_confirmedLong(), lookahead=barmerge.lookahead_off) : false
+confirmedShortRaw = useConfirmed ? request.security(syminfo.tickerid, entryTF, f_confirmedShort(), lookahead=barmerge.lookahead_off) : false
+regimeBull = request.security(syminfo.tickerid, regimeTF, ta.ema(close, emaFastLen) > ta.ema(close, emaMidLen), lookahead=barmerge.lookahead_off)
+regimeBear = request.security(syminfo.tickerid, regimeTF, ta.ema(close, emaFastLen) < ta.ema(close, emaMidLen), lookahead=barmerge.lookahead_off)
+confirmedLong  = confirmedLongRaw  and (not useHTFRegime or regimeBull)
+confirmedShort = confirmedShortRaw and (not useHTFRegime or regimeBear)
+
+longTrigger  = impulseLong  or confirmedLong
+shortTrigger = impulseShort or confirmedShort
+
+// ============================================================
+// STATE MACHINE (1 отворена позиция наведнъж, само за визуализация)
+// ============================================================
+var bool inLong = false
+var bool inShort = false
+var float entryPrice = na
+var float trailStop = na
+var float extreme = na
+var bool tp1Hit = false
+var bool tp2Hit = false
+var bool tp3Hit = false
+var float tp1Level = na
+var float tp2Level = na
+var float tp3Level = na
+
+trailAtr = ta.atr(trailAtrLen)
+
+f_tpLevel(base, pct, atrMult, isLong) =>
+    useFixedPct ? (isLong ? base * (1 + pct / 100) : base * (1 - pct / 100)) : (isLong ? base + atrMult * trailAtr : base - atrMult * trailAtr)
+
+newLongEntry  = longTrigger  and not inLong and not inShort
+newShortEntry = shortTrigger and not inShort and not inLong
+
+if newLongEntry
+    inLong := true
+    inShort := false
+    entryPrice := close
+    extreme := high
+    trailStop := low - trailAtrMult * trailAtr
+    tp1Hit := false
+    tp2Hit := false
+    tp3Hit := false
+    tp1Level := f_tpLevel(close, tp1Pct, tp1AtrMult, true)
+    tp2Level := f_tpLevel(close, tp2Pct, tp2AtrMult, true)
+    tp3Level := f_tpLevel(close, tp3Pct, tp3AtrMult, true)
+    if sendAlerts
+        alert("{\"symbol\":\"" + syminfo.ticker + "\",\"type\":\"entry\",\"side\":\"long\",\"price\":" + str.tostring(entryPrice) + ",\"tp1\":" + str.tostring(tp1Level) + ",\"tp2\":" + str.tostring(tp2Level) + ",\"tp3\":" + str.tostring(tp3Level) + ",\"stop\":" + str.tostring(trailStop) + ",\"time\":\"" + str.format_time(time, "yyyy-MM-dd HH:mm") + "\"}", alert.freq_once_per_bar_close)
+
+if newShortEntry
+    inShort := true
+    inLong := false
+    entryPrice := close
+    extreme := low
+    trailStop := high + trailAtrMult * trailAtr
+    tp1Hit := false
+    tp2Hit := false
+    tp3Hit := false
+    tp1Level := f_tpLevel(close, tp1Pct, tp1AtrMult, false)
+    tp2Level := f_tpLevel(close, tp2Pct, tp2AtrMult, false)
+    tp3Level := f_tpLevel(close, tp3Pct, tp3AtrMult, false)
+    if sendAlerts
+        alert("{\"symbol\":\"" + syminfo.ticker + "\",\"type\":\"entry\",\"side\":\"short\",\"price\":" + str.tostring(entryPrice) + ",\"tp1\":" + str.tostring(tp1Level) + ",\"tp2\":" + str.tostring(tp2Level) + ",\"tp3\":" + str.tostring(tp3Level) + ",\"stop\":" + str.tostring(trailStop) + ",\"time\":\"" + str.format_time(time, "yyyy-MM-dd HH:mm") + "\"}", alert.freq_once_per_bar_close)
+
+if inLong
+    if not tp1Hit and high >= tp1Level
+        tp1Hit := true
+        label.new(bar_index, tp1Level, "TP1 ✓ " + str.tostring(tp1Level, format.mintick), style=label.style_label_left, color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+        if sendAlerts
+            alert("{\"symbol\":\"" + syminfo.ticker + "\",\"type\":\"tp1\",\"side\":\"long\",\"price\":" + str.tostring(tp1Level) + ",\"time\":\"" + str.format_time(time, "yyyy-MM-dd HH:mm") + "\"}", alert.freq_once_per_bar_close)
+    if not tp2Hit and high >= tp2Level
+        tp2Hit := true
+        label.new(bar_index, tp2Level, "TP2 ✓ " + str.tostring(tp2Level, format.mintick), style=label.style_label_left, color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+        if sendAlerts
+            alert("{\"symbol\":\"" + syminfo.ticker + "\",\"type\":\"tp2\",\"side\":\"long\",\"price\":" + str.tostring(tp2Level) + ",\"time\":\"" + str.format_time(time, "yyyy-MM-dd HH:mm") + "\"}", alert.freq_once_per_bar_close)
+    if not tp3Hit and high >= tp3Level
+        tp3Hit := true
+        label.new(bar_index, tp3Level, "TP3 ✓ " + str.tostring(tp3Level, format.mintick), style=label.style_label_left, color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+        if sendAlerts
+            alert("{\"symbol\":\"" + syminfo.ticker + "\",\"type\":\"tp3\",\"side\":\"long\",\"price\":" + str.tostring(tp3Level) + ",\"time\":\"" + str.format_time(time, "yyyy-MM-dd HH:mm") + "\"}", alert.freq_once_per_bar_close)
+
+    extreme := math.max(extreme, high)
+    trailStop := math.max(trailStop, extreme - trailAtrMult * trailAtr)
+    if moveToBreakevenAtTp1 and tp1Hit
+        trailStop := math.max(trailStop, entryPrice)
+
+    if low <= trailStop
+        label.new(bar_index, trailStop, "STOP ✕ " + str.tostring(trailStop, format.mintick), style=label.style_label_left, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+        if sendAlerts
+            alert("{\"symbol\":\"" + syminfo.ticker + "\",\"type\":\"stop\",\"side\":\"long\",\"price\":" + str.tostring(trailStop) + ",\"time\":\"" + str.format_time(time, "yyyy-MM-dd HH:mm") + "\"}", alert.freq_once_per_bar_close)
+        inLong := false
+    else if closeOnTp3 and tp3Hit
+        inLong := false
+
+if inShort
+    if not tp1Hit and low <= tp1Level
+        tp1Hit := true
+        label.new(bar_index, tp1Level, "TP1 ✓ " + str.tostring(tp1Level, format.mintick), style=label.style_label_left, color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+        if sendAlerts
+            alert("{\"symbol\":\"" + syminfo.ticker + "\",\"type\":\"tp1\",\"side\":\"short\",\"price\":" + str.tostring(tp1Level) + ",\"time\":\"" + str.format_time(time, "yyyy-MM-dd HH:mm") + "\"}", alert.freq_once_per_bar_close)
+    if not tp2Hit and low <= tp2Level
+        tp2Hit := true
+        label.new(bar_index, tp2Level, "TP2 ✓ " + str.tostring(tp2Level, format.mintick), style=label.style_label_left, color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+        if sendAlerts
+            alert("{\"symbol\":\"" + syminfo.ticker + "\",\"type\":\"tp2\",\"side\":\"short\",\"price\":" + str.tostring(tp2Level) + ",\"time\":\"" + str.format_time(time, "yyyy-MM-dd HH:mm") + "\"}", alert.freq_once_per_bar_close)
+    if not tp3Hit and low <= tp3Level
+        tp3Hit := true
+        label.new(bar_index, tp3Level, "TP3 ✓ " + str.tostring(tp3Level, format.mintick), style=label.style_label_left, color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+        if sendAlerts
+            alert("{\"symbol\":\"" + syminfo.ticker + "\",\"type\":\"tp3\",\"side\":\"short\",\"price\":" + str.tostring(tp3Level) + ",\"time\":\"" + str.format_time(time, "yyyy-MM-dd HH:mm") + "\"}", alert.freq_once_per_bar_close)
+
+    extreme := math.min(extreme, low)
+    trailStop := math.min(trailStop, extreme + trailAtrMult * trailAtr)
+    if moveToBreakevenAtTp1 and tp1Hit
+        trailStop := math.min(trailStop, entryPrice)
+
+    if high >= trailStop
+        label.new(bar_index, trailStop, "STOP ✕ " + str.tostring(trailStop, format.mintick), style=label.style_label_left, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+        if sendAlerts
+            alert("{\"symbol\":\"" + syminfo.ticker + "\",\"type\":\"stop\",\"side\":\"short\",\"price\":" + str.tostring(trailStop) + ",\"time\":\"" + str.format_time(time, "yyyy-MM-dd HH:mm") + "\"}", alert.freq_once_per_bar_close)
+        inShort := false
+    else if closeOnTp3 and tp3Hit
+        inShort := false
+
+// ============================================================
+// ВИЗУАЛИЗАЦИЯ
+// ============================================================
+plotshape(newLongEntry, title="LONG", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.small, text="LONG")
+plotshape(newShortEntry, title="SHORT", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="SHORT")
+
+inPos = inLong or inShort
+plot(inPos ? entryPrice : na, title="Entry", style=plot.style_circles, color=color.new(color.white, 60), linewidth=1)
+plot(inPos ? tp1Level : na, title="TP1", color=color.new(color.teal, 20), linewidth=1)
+plot(inPos ? tp2Level : na, title="TP2", color=color.new(color.teal, 20), linewidth=1)
+plot(inPos ? tp3Level : na, title="TP3", color=color.new(color.teal, 20), linewidth=1)
+plot(inPos ? trailStop : na, title="Trailing Stop", style=plot.style_stepline, color=color.new(color.red, 0), linewidth=2)

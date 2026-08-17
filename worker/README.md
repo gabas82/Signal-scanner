@@ -126,6 +126,19 @@ Dashboard → orange-grass-d809 → **Settings → Triggers → Cron Triggers �
 
 Без валиден `token` заявката връща 401 — пази URL-а по същия начин като останалите тайни ключове.
 
+## ENTRY SIGNAL SCANNER (`worker/entry-signals.pine`)
+
+Отделен overlay индикатор за директно чертане на входа върху графиката (LONG/SHORT стрелка + TP1/TP2/TP3 + trailing stop линия), в стила на платените сигнални канали, но за лична употреба. Не праща данни към Worker-а — изцяло самостоятелен `alert()` JSON (виж по-долу), нужно е ръчно окабеляване, ако искаш и WhatsApp известие за него.
+
+Логика (Pine порт на структурните детектори от `signal-logic.js`, byte-parity доколкото Pine built-in-ите позволяват):
+- **IMPULSE+ATR** (`calcImpulseAtrSignal`): пробив на предходния бар + голямо тяло + обемен spike + ATR% "здравословен диапазон" филтър, само на chart timeframe-а, само на затворена свещ (`barstate.isconfirmed`).
+- **CONFIRMED** (`calcConfirmedSignal`): EMA20 pullback continuation на configurable "Confirm timeframe" (по подразбиране 15м) през `request.security(..., lookahead=barmerge.lookahead_off)`, плюс по избор HTF regime sync (по подразбиране 1ч EMA20>EMA50).
+- Двата тригера са `OR`-нати за входа — влиза при първия, който гръмне.
+
+TP1/TP2/TP3 по подразбиране следват същата фиксирана % стълба като `TP_PCTS` в `worker.js` (1.26%/2.34%/3.58%) — превключваем на ATR-мултиплайър вариант с `useFixedPct=false`. Trailing stop-ът е ATR chandelier (highest-high/lowest-low от входа минус/плюс ATR×мултиплайър), стъпва само в полза на позицията, по избор скача на breakeven след TP1.
+
+Настройка на alert-а: същия модел като ALT CYCLE RADAR — TradingView → индикаторът → **Create Alert** → Condition **"Any alert() function call"**. `alert()` съобщенията пращат JSON от вида `{"symbol","type":"entry|tp1|tp2|tp3|stop","side":"long|short","price",...}`. Ако искаш push към WhatsApp за тези, `/tv-alert` в момента очаква ALT CYCLE RADAR-специфичната схема (`phase/score/btcD/...`) — ще трябва или отделен endpoint, или разклоняване по `payload.type` вътре в съществуващия handler, преди да сработи за този индикатор.
+
 ## Локални тестове
 
 Цялата логика (`calcDCALevels`, `checkDcaLevels`, `sendWhatsApp`, `scanSymbolSignals`, `checkMarketSignals`) е тествана локално с Node (mock `fetch` + mock KV), плюс diff-проверка байт-по-байт срещу оригиналните функции в `signal-logic.js` - виж историята на промените, ако искаш да пуснеш проверката пак.
