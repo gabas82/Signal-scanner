@@ -108,6 +108,51 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // За PHASE CYCLE ENGINE (Open Interest история - "OI Δ15m" от предложението).
+  if (url.pathname === '/openinterest') {
+    if (!requireToken(url, res)) return;
+    const symbol = url.searchParams.get('symbol');
+    const period = url.searchParams.get('period') || '5m';
+    const limit = url.searchParams.get('limit') || '30';
+    if (!symbol) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'symbol is required' }));
+      return;
+    }
+    const target = `https://fapi.binance.com/futures/data/openInterestHist?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(limit)}`;
+    proxyToBinance(target, res);
+    return;
+  }
+
+  // За PHASE CYCLE ENGINE (order book Buy/Sell стени - за wall bias с distance filter).
+  if (url.pathname === '/depth') {
+    if (!requireToken(url, res)) return;
+    const symbol = url.searchParams.get('symbol');
+    const limit = url.searchParams.get('limit') || '500';
+    if (!symbol) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'symbol is required' }));
+      return;
+    }
+    const target = `https://fapi.binance.com/fapi/v1/depth?symbol=${encodeURIComponent(symbol)}&limit=${encodeURIComponent(limit)}`;
+    proxyToBinance(target, res);
+    return;
+  }
+
+  // За PHASE CYCLE ENGINE (24ч % промяна - за OVERHEATED/NO CHASE детектора).
+  if (url.pathname === '/ticker24hr') {
+    if (!requireToken(url, res)) return;
+    const symbol = url.searchParams.get('symbol');
+    if (!symbol) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'symbol is required' }));
+      return;
+    }
+    const target = `https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
+    proxyToBinance(target, res);
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
 });
