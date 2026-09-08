@@ -107,6 +107,14 @@ async function sendWhatsApp(env, text) {
   try {
     const r = await fetch(url);
     const body = await r.text();
+    // Досега неуспешен HTTP отговор от TextMeBot (напр. изчерпан лимит, невалиден
+    // recipient, изтекла връзка) минаваше напълно тихо - връщаше се {ok:false,...},
+    // но НИКЪДЕ не се логваше, за разлика от мрежово изключение (catch по-долу).
+    // Реален случай: PHASE CYCLE ENGINE-ът прати 23 паралелни известия на първия
+    // си тик (по едно за всеки нов символ, липсваща стара фаза в KV), без нито
+    // едно да пристигне във WhatsApp - без това лог, нямаше как да се разбере
+    // дали грешката е в Worker кода или в отговора на самия TextMeBot.
+    if (!r.ok) console.error(`TextMeBot non-OK response: HTTP ${r.status}: ${body.slice(0, 300)}`);
     return { ok: r.ok, status: r.status, body: body.slice(0, 500) };
   } catch (e) {
     console.error('TextMeBot send error:', e);
