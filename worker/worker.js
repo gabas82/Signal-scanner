@@ -899,6 +899,226 @@ async function fetchFundingWorker(env, symbol) {
   }
 }
 
+// ============================================================================
+// PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
+// HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
+// LONG/SHORT точков резултат (SIGNAL_WEIGHTS/SIGNAL_FAMILY_MAX/computeDirectionConfidence
+// по-горе НЕ са пипнати с нищо тук) - класифицира монетата в една от 11 фази на
+// пазарния цикъл (WARMING → LONG WATCH/SETUP → STRONG LONG → OVERHEATED/NO CHASE →
+// TOP WATCH → SHORT WATCH/SETUP → STRONG SHORT → BREAKDOWN → пак компресия/
+// WARMING), вместо просто LONG/SHORT/MIXED. Праща СОБСТВЕНО, отделно WhatsApp
+// известие само при РЕАЛНА смяна на фазата (виж cyclePhaseCanFire по-долу) -
+// не участва в MIN_NOTIFY_SCORE/newFired на checkMarketSignals.
+// Три нови типа данни, които Worker-ът не тегли никъде другаде досега:
+// Open Interest история, order book Buy/Sell стени, 24ч % промяна.
+
+// Open Interest история (Binance futures/data/openInterestHist) - за "OI Δ15m"
+// от предложението (секция E: OI трябва да се чете СПРЯМО цената, не самостоятелно).
+// Връща масив {time, oi} във възходящ хронологичен ред (най-новото последно),
+// или null при грешка/липсващи данни.
+async function fetchOpenInterestHistWorker(env, symbol, period = '5m', limit = 6) {
+  try {
+    const r = await fetch(`${env.RELAY_URL}/openinterest?symbol=${symbol}&period=${period}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (!Array.isArray(data) || !data.length) return null;
+    return data.map(d => ({ time: d.timestamp, oi: parseFloat(d.sumOpenInterest) })).filter(d => isFinite(d.oi));
+  } catch (e) {
+    return null;
+  }
+}
+// % промяна на OI за последните `lookback` периода (по подразбиране 3x5м=15м,
+// точно "OI Δ15m" от предложението). null ако няма достатъчно история.
+function calcOiDeltaPct(oiHist, lookback = 3) {
+  if (!oiHist || oiHist.length < lookback + 1) return null;
+  const now = oiHist[oiHist.length - 1].oi;
+  const prev = oiHist[oiHist.length - 1 - lookback].oi;
+  if (!prev) return null;
+  return ((now - prev) / prev) * 100;
+}
+
+// Order book Buy/Sell стени (Binance futures/v1/depth) - PRIORITY F от предложението
+// ("ORDER BOOK WALL FILTER"): само стени в разумно разстояние (по подразбиране
+// 15%) от текущата цена се броят - далечни стени на +100%/+200% не трябва да
+// влияят на локалния bias (реалният проблем, докладван при AIXBT). Връща null
+// при грешка/липсващи данни, за да не чупи PHASE CYCLE заради спомагателна инфо.
+const ORDER_BOOK_WALL_MAX_DISTANCE_PCT = 15;
+async function fetchOrderBookWallsWorker(env, symbol, price) {
+  try {
+    const r = await fetch(`${env.RELAY_URL}/depth?symbol=${symbol}&limit=500&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (!Array.isArray(data.bids) || !Array.isArray(data.asks) || price == null) return null;
+    const inRange = ([p]) => Math.abs((parseFloat(p) - price) / price * 100) <= ORDER_BOOK_WALL_MAX_DISTANCE_PCT;
+    const buyWallUsd = data.bids.filter(inRange).reduce((sum, [p, q]) => sum + parseFloat(p) * parseFloat(q), 0);
+    const sellWallUsd = data.asks.filter(inRange).reduce((sum, [p, q]) => sum + parseFloat(p) * parseFloat(q), 0);
+    return { buyWallUsd, sellWallUsd };
+  } catch (e) {
+    return null;
+  }
+}
+
+// 24ч % промяна (Binance futures/v1/ticker/24hr) - за OVERHEATED/NO CHASE
+// детектора (секция C от предложението). Връща null при грешка/липсващи данни.
+async function fetch24hChangeWorker(env, symbol) {
+  try {
+    const r = await fetch(`${env.RELAY_URL}/ticker24hr?symbol=${symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const chg = parseFloat(data.priceChangePercent);
+    return isFinite(chg) ? chg : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Секция E от предложението - "OI ТРЯБВА ДА СЕ ТЪЛКУВА СПРЯМО ЦЕНАТА": не
+// ползваме OI Δ самостоятелно, само в комбинация с посоката на цената.
+// PRICE↑+OI↑ = продължение; PRICE↑+OI↓ = възможно изчерпване (затваряния);
+// PRICE↓+OI↑ = SHORT продължение; PRICE↓+OI↓ = flush/exhaustion (ликвидации).
+const OI_DELTA_SIGNIFICANT_PCT = 2; // праг под който Δ се смята за шум, не реална промяна
+function interpretOiPriceCross(priceUp, oiDeltaPct) {
+  if (oiDeltaPct == null) return 'unknown';
+  if (Math.abs(oiDeltaPct) < OI_DELTA_SIGNIFICANT_PCT) return 'flat';
+  const oiUp = oiDeltaPct > 0;
+  if (priceUp && oiUp) return 'long_continuation';
+  if (priceUp && !oiUp) return 'long_exhaustion_risk';
+  if (!priceUp && oiUp) return 'short_continuation';
+  return 'long_flush_or_exhaustion';
+}
+
+// "DEATH X" от предложението - Death Cross на дневна база (EMA50 пресича ЛОЛУ
+// EMA200) като ЕДНОКРАТНО СЪБИТИЕ (crossunder), не просто "текущ bear режим"
+// (за това вече си имаме calcEmaTrendFilter.bear по-горе - steady-state режим,
+// не самото пресичане). candles трябва да са ЗАТВОРЕНИ дневни свещи.
+function calcDeathCross(candles, opts = {}) {
+  const fastLen = opts.fastLen ?? 50, slowLen = opts.slowLen ?? 200;
+  const closes = candles.map(c => c.close);
+  const fastSeries = calcEMASeries(closes, fastLen);
+  const slowSeries = calcEMASeries(closes, slowLen);
+  const n = candles.length;
+  const f0 = fastSeries[n - 1], f1 = fastSeries[n - 2], s0 = slowSeries[n - 1], s1 = slowSeries[n - 2];
+  if (f0 == null || f1 == null || s0 == null || s1 == null) return false;
+  return f1 >= s1 && f0 < s0;
+}
+
+// Секция C от предложението - "OVERHEATED / NO CHASE": прекомерен 24ч/7д ръст
+// САМ ПО СЕБЕ СИ не е SHORT сигнал, но комбиниран с голямо разстояние от EMA50
+// (дневна) блокира нови LONG входове, без все още да е потвърдено обръщане.
+// chg7d се смята от вече наличните дневни свещи (без нужда от допълнителна
+// заявка) - close сега срещу close преди 7 затворени дневни свещи.
+const OVERHEATED_CHG24H_PCT = 15;
+const OVERHEATED_CHG7D_PCT = 40;
+const OVERHEATED_EMA_DISTANCE_PCT = 12;
+function calcChg7dPct(candles1dClosed) {
+  const n = candles1dClosed.length;
+  if (n < 8) return null;
+  const now = candles1dClosed[n - 1].close, prev = candles1dClosed[n - 8].close;
+  if (!prev) return null;
+  return ((now - prev) / prev) * 100;
+}
+function calcOverheated(chg24h, chg7d, price, ema50d) {
+  const bigMove = (chg24h != null && chg24h >= OVERHEATED_CHG24H_PCT) || (chg7d != null && chg7d >= OVERHEATED_CHG7D_PCT);
+  if (!bigMove) return false;
+  if (ema50d == null || price == null || ema50d <= 0) return false;
+  return ((price - ema50d) / ema50d) * 100 >= OVERHEATED_EMA_DISTANCE_PCT;
+}
+
+// Секция B - "TOP WATCH фактори" (gate преди да броим SHORT CONFIRMATION):
+// прекалено положителен funding ИЛИ прекалено презареден Long/Short към LONG
+// ИЛИ вече установен OVERHEATED - кое да е от трите отваря TOP WATCH прозореца.
+const TOP_WATCH_FUNDING_MIN = 0.06; // същия праг като MACRO_SQUEEZE_FUNDING_MIN
+const TOP_WATCH_LONGPCT_MIN = 65;
+function isTopWatch(overheated, funding, longPct) {
+  return overheated || (funding != null && funding >= TOP_WATCH_FUNDING_MIN) || (longPct != null && longPct >= TOP_WATCH_LONGPCT_MIN);
+}
+
+// Секция F - Sell стена трябва да доминира с разумен марж (не само 51%/49%),
+// за да се брои като реален SHORT confirmation фактор, огледално на
+// calcWallBias/DOMINANCE_RATIO=1.5 в signal-logic.js.
+const WALL_DOMINANCE_RATIO = 1.5;
+
+// LONG_SCORE (Секция A "IMPULSE HUNTER") - 7 точки, подбрани от предложението
+// с приоритет на вече съществуващи, тествани детектори (WARMING/EARLY BUILD-UP/
+// BUILD-UP CONFIRMED/PRE-IMPULSE/4H CLUSTER вече покриват COMPRESSION/CASCADE
+// имплицитно - COMPRESSION е вграден гейт в calcWarmingTier, 4H CLUSTER UP е
+// calc4HBigVolume). Новите данни (OI, funding, wall bias) добавят точно 2
+// допълнителни точки. Скàлата на изхода следва точно предложението:
+// 0-2=NEUTRAL, 3=WATCH, 4=SETUP, 5+=STRONG.
+function calcCycleLongScore({ warmDirectionUp, earlyLong, buildUpConfirmLong, preImpulseLong, bigVol4hUp, oiCross, fundingOK, wallBiasLong }) {
+  let score = 0;
+  if (warmDirectionUp) score++;
+  if (earlyLong) score++;
+  if (buildUpConfirmLong) score++;
+  if (preImpulseLong) score++;
+  if (bigVol4hUp) score++;
+  if (oiCross === 'long_continuation') score++;
+  if (fundingOK && wallBiasLong) score++;
+  return score;
+}
+// SHORT_SCORE (Секция B "EXHAUSTION/TOP HUNTER") - оценява се САМО когато
+// isTopWatch() вече е true (виж checkMarketSignals/scanSymbolSignals по-долу) -
+// огледално на предложението, където SHORT CONFIRMATION идва СЛЕД TOP WATCH.
+function calcCycleShortScore({ deathCross, dmaBear, oiReversal, bearishStructureActive, sellWallDominant, longOverloaded, structuralShortConfirm }) {
+  let score = 0;
+  if (deathCross) score++;
+  if (dmaBear) score++;
+  if (oiReversal) score++;
+  if (bearishStructureActive) score++;
+  if (sellWallDominant) score++;
+  if (longOverloaded) score++;
+  if (structuralShortConfirm) score++;
+  return score;
+}
+
+// Секция G - крайният изход на картата (11 фази вместо просто LONG/SHORT/
+// NEUTRAL). Изчислява се НАНОВО всеки тик от текущите резултати (не строга
+// последователност от предишната фаза) - по-устойчиво от строг state machine,
+// който може да "заседне"; секция D диаграмата се получава естествено, защото
+// прагът на всяка следваща фаза е по-строг от предишната.
+const PHASE_LABELS = {
+  WARMING: '🟡 WARMING',
+  LONG_WATCH: '🟢 LONG WATCH',
+  LONG_SETUP: '🟢 LONG SETUP',
+  STRONG_LONG: '🚀 STRONG LONG',
+  OVERHEATED_NO_CHASE: '🔥 OVERHEATED — NO CHASE',
+  TOP_WATCH: '👀 TOP WATCH',
+  SHORT_WATCH: '🔴 SHORT WATCH',
+  SHORT_SETUP: '🔴 SHORT SETUP',
+  STRONG_SHORT: '💥 STRONG SHORT',
+  BREAKDOWN: '💥 BREAKDOWN',
+  NEUTRAL: '⚪ NEUTRAL / NO TRADE',
+};
+function computeCyclePhase({ longScore, shortScore, overheated, topWatch, warmTierActive, breakdownConfirmed }) {
+  if (topWatch && shortScore >= 5 && breakdownConfirmed) return 'BREAKDOWN';
+  if (topWatch && shortScore >= 5) return 'STRONG_SHORT';
+  if (topWatch && shortScore >= 4) return 'SHORT_SETUP';
+  if (topWatch && shortScore >= 3) return 'SHORT_WATCH';
+  if (topWatch) return 'TOP_WATCH';
+  if (overheated) return 'OVERHEATED_NO_CHASE';
+  if (longScore >= 5) return 'STRONG_LONG';
+  if (longScore >= 4) return 'LONG_SETUP';
+  if (longScore >= 3) return 'LONG_WATCH';
+  if (warmTierActive) return 'WARMING';
+  return 'NEUTRAL';
+}
+
+// Известие само при РЕАЛНА смяна на фазата (не при всеки тик, докато е в
+// същата фаза - иначе спам). ВАЖНО - НЯМА допълнителен времеви cooldown тук:
+// първи опит с плосък 60-мин cooldown погрешно блокираше и ЛЕГИТИМНА бърза
+// прогресия през фазите (напр. WARMING→LONG_WATCH→LONG_SETUP→STRONG_LONG за
+// 15-20 мин при истински бърз импулс - точно сценарият, който "IMPULSE HUNTER"
+// цели да хване рано), не само нежелано флип-флопване. Всеки от 7-те входни
+// фактора вече си има собствен cooldown/хистерезис по-горе (WARMING/EARLY
+// BUILD-UP/и т.н.), затова резкия tick-to-tick "флип-флоп" на самата ФАЗА е
+// естествено рядък - не е нужен допълнителен таймер тук.
+function cyclePhaseCanFire(state, newPhase) {
+  return state.cycle?.phase !== newPhase;
+}
+function markCyclePhase(state, newPhase) {
+  state.cycle = { phase: newPhase, at: Date.now() };
+}
+
 // WhatsApp/Android понякога разпознава "$" залепено директно за низ от цифри
 // като телефонен/тракинг номер и чупи и визуализацията, и copy-paste (изяжда
 // водещи символи - напр. "$65061.30" стана "5061.30", "$0.3520" стана
@@ -1106,6 +1326,7 @@ async function scanSymbolSignals(env, symbol) {
   const c5Closed = c5.slice(0, -1);
   const c1hClosed = c1h.slice(0, -1);
   const c4hClosed = c4h.slice(0, -1);
+  const c1dClosed = c1d.slice(0, -1); // за PHASE CYCLE ENGINE (Death Cross/50 DMA/chg7d) по-долу
 
   const rsi4h = c4h.length ? calcRSI(c4h.map(x=>x.close), 14) : null;
   const rsi1d = c1d.length ? calcRSI(c1d.map(x=>x.close), 14) : null;
@@ -1326,12 +1547,67 @@ async function scanSymbolSignals(env, symbol) {
   const { support, resistance } = calcSupportResistance(c1h, 20);
   const confidence = computeDirectionConfidence(longScore, shortScore);
 
+  // ---- PHASE CYCLE ENGINE (виж дефинициите на константите/функциите по-горе,
+  // непосредствено след fetchFundingWorker) - реюзва вече изчислените в тази
+  // функция detektori (warmTier/warming/bigVol4h/early/buildUpConfirmLong-Short/
+  // preImpulseLong-Short/confirmed/shiftDown), само 5 нови паралелни заявки за
+  // данните, които Worker-ът не тегли никъде другаде (OI/order book/24ч/
+  // Long-Short/funding - последните две вече се теглят от checkMacroSqueeze за
+  // друга цел, тук е отделно извикване, огледално на съществуващия прецедент).
+  // НЕ променя по никакъв начин longScore/shortScore/confidence по-горе.
+  const [oiHist, wallsRaw, chg24h, longShortCycle, fundingCycle] = await Promise.all([
+    fetchOpenInterestHistWorker(env, symbol),
+    fetchOrderBookWallsWorker(env, symbol, price),
+    fetch24hChangeWorker(env, symbol),
+    fetchLongShortWorker(env, symbol),
+    fetchFundingWorker(env, symbol),
+  ]);
+  const oiDeltaPct = calcOiDeltaPct(oiHist);
+  const oiCross = interpretOiPriceCross(warming.direction === 'up', oiDeltaPct);
+  const wallBiasLong = !!wallsRaw && wallsRaw.buyWallUsd > wallsRaw.sellWallUsd;
+  const sellWallDominant = !!wallsRaw && wallsRaw.sellWallUsd >= wallsRaw.buyWallUsd * WALL_DOMINANCE_RATIO;
+  const chg7d = calcChg7dPct(c1dClosed);
+  const ema50dSeries = calcEMASeries(c1dClosed.map(x => x.close), 50);
+  const ema50d = ema50dSeries.length ? ema50dSeries[ema50dSeries.length - 1] : null;
+  const overheated = calcOverheated(chg24h, chg7d, price, ema50d);
+  const cycleLongPct = longShortCycle ? parseFloat(longShortCycle.longPct) : null;
+  const topWatch = isTopWatch(overheated, fundingCycle, cycleLongPct);
+  const fundingOK = fundingCycle == null || fundingCycle < TOP_WATCH_FUNDING_MIN;
+  const deathCross = c1dClosed.length ? calcDeathCross(c1dClosed) : false;
+  const dmaBear = calcEmaTrendFilter(c1dClosed).bear;
+  const bearishStructureActive = (warmTier !== 'none' && warming.direction === 'down') || buildUpConfirmShort || preImpulseShort;
+  const structuralShortConfirm = shiftDown || confirmed.short;
+  const oiReversal = oiCross === 'short_continuation' || oiCross === 'long_exhaustion_risk';
+
+  const cycleLongScore = calcCycleLongScore({
+    warmDirectionUp: warmTier !== 'none' && warming.direction === 'up',
+    earlyLong: early.long,
+    buildUpConfirmLong, preImpulseLong,
+    bigVol4hUp: bigVol4h.active && bigVol4h.direction === 'up',
+    oiCross, fundingOK, wallBiasLong,
+  });
+  // SHORT_SCORE се смята САМО ако вече сме в TOP WATCH (секция B от
+  // предложението - SHORT CONFIRMATION идва СЛЕД TOP WATCH gate-а, не преди).
+  const cycleShortScore = topWatch ? calcCycleShortScore({
+    deathCross, dmaBear, oiReversal, bearishStructureActive, sellWallDominant,
+    longOverloaded: cycleLongPct != null && cycleLongPct >= TOP_WATCH_LONGPCT_MIN,
+    structuralShortConfirm,
+  }) : 0;
+  const cyclePhase = computeCyclePhase({
+    longScore: cycleLongScore, shortScore: cycleShortScore, overheated, topWatch,
+    warmTierActive: warmTier !== 'none',
+    breakdownConfirmed: structuralShortConfirm,
+  });
+  const cyclePhaseChanged = cyclePhaseCanFire(state, cyclePhase);
+  if (cyclePhaseChanged) markCyclePhase(state, cyclePhase);
+
   await saveSymbolState(env, symbol, state);
 
   return {
     newFired: newFired.map(sig => sig.label),
     activeFired: activeSignals.map(sig => sig.label),
     price, support, resistance, ...confidence,
+    cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore,
   };
 }
 
@@ -1341,7 +1617,7 @@ async function scanSymbolSignals(env, symbol) {
 async function checkMarketSignals(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore } = await scanSymbolSignals(env, pos.symbol);
       // MIN_NOTIFY_SCORE - самотен слаб сигнал вече не праща цяло известие,
       // само защото нещо е "активно" (виж бележката при MIN_NOTIFY_SCORE).
       // ACTIVE SIGNAL MEMORY (т.4 от спецификацията) - стари сигнали от паметта
@@ -1393,6 +1669,19 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
           lines.push(...previouslyActive);
         }
         await sendWhatsApp(env, lines.join('\n'));
+      }
+      // PHASE CYCLE ENGINE - изцяло отделно известие от горното, независимо
+      // от MIN_NOTIFY_SCORE/newFired на класическия LONG/SHORT поток. Праща се
+      // САМО при реална смяна на фазата (виж cyclePhaseCanFire в scanSymbolSignals).
+      if (cyclePhaseChanged) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const cycleLines = [
+          `🔮 ЦИКЪЛ: ${symbolNoUsdt}`,
+          `Фаза: ${PHASE_LABELS[cyclePhase]}`,
+          `LONG SCORE: ${cycleLongScore}/7`,
+          `SHORT SCORE: ${cycleShortScore}/7`,
+        ];
+        await sendWhatsApp(env, cycleLines.join('\n'));
       }
     } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }
   }
