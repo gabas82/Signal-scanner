@@ -921,6 +921,52 @@ async function fetchFundingWorker(env, symbol) {
   }
 }
 
+// Скорошни ликвидационни каскади (CoinGlass API - вече платен, CG_API_KEY
+// secret вече съществува за проксито в fetch() handler-а по-долу). Пряко
+// извикване, БЕЗ DigitalOcean relay - CoinGlass, за разлика от Binance, не
+// блокира Cloudflare Workers IP-та на ниво WAF (виж съществуващия CoinGlass
+// proxy път в fetch() handler-а - вика се директно, без relay, вече години).
+// "side" в отговора: 1=Buy (SHORT позиции са били принудително ликвидирани ->
+// форсирано купуване -> бичи натиск), 2=Sell (LONG позиции ликвидирани ->
+// форсирана продажба -> мечи натиск) - огледално на CoinGlass конвенцията.
+// ВАЖНО: точните query параметри и имена на полета в отговора са изведени
+// САМО от публичната CoinGlass документация (docs.coinglass.com/reference/
+// liquidation-order) - тази среда няма достъп до външни домейни, за да ги
+// тества на живо. Прагът LIQUIDATION_CASCADE_USD_MIN е първоначална преценка,
+// не калибрирана с реални данни - очаква се наблюдение и евентуална корекция
+// след deploy (вижда се и в PR описанието).
+async function fetchLiquidationOrdersWorker(env, symbol) {
+  try {
+    const r = await fetch(`https://open-api-v4.coinglass.com/api/futures/liquidation/order?symbol=${symbol}&exchange=Binance`, {
+      headers: { 'CG-API-KEY': env.CG_API_KEY },
+    });
+    if (!r.ok) return null;
+    const json = await r.json();
+    const data = Array.isArray(json?.data) ? json.data : null;
+    if (!data) return null;
+    return data
+      .map(d => ({ side: Number(d.side), usdValue: parseFloat(d.usd_value), time: Number(d.time) }))
+      .filter(d => isFinite(d.usdValue) && isFinite(d.time));
+  } catch (e) {
+    return null;
+  }
+}
+const LIQUIDATION_LOOKBACK_MIN = 15;
+const LIQUIDATION_CASCADE_USD_MIN = 500000; // 500хил. USD - първоначален праг, нужна калибрация с реални данни
+function calcLiquidationCascade(orders, opts = {}) {
+  const lookbackMin = opts.lookbackMin ?? LIQUIDATION_LOOKBACK_MIN;
+  const usdMin = opts.usdMin ?? LIQUIDATION_CASCADE_USD_MIN;
+  if (!orders || !orders.length) return { bullish: false, bearish: false, buySumUsd: 0, sellSumUsd: 0 };
+  const cutoff = Date.now() - lookbackMin * 60000;
+  let buySumUsd = 0, sellSumUsd = 0;
+  for (const o of orders) {
+    if (o.time < cutoff) continue;
+    if (o.side === 1) buySumUsd += o.usdValue;
+    else if (o.side === 2) sellSumUsd += o.usdValue;
+  }
+  return { bullish: buySumUsd >= usdMin, bearish: sellSumUsd >= usdMin, buySumUsd, sellSumUsd };
+}
+
 // ============================================================================
 // PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
 // HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
@@ -931,8 +977,8 @@ async function fetchFundingWorker(env, symbol) {
 // WARMING), вместо просто LONG/SHORT/MIXED. Праща СОБСТВЕНО, отделно WhatsApp
 // известие само при РЕАЛНА смяна на фазата (виж cyclePhaseCanFire по-долу) -
 // не участва в MIN_NOTIFY_SCORE/newFired на checkMarketSignals.
-// Три нови типа данни, които Worker-ът не тегли никъде другаде досега:
-// Open Interest история, order book Buy/Sell стени, 24ч % промяна.
+// Четири нови типа данни, които Worker-ът не тегли никъде другаде досега:
+// Open Interest история, order book Buy/Sell стени, 24ч % промяна, ликвидации.
 
 // Open Interest история (Binance futures/data/openInterestHist) - за "OI Δ15m"
 // от предложението (секция E: OI трябва да се чете СПРЯМО цената, не самостоятелно).
@@ -1092,16 +1138,16 @@ function calcMACDCrossover(candles, opts = {}) {
   return { bullish: m1 <= s1 && m0 > s0, bearish: m1 >= s1 && m0 < s0 };
 }
 
-// LONG_SCORE (Секция A "IMPULSE HUNTER") - 8 точки, подбрани от предложението
+// LONG_SCORE (Секция A "IMPULSE HUNTER") - 9 точки, подбрани от предложението
 // с приоритет на вече съществуващи, тествани детектори (WARMING/EARLY BUILD-UP/
 // BUILD-UP CONFIRMED/PRE-IMPULSE/4H CLUSTER вече покриват COMPRESSION/CASCADE
 // имплицитно - COMPRESSION е вграден гейт в calcWarmingTier, 4H CLUSTER UP е
-// calc4HBigVolume). Новите данни (OI, funding, wall bias, MACD) добавят 3
-// допълнителни точки. Скàлата на изхода следва предложението (0-2=NEUTRAL,
-// 3=WATCH, 4=SETUP, 5+=STRONG) - абсолютните прагове не са преизчислени за
-// новия максимум от 8 (вместо 7), умишлено: по-лесно достигане на STRONG с
-// допълнителния MACD фактор е приемливо, не грешка.
-function calcCycleLongScore({ warmDirectionUp, earlyLong, buildUpConfirmLong, preImpulseLong, bigVol4hUp, oiCross, fundingOK, wallBiasLong, macdBullishCross }) {
+// calc4HBigVolume). Новите данни (OI, funding, wall bias, MACD, ликвидационни
+// каскади) добавят 4 допълнителни точки. Скàлата на изхода следва предложението
+// (0-2=NEUTRAL, 3=WATCH, 4=SETUP, 5+=STRONG) - абсолютните прагове не са
+// преизчислени за новия максимум от 9 (вместо 7), умишлено: по-лесно
+// достигане на STRONG с допълнителните фактори е приемливо, не грешка.
+function calcCycleLongScore({ warmDirectionUp, earlyLong, buildUpConfirmLong, preImpulseLong, bigVol4hUp, oiCross, fundingOK, wallBiasLong, macdBullishCross, liquidationCascadeBullish }) {
   let score = 0;
   if (warmDirectionUp) score++;
   if (earlyLong) score++;
@@ -1111,13 +1157,15 @@ function calcCycleLongScore({ warmDirectionUp, earlyLong, buildUpConfirmLong, pr
   if (oiCross === 'long_continuation') score++;
   if (fundingOK && wallBiasLong) score++;
   if (macdBullishCross) score++;
+  if (liquidationCascadeBullish) score++;
   return score;
 }
 // SHORT_SCORE (Секция B "EXHAUSTION/TOP HUNTER") - оценява се САМО когато
 // isTopWatch() вече е true (виж checkMarketSignals/scanSymbolSignals по-долу) -
 // огледално на предложението, където SHORT CONFIRMATION идва СЛЕД TOP WATCH.
-// 8 точки (7 от предложението + MACD bearish crossunder, огледално на LONG_SCORE).
-function calcCycleShortScore({ deathCross, dmaBear, oiReversal, bearishStructureActive, sellWallDominant, longOverloaded, structuralShortConfirm, macdBearishCross }) {
+// 9 точки (7 от предложението + MACD bearish crossunder + ликвидационна каскада,
+// огледално на LONG_SCORE).
+function calcCycleShortScore({ deathCross, dmaBear, oiReversal, bearishStructureActive, sellWallDominant, longOverloaded, structuralShortConfirm, macdBearishCross, liquidationCascadeBearish }) {
   let score = 0;
   if (deathCross) score++;
   if (dmaBear) score++;
@@ -1127,6 +1175,7 @@ function calcCycleShortScore({ deathCross, dmaBear, oiReversal, bearishStructure
   if (longOverloaded) score++;
   if (structuralShortConfirm) score++;
   if (macdBearishCross) score++;
+  if (liquidationCascadeBearish) score++;
   return score;
 }
 
@@ -1167,7 +1216,7 @@ function computeCyclePhase({ longScore, shortScore, overheated, topWatch, warmTi
 // първи опит с плосък 60-мин cooldown погрешно блокираше и ЛЕГИТИМНА бърза
 // прогресия през фазите (напр. WARMING→LONG_WATCH→LONG_SETUP→STRONG_LONG за
 // 15-20 мин при истински бърз импулс - точно сценарият, който "IMPULSE HUNTER"
-// цели да хване рано), не само нежелано флип-флопване. Всеки от 8-те входни
+// цели да хване рано), не само нежелано флип-флопване. Всеки от 9-те входни
 // фактора вече си има собствен cooldown/хистерезис по-горе (WARMING/EARLY
 // BUILD-UP/и т.н.), затова резкия tick-to-tick "флип-флоп" на самата ФАЗА е
 // естествено рядък - не е нужен допълнителен таймер тук.
@@ -1614,12 +1663,13 @@ async function scanSymbolSignals(env, symbol) {
   // Long-Short/funding - последните две вече се теглят от checkMacroSqueeze за
   // друга цел, тук е отделно извикване, огледално на съществуващия прецедент).
   // НЕ променя по никакъв начин longScore/shortScore/confidence по-горе.
-  const [oiHist, wallsRaw, chg24h, longShortCycle, fundingCycle] = await Promise.all([
+  const [oiHist, wallsRaw, chg24h, longShortCycle, fundingCycle, liquidationOrders] = await Promise.all([
     fetchOpenInterestHistWorker(env, symbol),
     fetchOrderBookWallsWorker(env, symbol, price),
     fetch24hChangeWorker(env, symbol),
     fetchLongShortWorker(env, symbol),
     fetchFundingWorker(env, symbol),
+    fetchLiquidationOrdersWorker(env, symbol),
   ]);
   const oiDeltaPct = calcOiDeltaPct(oiHist);
   const oiCross = interpretOiPriceCross(warming.direction === 'up', oiDeltaPct);
@@ -1638,6 +1688,7 @@ async function scanSymbolSignals(env, symbol) {
   const structuralShortConfirm = shiftDown || confirmed.short;
   const oiReversal = oiCross === 'short_continuation' || oiCross === 'long_exhaustion_risk';
   const macdCross = c1dClosed.length ? calcMACDCrossover(c1dClosed) : { bullish: false, bearish: false };
+  const liquidationCascade = calcLiquidationCascade(liquidationOrders);
 
   const cycleLongScore = calcCycleLongScore({
     warmDirectionUp: warmTier !== 'none' && warming.direction === 'up',
@@ -1646,6 +1697,7 @@ async function scanSymbolSignals(env, symbol) {
     bigVol4hUp: bigVol4h.active && bigVol4h.direction === 'up',
     oiCross, fundingOK, wallBiasLong,
     macdBullishCross: macdCross.bullish,
+    liquidationCascadeBullish: liquidationCascade.bullish,
   });
   // SHORT_SCORE се смята САМО ако вече сме в TOP WATCH (секция B от
   // предложението - SHORT CONFIRMATION идва СЛЕД TOP WATCH gate-а, не преди).
@@ -1653,6 +1705,7 @@ async function scanSymbolSignals(env, symbol) {
     deathCross, dmaBear, oiReversal, bearishStructureActive, sellWallDominant,
     longOverloaded: cycleLongPct != null && cycleLongPct >= TOP_WATCH_LONGPCT_MIN,
     structuralShortConfirm, macdBearishCross: macdCross.bearish,
+    liquidationCascadeBearish: liquidationCascade.bearish,
   }) : 0;
   const cyclePhase = computeCyclePhase({
     longScore: cycleLongScore, shortScore: cycleShortScore, overheated, topWatch,
@@ -1739,8 +1792,8 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
         const cycleLines = [
           `🔮 ЦИКЪЛ: ${symbolNoUsdt}`,
           `Фаза: ${PHASE_LABELS[cyclePhase]}`,
-          `LONG SCORE: ${cycleLongScore}/8`,
-          `SHORT SCORE: ${cycleShortScore}/8`,
+          `LONG SCORE: ${cycleLongScore}/9`,
+          `SHORT SCORE: ${cycleShortScore}/9`,
         ];
         await sendWhatsApp(env, cycleLines.join('\n'));
       }
