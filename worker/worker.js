@@ -101,19 +101,37 @@ function calcDCALevels(entryPrice, side, symbol) {
 // Логването на неуспешен HTTP отговор (добавено по-рано - виж git history)
 // разкри реалната причина зад известия, които просто не пристигаха: TextMeBot
 // отговаря с HTTP 403 "There is currently a limit of 1 messages per 5 seconds
-// to prevent a ban from whatsapp" - реален случай: PHASE CYCLE ENGINE-ът прати
-// няколко "🔮 ЦИКЪЛ" известия последователно бързо (напр. RENDER + друг символ
-// в един и същ 5-мин тик), TextMeBot отказа част от тях. sendWhatsApp-ите се
-// извикват последователно (await един по един, никога паралелно), затова прост
-// throttle с module-scope timestamp е достатъчен - изчакваме поне
-// WHATSAPP_MIN_INTERVAL_MS от последното изпращане, преди следващото.
+// to prevent a ban from whatsapp".
 const WHATSAPP_MIN_INTERVAL_MS = 5200; // малко над обявения лимит от 5 сек, за буфер
-let lastWhatsAppSendAt = 0;
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function sendWhatsApp(env, text) {
+// РЕАЛЕН БЪГ, потвърден директно от Cloudflare логовете (две HTTP 403 грешки
+// със ЕДИН и същ requestId - значи от ЕДНА и съща scheduled() инвокация):
+// първият опит за throttle ("прочети lastWhatsAppSendAt -> изчакай -> запиши
+// lastWhatsAppSendAt") НЕ е атомарен. scheduled() пуска checkDcaLevels/
+// checkMarketSignals/checkMacroSqueeze ПАРАЛЕЛНО (Promise.all) - всеки може
+// да вика sendWhatsApp независимо. Две паралелни извиквания можеха да
+// прочетат СЪЩИЯ стар timestamp, преди което и да е от тях да го обнови,
+// да изчакат еднакво, и да пратят почти едновременно въпреки "throttle-а".
+// Поправка: sendWhatsApp СИНХРОННО се "закача" към единна module-scope
+// опашка (whatsAppChain) веднага при извикване, ПРЕДИ какъвто и да е await -
+// JS е single-threaded, затова четенето+презаписването на whatsAppChain в
+// една синхронна стъпка е атомарно дори при "паралелни" (Promise.all)
+// извиквания, гарантирайки истинска сериализация на ВСИЧКИ изпращания,
+// независимо от кой от трите извикващи потока идват.
+let lastWhatsAppSendAt = 0;
+let whatsAppChain = Promise.resolve();
+function sendWhatsApp(env, text) {
+  const p = whatsAppChain.then(() => sendWhatsAppSerialized(env, text));
+  // .catch тук пази опашката жива - грешка на едно съобщение не бива да
+  // блокира/чупи чакащите след него в опашката.
+  whatsAppChain = p.catch(() => {});
+  return p;
+}
+
+async function sendWhatsAppSerialized(env, text) {
   if (!env.CALLMEBOT_PHONE || !env.TEXTMEBOT_APIKEY) {
     console.error('TextMeBot secrets not set - skipping notification');
     return { ok: false, error: 'CALLMEBOT_PHONE/TEXTMEBOT_APIKEY not set' };
