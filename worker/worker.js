@@ -98,11 +98,29 @@ function calcDCALevels(entryPrice, side, symbol) {
 // пази старото си име нарочно (същият номер, само за да не се дублира secret-а
 // с ново име) - вижда се и в TEXTMEBOT_APIKEY, единственият нов secret тук.
 // Връща диагностика (ok/status/body) вместо да гълта резултата.
+// Логването на неуспешен HTTP отговор (добавено по-рано - виж git history)
+// разкри реалната причина зад известия, които просто не пристигаха: TextMeBot
+// отговаря с HTTP 403 "There is currently a limit of 1 messages per 5 seconds
+// to prevent a ban from whatsapp" - реален случай: PHASE CYCLE ENGINE-ът прати
+// няколко "🔮 ЦИКЪЛ" известия последователно бързо (напр. RENDER + друг символ
+// в един и същ 5-мин тик), TextMeBot отказа част от тях. sendWhatsApp-ите се
+// извикват последователно (await един по един, никога паралелно), затова прост
+// throttle с module-scope timestamp е достатъчен - изчакваме поне
+// WHATSAPP_MIN_INTERVAL_MS от последното изпращане, преди следващото.
+const WHATSAPP_MIN_INTERVAL_MS = 5200; // малко над обявения лимит от 5 сек, за буфер
+let lastWhatsAppSendAt = 0;
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function sendWhatsApp(env, text) {
   if (!env.CALLMEBOT_PHONE || !env.TEXTMEBOT_APIKEY) {
     console.error('TextMeBot secrets not set - skipping notification');
     return { ok: false, error: 'CALLMEBOT_PHONE/TEXTMEBOT_APIKEY not set' };
   }
+  const waitMs = WHATSAPP_MIN_INTERVAL_MS - (Date.now() - lastWhatsAppSendAt);
+  if (waitMs > 0) await sleep(waitMs);
+  lastWhatsAppSendAt = Date.now();
   const url = `https://api.textmebot.com/send.php?recipient=${encodeURIComponent(env.CALLMEBOT_PHONE)}&apikey=${encodeURIComponent(env.TEXTMEBOT_APIKEY)}&text=${encodeURIComponent(text)}`;
   try {
     const r = await fetch(url);
@@ -110,10 +128,6 @@ async function sendWhatsApp(env, text) {
     // Досега неуспешен HTTP отговор от TextMeBot (напр. изчерпан лимит, невалиден
     // recipient, изтекла връзка) минаваше напълно тихо - връщаше се {ok:false,...},
     // но НИКЪДЕ не се логваше, за разлика от мрежово изключение (catch по-долу).
-    // Реален случай: PHASE CYCLE ENGINE-ът прати 23 паралелни известия на първия
-    // си тик (по едно за всеки нов символ, липсваща стара фаза в KV), без нито
-    // едно да пристигне във WhatsApp - без това лог, нямаше как да се разбере
-    // дали грешката е в Worker кода или в отговора на самия TextMeBot.
     if (!r.ok) console.error(`TextMeBot non-OK response: HTTP ${r.status}: ${body.slice(0, 300)}`);
     return { ok: r.ok, status: r.status, body: body.slice(0, 500) };
   } catch (e) {
