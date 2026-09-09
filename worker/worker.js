@@ -1046,14 +1046,48 @@ function isTopWatch(overheated, funding, longPct) {
 // calcWallBias/DOMINANCE_RATIO=1.5 в signal-logic.js.
 const WALL_DOMINANCE_RATIO = 1.5;
 
-// LONG_SCORE (Секция A "IMPULSE HUNTER") - 7 точки, подбрани от предложението
+// MACD (12,26,9) bullish/bearish crossover на ДНЕВНА база - исторически бичи
+// crossover на MACD линията срещу сигналната линия е бил надежден сигнал за
+// край на мечи цикъл и начало на нов възходящ (напр. BTC 2012 - MACD bullish
+// crossover, последван от рали $5→$283). Индикаторът е чисто математически,
+// НЕ BTC-специфичен - смята се еднакво за всяка монета от watchlist-а.
+// BTC-специфично е само конкретният брой дни между цикли (произлиза от
+// halving-а, който altcoins нямат собствен еквивалент на) - затова тук
+// НЕ хардкодваме никакъв брой дни, само самото пресичане (crossover/
+// crossunder като еднократно събитие, не steady-state режим - огледално на
+// calcDeathCross по-горе). candles трябва да са ЗАТВОРЕНИ дневни свещи.
+function calcMACDCrossover(candles, opts = {}) {
+  const fastLen = opts.fastLen ?? 12, slowLen = opts.slowLen ?? 26, signalLen = opts.signalLen ?? 9;
+  const n = candles.length;
+  if (n < slowLen + signalLen + 1) return { bullish: false, bearish: false };
+  const closes = candles.map(c => c.close);
+  const fastSeries = calcEMASeries(closes, fastLen);
+  const slowSeries = calcEMASeries(closes, slowLen);
+  const macdSeries = fastSeries.map((f, i) => (f == null || slowSeries[i] == null) ? null : f - slowSeries[i]);
+  const firstValid = macdSeries.findIndex(v => v != null);
+  if (firstValid === -1) return { bullish: false, bearish: false };
+  // calcEMASeries очаква масив от числа без null-ове - подаваме само валидната
+  // опашка на MACD линията (от firstValid нататък), после подравняваме обратно
+  // с leading null-ове, за да пазим същите индекси като macdSeries.
+  const macdValid = macdSeries.slice(firstValid);
+  const signalValid = calcEMASeries(macdValid, signalLen);
+  const signalSeries = new Array(firstValid).fill(null).concat(signalValid);
+  const m0 = macdSeries[n - 1], m1 = macdSeries[n - 2];
+  const s0 = signalSeries[n - 1], s1 = signalSeries[n - 2];
+  if (m0 == null || m1 == null || s0 == null || s1 == null) return { bullish: false, bearish: false };
+  return { bullish: m1 <= s1 && m0 > s0, bearish: m1 >= s1 && m0 < s0 };
+}
+
+// LONG_SCORE (Секция A "IMPULSE HUNTER") - 8 точки, подбрани от предложението
 // с приоритет на вече съществуващи, тествани детектори (WARMING/EARLY BUILD-UP/
 // BUILD-UP CONFIRMED/PRE-IMPULSE/4H CLUSTER вече покриват COMPRESSION/CASCADE
 // имплицитно - COMPRESSION е вграден гейт в calcWarmingTier, 4H CLUSTER UP е
-// calc4HBigVolume). Новите данни (OI, funding, wall bias) добавят точно 2
-// допълнителни точки. Скàлата на изхода следва точно предложението:
-// 0-2=NEUTRAL, 3=WATCH, 4=SETUP, 5+=STRONG.
-function calcCycleLongScore({ warmDirectionUp, earlyLong, buildUpConfirmLong, preImpulseLong, bigVol4hUp, oiCross, fundingOK, wallBiasLong }) {
+// calc4HBigVolume). Новите данни (OI, funding, wall bias, MACD) добавят 3
+// допълнителни точки. Скàлата на изхода следва предложението (0-2=NEUTRAL,
+// 3=WATCH, 4=SETUP, 5+=STRONG) - абсолютните прагове не са преизчислени за
+// новия максимум от 8 (вместо 7), умишлено: по-лесно достигане на STRONG с
+// допълнителния MACD фактор е приемливо, не грешка.
+function calcCycleLongScore({ warmDirectionUp, earlyLong, buildUpConfirmLong, preImpulseLong, bigVol4hUp, oiCross, fundingOK, wallBiasLong, macdBullishCross }) {
   let score = 0;
   if (warmDirectionUp) score++;
   if (earlyLong) score++;
@@ -1062,12 +1096,14 @@ function calcCycleLongScore({ warmDirectionUp, earlyLong, buildUpConfirmLong, pr
   if (bigVol4hUp) score++;
   if (oiCross === 'long_continuation') score++;
   if (fundingOK && wallBiasLong) score++;
+  if (macdBullishCross) score++;
   return score;
 }
 // SHORT_SCORE (Секция B "EXHAUSTION/TOP HUNTER") - оценява се САМО когато
 // isTopWatch() вече е true (виж checkMarketSignals/scanSymbolSignals по-долу) -
 // огледално на предложението, където SHORT CONFIRMATION идва СЛЕД TOP WATCH.
-function calcCycleShortScore({ deathCross, dmaBear, oiReversal, bearishStructureActive, sellWallDominant, longOverloaded, structuralShortConfirm }) {
+// 8 точки (7 от предложението + MACD bearish crossunder, огледално на LONG_SCORE).
+function calcCycleShortScore({ deathCross, dmaBear, oiReversal, bearishStructureActive, sellWallDominant, longOverloaded, structuralShortConfirm, macdBearishCross }) {
   let score = 0;
   if (deathCross) score++;
   if (dmaBear) score++;
@@ -1076,6 +1112,7 @@ function calcCycleShortScore({ deathCross, dmaBear, oiReversal, bearishStructure
   if (sellWallDominant) score++;
   if (longOverloaded) score++;
   if (structuralShortConfirm) score++;
+  if (macdBearishCross) score++;
   return score;
 }
 
@@ -1116,7 +1153,7 @@ function computeCyclePhase({ longScore, shortScore, overheated, topWatch, warmTi
 // първи опит с плосък 60-мин cooldown погрешно блокираше и ЛЕГИТИМНА бърза
 // прогресия през фазите (напр. WARMING→LONG_WATCH→LONG_SETUP→STRONG_LONG за
 // 15-20 мин при истински бърз импулс - точно сценарият, който "IMPULSE HUNTER"
-// цели да хване рано), не само нежелано флип-флопване. Всеки от 7-те входни
+// цели да хване рано), не само нежелано флип-флопване. Всеки от 8-те входни
 // фактора вече си има собствен cooldown/хистерезис по-горе (WARMING/EARLY
 // BUILD-UP/и т.н.), затова резкия tick-to-tick "флип-флоп" на самата ФАЗА е
 // естествено рядък - не е нужен допълнителен таймер тук.
@@ -1586,6 +1623,7 @@ async function scanSymbolSignals(env, symbol) {
   const bearishStructureActive = (warmTier !== 'none' && warming.direction === 'down') || buildUpConfirmShort || preImpulseShort;
   const structuralShortConfirm = shiftDown || confirmed.short;
   const oiReversal = oiCross === 'short_continuation' || oiCross === 'long_exhaustion_risk';
+  const macdCross = c1dClosed.length ? calcMACDCrossover(c1dClosed) : { bullish: false, bearish: false };
 
   const cycleLongScore = calcCycleLongScore({
     warmDirectionUp: warmTier !== 'none' && warming.direction === 'up',
@@ -1593,13 +1631,14 @@ async function scanSymbolSignals(env, symbol) {
     buildUpConfirmLong, preImpulseLong,
     bigVol4hUp: bigVol4h.active && bigVol4h.direction === 'up',
     oiCross, fundingOK, wallBiasLong,
+    macdBullishCross: macdCross.bullish,
   });
   // SHORT_SCORE се смята САМО ако вече сме в TOP WATCH (секция B от
   // предложението - SHORT CONFIRMATION идва СЛЕД TOP WATCH gate-а, не преди).
   const cycleShortScore = topWatch ? calcCycleShortScore({
     deathCross, dmaBear, oiReversal, bearishStructureActive, sellWallDominant,
     longOverloaded: cycleLongPct != null && cycleLongPct >= TOP_WATCH_LONGPCT_MIN,
-    structuralShortConfirm,
+    structuralShortConfirm, macdBearishCross: macdCross.bearish,
   }) : 0;
   const cyclePhase = computeCyclePhase({
     longScore: cycleLongScore, shortScore: cycleShortScore, overheated, topWatch,
@@ -1686,8 +1725,8 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
         const cycleLines = [
           `🔮 ЦИКЪЛ: ${symbolNoUsdt}`,
           `Фаза: ${PHASE_LABELS[cyclePhase]}`,
-          `LONG SCORE: ${cycleLongScore}/7`,
-          `SHORT SCORE: ${cycleShortScore}/7`,
+          `LONG SCORE: ${cycleLongScore}/8`,
+          `SHORT SCORE: ${cycleShortScore}/8`,
         ];
         await sendWhatsApp(env, cycleLines.join('\n'));
       }
