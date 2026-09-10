@@ -968,12 +968,17 @@ async function loadSpark() {
         oiDelta5m: oiMulti.delta5m, oiDelta15m: oiMulti.delta15m, oiDelta1h: oiMulti.delta1h,
         volRatio: volAccel.ratio, chg1h, chg4h,
         longScore: score.longScore, shortScore: score.shortScore,
-        longTier: getSparkTier(score.longScore), shortTier: getSparkTier(score.shortScore),
+        // Задължителен твърд фактор (виж бележката при calcSparkScore) - tier-ът
+        // е 'none', ако нито OI, нито обемно ускорение реално е задействало в
+        // тази посока, независимо колко "меки" фактори са се събрали.
+        longTier: getSparkTier(score.longScore, score.hasHardFactorLong),
+        shortTier: getSparkTier(score.shortScore, score.hasHardFactorShort),
         extended: extension.extended,
       };
       // Точка 9 от предложението - Price Extension филтър: ако вече е "избягала",
-      // не е "ранна" - не влиза в резултатите, независимо от score-а.
-      if (!extension.extended && (score.longScore >= 3 || score.shortScore >= 3)) {
+      // не е "ранна" - не влиза в резултатите, независимо от score-а. Сега
+      // проверяваме tier-а (вече включва твърдия фактор), не суровия score.
+      if (!extension.extended && (coin.sparkSignal.longTier !== 'none' || coin.sparkSignal.shortTier !== 'none')) {
         results.push(coin);
       }
     } catch(e) { coin.sparkSignal = null; }
