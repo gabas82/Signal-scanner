@@ -985,6 +985,130 @@ function calcLiquidationCascade(orders, opts = {}) {
   return { bullish: buySumUsd >= usdMin, bearish: sellSumUsd >= usdMin, buySumUsd, sellSumUsd };
 }
 
+// ═══ "SPARK" - ранно откриване ПРЕДИ импулса ═══════════════════════════════
+// ВАЖНО: НЕ е същото като съществуващия "🚀 PRE-IMPULSE" таг по-долу (Etap 3
+// от Build-Up Detector-а) - онзи е ПОСЛЕДНАТА стъпка от вече потвърден 4ч
+// build-up (build-up confirm + ATR expansion), тук говорим за много по-ранен
+// момент - ПРЕДИ дори Early Build-Up да се задейства, докато капиталът/
+// позиционирането тепърва започват да се променят (OI/обем ускоряват,
+// докато цената още не е направила голямо движение). Именуваме го SPARK, за
+// да не се бърка с вече съществуващото значение на PRE-IMPULSE.
+// Byte-identical копие на функциите от signal-logic.js (Scanner UI) - същата
+// конвенция както при цялата останала PHASE CYCLE ENGINE логика по-долу.
+function calcOiMultiDelta(oiHist) {
+  const n = oiHist ? oiHist.length : 0;
+  const deltaAt = (lookback) => {
+    if (n < lookback + 1) return null;
+    const now = oiHist[n - 1].oi, prev = oiHist[n - 1 - lookback].oi;
+    if (!prev) return null;
+    return ((now - prev) / prev) * 100;
+  };
+  return { delta5m: deltaAt(1), delta15m: deltaAt(3), delta1h: deltaAt(12) };
+}
+
+function calcVolAcceleration(candles1h, candles4h, opts = {}) {
+  const avgLen = opts.avgLen ?? 20;
+  if (!candles1h.length || candles4h.length < avgLen) return { ratio: null, tier: 'none' };
+  const vol1h = candles1h[candles1h.length - 1].volume;
+  const vol4hAvg = calcSMA(candles4h.map(c => c.volume), avgLen);
+  if (vol4hAvg == null || vol4hAvg <= 0) return { ratio: null, tier: 'none' };
+  const ratio = vol1h / vol4hAvg;
+  let tier = 'none';
+  if (ratio >= 2.0) tier = 'expansion';
+  else if (ratio >= 1.5) tier = 'strong';
+  else if (ratio >= 1.2) tier = 'buildup';
+  return { ratio, tier };
+}
+
+function calcPriceChangePct(candles, barsBack = 1) {
+  const n = candles.length;
+  if (n < barsBack + 1) return null;
+  const now = candles[n - 1].close, prev = candles[n - 1 - barsBack].close;
+  if (!prev) return null;
+  return ((now - prev) / prev) * 100;
+}
+
+function calcStructureShift(candles, opts = {}) {
+  const emaLen = opts.emaLen ?? 20;
+  const n = candles.length;
+  if (n < emaLen + 4) return { long: false, short: false };
+  const closes = candles.map(c => c.close);
+  const emaSeries = calcEMASeries(closes, emaLen);
+  const emaNow = emaSeries[n - 1], emaPrev = emaSeries[n - 2];
+  if (emaNow == null || emaPrev == null) return { long: false, short: false };
+  const last = candles[n - 1];
+  const reclaim = last.close > emaNow && emaNow > emaPrev;
+  const lose = last.close < emaNow && emaNow < emaPrev;
+  const higherLowsStructure = candles[n-1].low > candles[n-2].low || candles[n-2].low > candles[n-3].low;
+  const lowerHighsStructure = candles[n-1].high < candles[n-2].high || candles[n-2].high < candles[n-3].high;
+  return { long: reclaim && higherLowsStructure, short: lose && lowerHighsStructure };
+}
+
+const SPARK_FUNDING_EXTREME = 0.05;
+function calcSqueezeCondition({ funding, priceUp, oiUp, volUp }) {
+  if (funding == null) return { bullish: false, bearish: false };
+  const bullish = funding <= -SPARK_FUNDING_EXTREME && priceUp && oiUp && volUp;
+  const bearish = funding >= SPARK_FUNDING_EXTREME && !priceUp && oiUp && volUp;
+  return { bullish, bearish };
+}
+
+const SPARK_EXTENSION_1H_PCT = 20;
+const SPARK_EXTENSION_4H_PCT = 35;
+function calcPriceExtension(chg1h, chg4h) {
+  const extendedUp = (chg1h != null && chg1h >= SPARK_EXTENSION_1H_PCT) || (chg4h != null && chg4h >= SPARK_EXTENSION_4H_PCT);
+  const extendedDown = (chg1h != null && chg1h <= -SPARK_EXTENSION_1H_PCT) || (chg4h != null && chg4h <= -SPARK_EXTENSION_4H_PCT);
+  return { extended: extendedUp || extendedDown, extendedUp, extendedDown };
+}
+
+const SPARK_OI_THRESHOLD = { major: 3, semi: 5, minor: 8 };
+const SPARK_VOL_RATIO_THRESHOLD = { major: 1.3, semi: 1.5, minor: 1.8 };
+function getSparkCoinTier(symbol) {
+  if (MAJOR_COINS.has(symbol)) return 'major';
+  if (SEMI_MAJOR_COINS.has(symbol)) return 'semi';
+  return 'minor';
+}
+
+function calcSparkScore({ symbol, oiDelta15m, volAccel, chg1h, structureShift, squeeze, wallBias, htfAligned }) {
+  const tier = getSparkCoinTier(symbol);
+  const oiThreshold = SPARK_OI_THRESHOLD[tier];
+  const volThreshold = SPARK_VOL_RATIO_THRESHOLD[tier];
+  const oiAccelUp = oiDelta15m != null && oiDelta15m >= oiThreshold;
+  const oiAccelDown = oiDelta15m != null && oiDelta15m <= -oiThreshold;
+  const volAccelOK = volAccel != null && volAccel.ratio != null && volAccel.ratio >= volThreshold;
+  const priceCompressed = chg1h != null && Math.abs(chg1h) <= 4;
+  let longScore = 0, shortScore = 0;
+  if (oiAccelUp) longScore++;
+  if (oiAccelDown) shortScore++;
+  if (volAccelOK) { longScore++; shortScore++; }
+  if (priceCompressed) { longScore++; shortScore++; }
+  if (structureShift?.long) longScore++;
+  if (structureShift?.short) shortScore++;
+  if (squeeze?.bullish) longScore++;
+  if (squeeze?.bearish) shortScore++;
+  if (wallBias === 'long') longScore++;
+  if (wallBias === 'short') shortScore++;
+  if (htfAligned === 'long') longScore++;
+  if (htfAligned === 'short') shortScore++;
+  return { longScore, shortScore };
+}
+
+const SPARK_LABELS = {
+  none: null,
+  earlyWatch: '👀 EARLY WATCH',
+  spark: '🟡 SPARK',
+  strongSpark: '🟠 STRONG SPARK',
+  highProbability: '🔥 HIGH PROBABILITY',
+  extreme: '🚨 EXTREME SETUP',
+};
+function getSparkTier(score) {
+  if (score >= 7) return 'extreme';
+  if (score >= 6) return 'highProbability';
+  if (score >= 5) return 'strongSpark';
+  if (score >= 4) return 'spark';
+  if (score >= 3) return 'earlyWatch';
+  return 'none';
+}
+
 // ============================================================================
 // PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
 // HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
@@ -1243,6 +1367,17 @@ function cyclePhaseCanFire(state, newPhase) {
 }
 function markCyclePhase(state, newPhase) {
   state.cycle = { phase: newPhase, at: Date.now() };
+}
+
+// SPARK - огледално на cyclePhaseCanFire/markCyclePhase по-горе. key е
+// `${direction}:${tier}` (напр. "long:strongSpark"), или 'none' когато
+// score<3 или монетата е extended (виж calcPriceExtension) - firing само на
+// ГЕНУИННА промяна към нов активен SPARK сигнал, никога при изчистване.
+function sparkCanFire(state, key) {
+  return key !== 'none' && state.spark?.key !== key;
+}
+function markSparkFired(state, key) {
+  state.spark = { key, at: Date.now() };
 }
 
 // WhatsApp/Android понякога разпознава "$" залепено директно за низ от цифри
@@ -1682,7 +1817,7 @@ async function scanSymbolSignals(env, symbol) {
   // друга цел, тук е отделно извикване, огледално на съществуващия прецедент).
   // НЕ променя по никакъв начин longScore/shortScore/confidence по-горе.
   const [oiHist, wallsRaw, chg24h, longShortCycle, fundingCycle, liquidationOrders] = await Promise.all([
-    fetchOpenInterestHistWorker(env, symbol),
+    fetchOpenInterestHistWorker(env, symbol, '5m', 13),
     fetchOrderBookWallsWorker(env, symbol, price),
     fetch24hChangeWorker(env, symbol),
     fetchLongShortWorker(env, symbol),
@@ -1733,6 +1868,36 @@ async function scanSymbolSignals(env, symbol) {
   const cyclePhaseChanged = cyclePhaseCanFire(state, cyclePhase);
   if (cyclePhaseChanged) markCyclePhase(state, cyclePhase);
 
+  // ---- SPARK (виж дефинициите непосредствено след calcLiquidationCascade по-
+  // горе) - реюзва вече изчислените в тази функция c1h/c4h (LIVE, за най-бърза
+  // реакция - същата конвенция както WARMING/Early Build-Up), trend4h,
+  // wallBiasLong/sellWallDominant, fundingCycle, и същия oiHist fetch (вече
+  // разширен на limit=13 по-горе, за да не се прави отделна мрежова заявка).
+  // НЕ променя по никакъв начин cycleLongScore/cycleShortScore/cyclePhase.
+  const oiMulti = calcOiMultiDelta(oiHist);
+  const volAccel = calcVolAcceleration(c1h, c4h);
+  const sparkChg1h = calcPriceChangePct(c1h, 1);
+  const sparkChg4h = calcPriceChangePct(c4h, 1);
+  const sparkStructureShift = calcStructureShift(c1h);
+  const sparkWallBias = wallBiasLong ? 'long' : sellWallDominant ? 'short' : null;
+  const sparkHtfAligned = trend4h.bull ? 'long' : trend4h.bear ? 'short' : null;
+  const sparkSqueeze = calcSqueezeCondition({
+    funding: fundingCycle, priceUp: sparkChg1h != null && sparkChg1h > 0,
+    oiUp: oiMulti.delta15m != null && oiMulti.delta15m > 0, volUp: volAccel.tier !== 'none',
+  });
+  const sparkExtension = calcPriceExtension(sparkChg1h, sparkChg4h);
+  const sparkScore = calcSparkScore({
+    symbol, oiDelta15m: oiMulti.delta15m, volAccel, chg1h: sparkChg1h,
+    structureShift: sparkStructureShift, squeeze: sparkSqueeze,
+    wallBias: sparkWallBias, htfAligned: sparkHtfAligned,
+  });
+  const sparkDirection = sparkScore.longScore >= sparkScore.shortScore ? 'long' : 'short';
+  const sparkMaxScore = Math.max(sparkScore.longScore, sparkScore.shortScore);
+  const sparkTier = getSparkTier(sparkMaxScore);
+  const sparkKey = (sparkMaxScore >= 3 && !sparkExtension.extended) ? `${sparkDirection}:${sparkTier}` : 'none';
+  const sparkFired = sparkCanFire(state, sparkKey);
+  if (sparkFired) markSparkFired(state, sparkKey);
+
   await saveSymbolState(env, symbol, state);
 
   return {
@@ -1740,6 +1905,9 @@ async function scanSymbolSignals(env, symbol) {
     activeFired: activeSignals.map(sig => sig.label),
     price, support, resistance, ...confidence,
     cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore,
+    sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore,
+    sparkOiDelta5m: oiMulti.delta5m, sparkOiDelta15m: oiMulti.delta15m, sparkOiDelta1h: oiMulti.delta1h,
+    sparkVolRatio: volAccel.ratio, sparkChg1h, sparkChg4h, sparkExtended: sparkExtension.extended,
   };
 }
 
@@ -1749,7 +1917,7 @@ async function scanSymbolSignals(env, symbol) {
 async function checkMarketSignals(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h } = await scanSymbolSignals(env, pos.symbol);
       // MIN_NOTIFY_SCORE - самотен слаб сигнал вече не праща цяло известие,
       // само защото нещо е "активно" (виж бележката при MIN_NOTIFY_SCORE).
       // ACTIVE SIGNAL MEMORY (т.4 от спецификацията) - стари сигнали от паметта
@@ -1814,6 +1982,23 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
           `SHORT SCORE: ${cycleShortScore}/9`,
         ];
         await sendWhatsApp(env, cycleLines.join('\n'));
+      }
+      // SPARK - ранно откриване ПРЕДИ импулса (виж бележката при
+      // calcSparkScore по-горе). Изцяло отделно известие, огледално на
+      // "🔮 ЦИКЪЛ" - праща се САМО при нов/променен активен SPARK сигнал
+      // (sparkFired, виж sparkCanFire), никога при изчистване ('none' не
+      // може да е sparkKey, който предизвиква firing - виж scanSymbolSignals).
+      if (sparkFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const sparkLines = [
+          `${SPARK_LABELS[sparkTier]} ${symbolNoUsdt} ${sparkDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `SPARK SCORE: ${sparkMaxScore}/7`,
+          `OI 5м: ${fmtPct(sparkOiDelta5m)} · OI 15м: ${fmtPct(sparkOiDelta15m)} · OI 1ч: ${fmtPct(sparkOiDelta1h)}`,
+          `VOL 1ч/4ч ср.: ${sparkVolRatio != null ? sparkVolRatio.toFixed(2) + 'x' : '--'} · Цена 1ч: ${fmtPct(sparkChg1h)}`,
+          `⚠️ Все още НЕ Е entry - следи за развитие`,
+        ];
+        await sendWhatsApp(env, sparkLines.join('\n'));
       }
     } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }
   }

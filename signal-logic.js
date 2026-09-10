@@ -913,6 +913,170 @@ function calcConfirmedSignal(candles15, candles1h, opts = {}) {
   return { long: pullbackLong && htfBull, short: pullbackShort && htfBear };
 }
 
+// ═══ "SPARK" - ранно откриване ПРЕДИ импулса ═══════════════════════════════
+// ВАЖНО: НЕ е същото като съществуващия "🚀 PRE-IMPULSE" таг по-горе (Etap 3
+// от Build-Up Detector-а) - онзи е ПОСЛЕДНАТА стъпка от вече потвърден 4ч
+// build-up (build-up confirm + ATR expansion), тук говорим за много по-ранен
+// момент - ПРЕДИ дори Early Build-Up да се задейства, докато капиталът/
+// позиционирането тепърва започват да се променят (OI/обем ускоряват,
+// докато цената още не е направила голямо движение). Именуваме го SPARK, за
+// да не се бърка с вече съществуващото значение на PRE-IMPULSE.
+// Изцяло допълнителен слой - не променя нито един съществуващ детектор/score.
+
+// Мулти-грануларна OI % промяна (5m/15m/1h) от ЕДНА OI история с period=5m -
+// вместо 3 отделни заявки, изчисляваме и трите delta от един series (5m = 1
+// период назад, 15m = 3 периода назад, 1h = 12 периода назад). oiHist е масив
+// {time, oi} във възходящ хронологичен ред (най-новото последно).
+function calcOiMultiDelta(oiHist) {
+  const n = oiHist ? oiHist.length : 0;
+  const deltaAt = (lookback) => {
+    if (n < lookback + 1) return null;
+    const now = oiHist[n - 1].oi, prev = oiHist[n - 1 - lookback].oi;
+    if (!prev) return null;
+    return ((now - prev) / prev) * 100;
+  };
+  return { delta5m: deltaAt(1), delta15m: deltaAt(3), delta1h: deltaAt(12) };
+}
+
+// Volume acceleration - обемът на последната 1ч свещ спрямо средния обем на
+// последните `avgLen` 4ч свещи. За разлика от VOL SPIKE (който гледа скок
+// СЛЕД събитието), тук търсим ускоряване, докато цената още е сравнително
+// спокойна - виж calcSparkScore/priceCompressed по-долу.
+function calcVolAcceleration(candles1h, candles4h, opts = {}) {
+  const avgLen = opts.avgLen ?? 20;
+  if (!candles1h.length || candles4h.length < avgLen) return { ratio: null, tier: 'none' };
+  const vol1h = candles1h[candles1h.length - 1].volume;
+  const vol4hAvg = calcSMA(candles4h.map(c => c.volume), avgLen);
+  if (vol4hAvg == null || vol4hAvg <= 0) return { ratio: null, tier: 'none' };
+  const ratio = vol1h / vol4hAvg;
+  let tier = 'none';
+  if (ratio >= 2.0) tier = 'expansion';
+  else if (ratio >= 1.5) tier = 'strong';
+  else if (ratio >= 1.2) tier = 'buildup';
+  return { ratio, tier };
+}
+
+// Обща % промяна на цената за последните `barsBack` свещи от дадения масив -
+// reuse-ва се и за price compression проверката (1ч), и за Price Extension
+// филтъра (1ч и 4ч, виж calcPriceExtension по-долу).
+function calcPriceChangePct(candles, barsBack = 1) {
+  const n = candles.length;
+  if (n < barsBack + 1) return null;
+  const now = candles[n - 1].close, prev = candles[n - 1 - barsBack].close;
+  if (!prev) return null;
+  return ((now - prev) / prev) * 100;
+}
+
+// Ранно структурно обръщане - EMA20 reclaim (LONG) / загуба на EMA20 (SHORT)
+// + начало на higher-low (LONG) / lower-high (SHORT) структура, огледално на
+// higherLows/lowerHighs проверката в calcBuildUpEarly по-горе, само че само
+// върху EMA20 (не изисква пълния Build-Up прозорец) - за да хване реакцията
+// много по-рано от calcShiftSignal (EMA20 пресича EMA50).
+function calcStructureShift(candles, opts = {}) {
+  const emaLen = opts.emaLen ?? 20;
+  const n = candles.length;
+  if (n < emaLen + 4) return { long: false, short: false };
+  const closes = candles.map(c => c.close);
+  const emaSeries = calcEMASeries(closes, emaLen);
+  const emaNow = emaSeries[n - 1], emaPrev = emaSeries[n - 2];
+  if (emaNow == null || emaPrev == null) return { long: false, short: false };
+  const last = candles[n - 1];
+  const reclaim = last.close > emaNow && emaNow > emaPrev;
+  const lose = last.close < emaNow && emaNow < emaPrev;
+  const higherLowsStructure = candles[n-1].low > candles[n-2].low || candles[n-2].low > candles[n-3].low;
+  const lowerHighsStructure = candles[n-1].high < candles[n-2].high || candles[n-2].high < candles[n-3].high;
+  return { long: reclaim && higherLowsStructure, short: lose && lowerHighsStructure };
+}
+
+// Секция 6 от предложението - funding участва само като ДОПЪЛНИТЕЛЕН фактор,
+// НЕ като самостоятелен тригер: силно отрицателен funding + цена нагоре + OI
+// нагоре + обем нагоре = вероятен SHORT SQUEEZE (бичи); огледално за LONG
+// SQUEEZE (положителен funding + цена надолу + OI нагоре + обем нагоре).
+const SPARK_FUNDING_EXTREME = 0.05;
+function calcSqueezeCondition({ funding, priceUp, oiUp, volUp }) {
+  if (funding == null) return { bullish: false, bearish: false };
+  const bullish = funding <= -SPARK_FUNDING_EXTREME && priceUp && oiUp && volUp;
+  const bearish = funding >= SPARK_FUNDING_EXTREME && !priceUp && oiUp && volUp;
+  return { bullish, bearish };
+}
+
+// Секция 9 от предложението - защита от "chase": ако монетата вече е +20% за
+// 1ч или +35% за 4ч (в която и да е посока), вече не е "ранна" - SPARK не
+// бива да я маркира като такава, независимо от останалите фактори.
+const SPARK_EXTENSION_1H_PCT = 20;
+const SPARK_EXTENSION_4H_PCT = 35;
+function calcPriceExtension(chg1h, chg4h) {
+  const extendedUp = (chg1h != null && chg1h >= SPARK_EXTENSION_1H_PCT) || (chg4h != null && chg4h >= SPARK_EXTENSION_4H_PCT);
+  const extendedDown = (chg1h != null && chg1h <= -SPARK_EXTENSION_1H_PCT) || (chg4h != null && chg4h <= -SPARK_EXTENSION_4H_PCT);
+  return { extended: extendedUp || extendedDown, extendedUp, extendedDown };
+}
+
+// Адаптивни прагове по категория монета (Точка 2 от предложението) - reuse-ва
+// вече съществуващите MAJOR_COINS/SEMI_MAJOR_COINS сетове, досега ползвани
+// само за DCA margin tier (виж getMaintenanceRate по-горе). +3% OI Δ15m при
+// BTC не е същото като +3% при нискокап altcoin - по-малките монети имат
+// по-шумно/по-волатилно OI, затова прагът им нарочно е по-висок.
+const SPARK_OI_THRESHOLD = { major: 3, semi: 5, minor: 8 };
+const SPARK_VOL_RATIO_THRESHOLD = { major: 1.3, semi: 1.5, minor: 1.8 };
+function getSparkCoinTier(symbol) {
+  if (MAJOR_COINS.has(symbol)) return 'major';
+  if (SEMI_MAJOR_COINS.has(symbol)) return 'semi';
+  return 'minor';
+}
+
+// SPARK SCORE (0-7 на всяка посока) - комбинира 7-те независими фактора от
+// предложението, нито един от които не е сам по себе си задължителен -
+// изчислява се НАНОВО всеки път от текущите данни, огледално на подхода в
+// PHASE CYCLE ENGINE (worker.js). volAccel/priceCompressed нарочно се броят
+// и в двете посоки - те са посочно-неутрални предусловия (просто казват "нещо
+// се ускорява/цената още не е избягала"), самата посока идва от OI знака,
+// structureShift, squeeze и wallBias/htfAligned.
+function calcSparkScore({ symbol, oiDelta15m, volAccel, chg1h, structureShift, squeeze, wallBias, htfAligned }) {
+  const tier = getSparkCoinTier(symbol);
+  const oiThreshold = SPARK_OI_THRESHOLD[tier];
+  const volThreshold = SPARK_VOL_RATIO_THRESHOLD[tier];
+
+  const oiAccelUp = oiDelta15m != null && oiDelta15m >= oiThreshold;
+  const oiAccelDown = oiDelta15m != null && oiDelta15m <= -oiThreshold;
+  const volAccelOK = volAccel != null && volAccel.ratio != null && volAccel.ratio >= volThreshold;
+  const priceCompressed = chg1h != null && Math.abs(chg1h) <= 4;
+
+  let longScore = 0, shortScore = 0;
+  if (oiAccelUp) longScore++;
+  if (oiAccelDown) shortScore++;
+  if (volAccelOK) { longScore++; shortScore++; }
+  if (priceCompressed) { longScore++; shortScore++; }
+  if (structureShift?.long) longScore++;
+  if (structureShift?.short) shortScore++;
+  if (squeeze?.bullish) longScore++;
+  if (squeeze?.bearish) shortScore++;
+  if (wallBias === 'long') longScore++;
+  if (wallBias === 'short') shortScore++;
+  if (htfAligned === 'long') longScore++;
+  if (htfAligned === 'short') shortScore++;
+
+  return { longScore, shortScore };
+}
+
+// Точки 3 и 8 от предложението - ранните нива се показват от 3/7 нагоре
+// (не чакаме 6/7 или 7/7, иначе пак виждаме монетата след движението).
+const SPARK_LABELS = {
+  none: null,
+  earlyWatch: '👀 EARLY WATCH',
+  spark: '🟡 SPARK',
+  strongSpark: '🟠 STRONG SPARK',
+  highProbability: '🔥 HIGH PROBABILITY',
+  extreme: '🚨 EXTREME SETUP',
+};
+function getSparkTier(score) {
+  if (score >= 7) return 'extreme';
+  if (score >= 6) return 'highProbability';
+  if (score >= 5) return 'strongSpark';
+  if (score >= 4) return 'spark';
+  if (score >= 3) return 'earlyWatch';
+  return 'none';
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -929,6 +1093,10 @@ if (typeof module !== 'undefined' && module.exports) {
     calcMMOscValue, calcMMOscEntry, calcMMOscPullbackZone,
     calcImpulseAtrSignal, calcConfirmedSignal,
     isManipulable, formatNum, formatPrice,
-    formatOIDelta, getMaintenanceRate, calcLiquidationPrice, calcDCALevels
+    formatOIDelta, getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
+    calcOiMultiDelta, calcVolAcceleration, calcPriceChangePct, calcStructureShift,
+    calcSqueezeCondition, calcPriceExtension, getSparkCoinTier, calcSparkScore,
+    getSparkTier, SPARK_LABELS, SPARK_OI_THRESHOLD, SPARK_VOL_RATIO_THRESHOLD,
+    SPARK_FUNDING_EXTREME, SPARK_EXTENSION_1H_PCT, SPARK_EXTENSION_4H_PCT
   };
 }
