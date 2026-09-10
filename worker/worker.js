@@ -1089,7 +1089,18 @@ function calcSparkScore({ symbol, oiDelta15m, volAccel, chg1h, structureShift, s
   if (wallBias === 'short') shortScore++;
   if (htfAligned === 'long') longScore++;
   if (htfAligned === 'short') shortScore++;
-  return { longScore, shortScore };
+
+  // Задължителен "твърд" фактор - реално наблюдавани SPARK известия (виж git
+  // history) достигаха 4/7+ САМО от "меки", direction-neutral фактори
+  // (priceCompressed + структура/wall/HTF), докато OI и обем изобщо не бяха
+  // ускорили - чист шум по време на тих пазар. Сега score-ът се брои
+  // нормално (за диагностика/показване), но getSparkTier по-долу отказва да
+  // класифицира каквото и да е като SPARK, ако нито OI, нито обемното
+  // ускорение реално са се задействали в тази посока.
+  const hasHardFactorLong = oiAccelUp || volAccelOK;
+  const hasHardFactorShort = oiAccelDown || volAccelOK;
+
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort };
 }
 
 const SPARK_LABELS = {
@@ -1100,7 +1111,8 @@ const SPARK_LABELS = {
   highProbability: '🔥 HIGH PROBABILITY',
   extreme: '🚨 EXTREME SETUP',
 };
-function getSparkTier(score) {
+function getSparkTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
   if (score >= 7) return 'extreme';
   if (score >= 6) return 'highProbability';
   if (score >= 5) return 'strongSpark';
@@ -1893,15 +1905,17 @@ async function scanSymbolSignals(env, symbol) {
   });
   const sparkDirection = sparkScore.longScore >= sparkScore.shortScore ? 'long' : 'short';
   const sparkMaxScore = Math.max(sparkScore.longScore, sparkScore.shortScore);
-  const sparkTier = getSparkTier(sparkMaxScore);
+  // Задължителен твърд фактор (виж бележката при calcSparkScore) - реално
+  // наблюдавани SPARK известия достигаха 4/7+ САМО от "меки", direction-
+  // neutral фактори (priceCompressed + структура/wall/HTF), докато OI/VOL
+  // ускорението изобщо не се е задействало - чист шум по време на тих пазар.
+  const sparkHasHardFactor = sparkDirection === 'long' ? sparkScore.hasHardFactorLong : sparkScore.hasHardFactorShort;
+  const sparkTier = getSparkTier(sparkMaxScore, sparkHasHardFactor);
   // т.8 от предложението - "3/7 показва в скенера, 4/7 задейства alert" -
   // WhatsApp известие пали само от 4/7 нагоре (spark/strongSpark/highProbability/
-  // extreme), НЕ на 3/7 (earlyWatch), за да не спамва с всяка монета, която
-  // случайно докосне 3/7 само от "меки" направление-неутрални фактори
-  // (priceCompressed + структура/wall/HTF), докато OI/VOL ускорението изобщо
-  // не се е задействало - реално наблюдавано (7 монети наведнъж на 3/7 с
-  // почти нулево OI и VOL ratio 0.05x-0.17x, далеч под прага за ускорение).
-  const sparkKey = (sparkMaxScore >= 4 && !sparkExtension.extended) ? `${sparkDirection}:${sparkTier}` : 'none';
+  // extreme), НЕ на 3/7 (earlyWatch). getSparkTier вече връща 'none', ако
+  // sparkHasHardFactor е false, но проверяваме и тук изрично за защита.
+  const sparkKey = (sparkMaxScore >= 4 && sparkHasHardFactor && !sparkExtension.extended) ? `${sparkDirection}:${sparkTier}` : 'none';
   const sparkFired = sparkCanFire(state, sparkKey);
   if (sparkFired) markSparkFired(state, sparkKey);
 

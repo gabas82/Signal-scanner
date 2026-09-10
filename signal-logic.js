@@ -1055,7 +1055,17 @@ function calcSparkScore({ symbol, oiDelta15m, volAccel, chg1h, structureShift, s
   if (htfAligned === 'long') longScore++;
   if (htfAligned === 'short') shortScore++;
 
-  return { longScore, shortScore };
+  // Задължителен "твърд" фактор - реално наблюдавани SPARK известия (виж git
+  // history) достигаха 4/7+ САМО от "меки", direction-neutral фактори
+  // (priceCompressed + структура/wall/HTF), докато OI и обем изобщо не бяха
+  // ускорили - чист шум по време на тих пазар. Сега score-ът се брои
+  // нормално (за диагностика/показване), но getSparkTier по-долу отказва да
+  // класифицира каквото и да е като SPARK, ако нито OI, нито обемното
+  // ускорение реално са се задействали в тази посока.
+  const hasHardFactorLong = oiAccelUp || volAccelOK;
+  const hasHardFactorShort = oiAccelDown || volAccelOK;
+
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort };
 }
 
 // Точки 3 и 8 от предложението - ранните нива се показват от 3/7 нагоре
@@ -1068,7 +1078,8 @@ const SPARK_LABELS = {
   highProbability: '🔥 HIGH PROBABILITY',
   extreme: '🚨 EXTREME SETUP',
 };
-function getSparkTier(score) {
+function getSparkTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
   if (score >= 7) return 'extreme';
   if (score >= 6) return 'highProbability';
   if (score >= 5) return 'strongSpark';
