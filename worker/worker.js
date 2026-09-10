@@ -1894,7 +1894,14 @@ async function scanSymbolSignals(env, symbol) {
   const sparkDirection = sparkScore.longScore >= sparkScore.shortScore ? 'long' : 'short';
   const sparkMaxScore = Math.max(sparkScore.longScore, sparkScore.shortScore);
   const sparkTier = getSparkTier(sparkMaxScore);
-  const sparkKey = (sparkMaxScore >= 3 && !sparkExtension.extended) ? `${sparkDirection}:${sparkTier}` : 'none';
+  // т.8 от предложението - "3/7 показва в скенера, 4/7 задейства alert" -
+  // WhatsApp известие пали само от 4/7 нагоре (spark/strongSpark/highProbability/
+  // extreme), НЕ на 3/7 (earlyWatch), за да не спамва с всяка монета, която
+  // случайно докосне 3/7 само от "меки" направление-неутрални фактори
+  // (priceCompressed + структура/wall/HTF), докато OI/VOL ускорението изобщо
+  // не се е задействало - реално наблюдавано (7 монети наведнъж на 3/7 с
+  // почти нулево OI и VOL ratio 0.05x-0.17x, далеч под прага за ускорение).
+  const sparkKey = (sparkMaxScore >= 4 && !sparkExtension.extended) ? `${sparkDirection}:${sparkTier}` : 'none';
   const sparkFired = sparkCanFire(state, sparkKey);
   if (sparkFired) markSparkFired(state, sparkKey);
 
