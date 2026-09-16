@@ -936,6 +936,18 @@ async function fetchOiMultiHist(symbol) {
   } catch(e) { return null; }
 }
 
+// Taker buy/sell обем (IDEA 05 - "FLOW WARMING", виж calcFlowWarmingScore/
+// calcTakerFlowDelta в signal-logic.js) - огледално на fetchOiMultiHist по-горе,
+// same period=5m/limit=13 конвенция за 5m/15m/1h delta от ЕДИН fetch.
+async function fetchTakerFlowHist(symbol) {
+  try {
+    const r = await fetch(`https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=${symbol}&period=5m&limit=13`);
+    const data = await r.json();
+    if (!Array.isArray(data)) return null;
+    return data.map(d => ({ time: d.timestamp, buyVol: parseFloat(d.buyVol), sellVol: parseFloat(d.sellVol) })).filter(d => isFinite(d.buyVol) && isFinite(d.sellVol));
+  } catch(e) { return null; }
+}
+
 async function loadSpark() {
   const content = document.getElementById('main-content');
   content.innerHTML = `<div class="loading">СКАНИРАНЕ ЗА SPARK (РАННИ КАНДИДАТИ)...<br><span style="font-size:10px;color:var(--text2)">Проверява ${allCoins.length} монети (OI 5м/15м/1ч + обем 1ч/4ч)</span><div class="loading-bar"><div class="loading-fill"></div></div></div>`;
@@ -968,13 +980,15 @@ async function loadSpark() {
   const results = [];
   for (const coin of allCoins) {
     try {
-      const [k1h, k4h, oiHist] = await Promise.all([
+      const [k1h, k4h, oiHist, takerHist] = await Promise.all([
         fetchKlines(coin.fullSymbol, '1h', 60, SPARK_KLINE_TTL_MS),
         fetchKlines(coin.fullSymbol, '4h', 30, SPARK_KLINE_TTL_MS),
         fetchOiMultiHist(coin.fullSymbol),
+        fetchTakerFlowHist(coin.fullSymbol),
       ]);
       const c1h = klinesToCandles(k1h), c4h = klinesToCandles(k4h);
       const oiMulti = calcOiMultiDelta(oiHist);
+      const takerFlow = calcTakerFlowDelta(takerHist);
       const volAccel = calcVolAcceleration(c1h, c4h);
       const chg1h = calcPriceChangePct(c1h, 1);
       const chg4h = calcPriceChangePct(c4h, 1);
@@ -1001,6 +1015,18 @@ async function loadSpark() {
         coinOiDelta15m: oiMulti.delta15m, btcOiDelta15m: btcSparkContext.oiDelta15m,
         coinVolRatio: volAccel.ratio, btcVolRatio: btcSparkContext.volRatio,
       });
+      // IDEA 05 - "FLOW WARMING" (виж calcFlowWarmingScore в signal-logic.js) -
+      // ДВОЕН твърд фактор (OI И taker CVD едновременно), по-строг от SPARK
+      // нарочно - целта е да хване монетата ПРЕДИ тя да е събрала достатъчно
+      // "меки" точки, за да мине SPARK прага (виж бележката при функцията).
+      const flowWarmingScore = calcFlowWarmingScore({
+        symbol: coin.symbol, oiDelta15m: oiMulti.delta15m, takerDelta15m: takerFlow.delta15m,
+        volAccel, chg1h,
+      });
+      const flowWarmingDirection = flowWarmingScore.longScore >= flowWarmingScore.shortScore ? 'long' : 'short';
+      const flowWarmingMaxScore = Math.max(flowWarmingScore.longScore, flowWarmingScore.shortScore);
+      const flowWarmingHasHardFactor = flowWarmingDirection === 'long' ? flowWarmingScore.hasHardFactorLong : flowWarmingScore.hasHardFactorShort;
+      const flowWarmingTier = getFlowWarmingTier(flowWarmingMaxScore, flowWarmingHasHardFactor);
       coin.sparkSignal = {
         oiDelta5m: oiMulti.delta5m, oiDelta15m: oiMulti.delta15m, oiDelta1h: oiMulti.delta1h,
         volRatio: volAccel.ratio, chg1h, chg4h,
@@ -1012,11 +1038,17 @@ async function loadSpark() {
         shortTier: getSparkTier(score.shortScore, score.hasHardFactorShort),
         extended: extension.extended,
         relativeFlow: relativeFlow.classification, oiDivergence: relativeFlow.oiDivergence, volDivergence: relativeFlow.volDivergence,
+        takerDelta15m: takerFlow.delta15m,
+        flowWarmingTier, flowWarmingDirection, flowWarmingMaxScore,
       };
       // Точка 9 от предложението - Price Extension филтър: ако вече е "избягала",
       // не е "ранна" - не влиза в резултатите, независимо от score-а. Сега
       // проверяваме tier-а (вече включва твърдия фактор), не суровия score.
-      if (!extension.extended && (coin.sparkSignal.longTier !== 'none' || coin.sparkSignal.shortTier !== 'none')) {
+      // FLOW WARMING (IDEA 05) добавя ТРЕТА, самостоятелна причина за влизане в
+      // резултатите - монета с ДВОЕН (OI+CVD) твърд фактор може все още да няма
+      // sparkTier (не е събрала достатъчно "меки" точки за SPARK), но точно
+      // това е случаят, който FLOW WARMING цели да хване по-рано.
+      if (!extension.extended && (coin.sparkSignal.longTier !== 'none' || coin.sparkSignal.shortTier !== 'none' || flowWarmingTier !== 'none')) {
         results.push(coin);
       }
     } catch(e) { coin.sparkSignal = null; }
@@ -1029,6 +1061,14 @@ async function loadSpark() {
   // по-интересно от "цял пазар/BTC се движи заедно", 3) най-силно OI ускорение,
   // 4) най-силно обемно ускорение, 5) най-малко Price Extension.
   results.sort((a, b) => {
+    // IDEA 05 - "FLOW WARMING" - "leader" tier е приоритет ПРЕД самия SPARK
+    // score: точно тази комбинация (виж calcFlowWarmingScore) е сигналът,
+    // който трябва да изпъкне НАЙ-ОТГОРЕ, дори ако все още няма достатъчно
+    // "меки" точки за висок sparkTier - целта е да се хване РАНО, не след
+    // като вече е събрала точки другаде.
+    const aLeader = a.sparkSignal.flowWarmingTier === 'leader' ? 1 : 0;
+    const bLeader = b.sparkSignal.flowWarmingTier === 'leader' ? 1 : 0;
+    if (bLeader !== aLeader) return bLeader - aLeader;
     const aMax = Math.max(a.sparkSignal.longScore, a.sparkSignal.shortScore);
     const bMax = Math.max(b.sparkSignal.longScore, b.sparkSignal.shortScore);
     if (bMax !== aMax) return bMax - aMax;
@@ -1387,6 +1427,16 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     const flowLabel = RELATIVE_FLOW_LABELS[coin.sparkSignal.relativeFlow];
     if (flowLabel) tags.push(`<span class="tag" style="background:rgba(120,80,220,0.2);color:#a78bfa">${flowLabel}</span>`);
   }
+  // IDEA 05 - "FLOW WARMING" (виж calcFlowWarmingScore в signal-logic.js) -
+  // ЗАДЪЛЖИТЕЛНО извън sparkLabel гейта по-горе: целта на детектора е точно
+  // да хване монетата ПРЕДИ SPARK да е събрал достатъчно "меки" точки (виж
+  // резултатния филтър в loadSpark()) - тагът трябва да излезе дори когато
+  // sparkLabel е null.
+  const flowWarmingLabel = coin.sparkSignal ? FLOW_WARMING_LABELS[coin.sparkSignal.flowWarmingTier] : null;
+  if (flowWarmingLabel && !coin.sparkSignal.extended) {
+    const fwDir = coin.sparkSignal.flowWarmingDirection;
+    tags.push(`<span class="tag" style="background:${fwDir==='long'?'rgba(255,140,0,0.25)':'rgba(255,90,90,0.25)'};color:${fwDir==='long'?'#ffb84d':'#ff8080'}">${flowWarmingLabel} ${fwDir==='long'?'▲':'▼'} (${coin.sparkSignal.flowWarmingMaxScore}/4)</span>`);
+  }
   if (coin.sparkSignal?.extended) tags.push(`<span class="tag" style="background:rgba(180,140,0,0.2);color:var(--yellow)">⚠️ LATE/EXTENDED - DO NOT CHASE</span>`);
   const detectorBanner = isBottom ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>` : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding.toFixed(3)}% · L/S>${coin.longPct.toFixed(0)}% · OI↓</div>` : '';
   let setupBanner = '';
@@ -1406,6 +1456,20 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
       <div style="color:var(--text2);margin-top:2px;">OI 5m: ${fmtPct(s.oiDelta5m)} · OI 15m: ${fmtPct(s.oiDelta15m)} · OI 1h: ${fmtPct(s.oiDelta1h)}</div>
       <div style="color:var(--text2);">VOL 1h/4h avg: ${s.volRatio!=null?s.volRatio.toFixed(2)+'x':'--'} · PRICE 1h: ${fmtPct(s.chg1h)}</div>
       ${RELATIVE_FLOW_LABELS[s.relativeFlow] ? `<div style="color:#a78bfa;margin-top:2px;">${RELATIVE_FLOW_LABELS[s.relativeFlow]} · спрямо BTC: OI ${fmtPct(s.oiDivergence)} · VOL ${s.volDivergence!=null?(s.volDivergence>0?'+':'')+s.volDivergence.toFixed(2)+'x':'--'}</div>` : ''}
+    </div>`;
+  }
+  // FLOW WARMING детайлен банер (IDEA 05) - отделен от SPARK банера по-горе
+  // (виж бележката при flowWarmingLabel в таговете) - излиза дори когато
+  // sparkLabel е null, точно за случая "хванат преди SPARK".
+  let flowWarmingBanner = '';
+  if (flowWarmingLabel && !coin.sparkSignal.extended) {
+    const s = coin.sparkSignal;
+    const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+    const fwDir = s.flowWarmingDirection;
+    flowWarmingBanner = `<div style="margin:6px 0;padding:6px 8px;border-radius:4px;background:${fwDir==='long'?'rgba(255,140,0,0.10)':'rgba(255,90,90,0.10)'};border-left:3px solid ${fwDir==='long'?'#ffb84d':'#ff8080'};font-size:10px;">
+      <div style="font-weight:600;color:${fwDir==='long'?'#ffb84d':'#ff8080'}">${flowWarmingLabel} ${fwDir==='long'?'▲ LONG':'▼ SHORT'} · FLOW WARMING SCORE: ${s.flowWarmingMaxScore}/4</div>
+      <div style="color:var(--text2);margin-top:2px;">OI 15m: ${fmtPct(s.oiDelta15m)} · CVD (taker) 15m: ${fmtPct(s.takerDelta15m)}</div>
+      <div style="color:var(--text2);">VOL 1h/4h avg: ${s.volRatio!=null?s.volRatio.toFixed(2)+'x':'--'} · PRICE 1h: ${fmtPct(s.chg1h)}</div>
     </div>`;
   }
   const detectorClass = (isBottom ? ' detector-bottom' : isTop ? ' detector-top' : '') + (coin.oiFlip ? ' oi-flip' : '');
@@ -1450,6 +1514,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     ${detectorBanner}
     ${setupBanner}
     ${sparkBanner}
+    ${flowWarmingBanner}
     <div style="color:var(--text2);font-size:9px;letter-spacing:.5px;margin:6px 0 -2px;">⚡ МОМЕНТУМ ПОСОКА (24ч/L-S/funding/обем) — независимо от паттърн таговете горе</div>
     <div class="signal-box">
       <div class="signal-badge badge-${sc}">${sig.signal}</div>
