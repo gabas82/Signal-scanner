@@ -1148,6 +1148,56 @@ function calcRelativeFlow({ coinHasHardFactor, coinDirection, btcHasHardFactor, 
   return { classification, oiDivergence, volDivergence };
 }
 
+// ═══ TAKER BUY/SELL ОБЕМ - "CVD/Delta proxy" (инфраструктура за IDEA 01/05/06) ═
+// Binance klines дават само комбиниран обем (buy+sell слети) - без разбивка
+// не може да се различи "агресивно купуване" от "агресивна продажба", а точно
+// това търсят IDEA 01 (Absorption/Trap), IDEA 05 (Flow Warming) и IDEA 06
+// (Reload/Second Entry). futures/data/takerlongshortRatio е най-близкият
+// безплатен Binance proxy до истинско CVD/Delta - връща агресивен taker
+// buyVol/sellVol за периода (не суровен trader account ratio, какъвто е
+// globalLongShortAccountRatio по-горе). Изцяло нов, отделен слой - засега само
+// смята и връща данните (виж fetchTakerLongShortWorker и scanSymbolSignals
+// по-долу), не гейтва/сменя нищо съществуващо. Byte-identical копие на
+// функциите от signal-logic.js.
+function calcTakerBuyPressure(entry) {
+  if (!entry) return null;
+  const total = entry.buyVol + entry.sellVol;
+  if (!total) return null;
+  return (entry.buyVol / total) * 100;
+}
+// Мулти-грануларна delta на taker buy pressure (5m/15m/1h), огледално на
+// calcOiMultiDelta по-горе - от ЕДНА история с period=5m смятаме и трите delta
+// (5m = 1 период назад, 15m = 3 периода назад, 1h = 12 периода назад).
+// Ускоряващ се buyPressure БЕЗ пропорционално движение на цената е точно
+// "абсорбция"/"flow warming" сигналът, който IDEA 01/05 търсят.
+function calcTakerFlowDelta(takerHist) {
+  const n = takerHist ? takerHist.length : 0;
+  const now = n ? calcTakerBuyPressure(takerHist[n - 1]) : null;
+  const deltaAt = (lookback) => {
+    if (n < lookback + 1 || now == null) return null;
+    const prev = calcTakerBuyPressure(takerHist[n - 1 - lookback]);
+    if (prev == null) return null;
+    return now - prev;
+  };
+  return { buyPressureNow: now, delta5m: deltaAt(1), delta15m: deltaAt(3), delta1h: deltaAt(12) };
+}
+// Taker buy/sell обем (Binance futures/data/takerlongshortRatio) - през
+// relay-я по същата причина като klines/ticker/funding/openinterest. Връща
+// масив {time, buyVol, sellVol} във възходящ хронологичен ред (най-новото
+// последно), или null при грешка/липсващи данни - огледално на
+// fetchOpenInterestHistWorker по-долу.
+async function fetchTakerLongShortWorker(env, symbol, period = '5m', limit = 13) {
+  try {
+    const r = await fetch(`${env.RELAY_URL}/takerlongshort?symbol=${symbol}&period=${period}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (!Array.isArray(data) || !data.length) return null;
+    return data.map(d => ({ time: d.timestamp, buyVol: parseFloat(d.buyVol), sellVol: parseFloat(d.sellVol) })).filter(d => isFinite(d.buyVol) && isFinite(d.sellVol));
+  } catch (e) {
+    return null;
+  }
+}
+
 // ============================================================================
 // PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
 // HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
@@ -1855,13 +1905,14 @@ async function scanSymbolSignals(env, symbol) {
   // Long-Short/funding - последните две вече се теглят от checkMacroSqueeze за
   // друга цел, тук е отделно извикване, огледално на съществуващия прецедент).
   // НЕ променя по никакъв начин longScore/shortScore/confidence по-горе.
-  const [oiHist, wallsRaw, chg24h, longShortCycle, fundingCycle, liquidationOrders] = await Promise.all([
+  const [oiHist, wallsRaw, chg24h, longShortCycle, fundingCycle, liquidationOrders, takerHist] = await Promise.all([
     fetchOpenInterestHistWorker(env, symbol, '5m', 13),
     fetchOrderBookWallsWorker(env, symbol, price),
     fetch24hChangeWorker(env, symbol),
     fetchLongShortWorker(env, symbol),
     fetchFundingWorker(env, symbol),
     fetchLiquidationOrdersWorker(env, symbol),
+    fetchTakerLongShortWorker(env, symbol, '5m', 13),
   ]);
   const oiDeltaPct = calcOiDeltaPct(oiHist);
   const oiCross = interpretOiPriceCross(warming.direction === 'up', oiDeltaPct);
@@ -1946,6 +1997,11 @@ async function scanSymbolSignals(env, symbol) {
   const sparkFired = sparkCanFire(state, sparkKey);
   if (sparkFired) markSparkFired(state, sparkKey);
 
+  // Taker buy/sell обем (виж calcTakerFlowDelta по-горе) - засега само се
+  // смята и връща, не участва в sparkKey/sparkFired/cyclePhase - инфраструктура
+  // за предстоящите IDEA 01/05/06 детектори (виж git history за плана).
+  const takerFlow = calcTakerFlowDelta(takerHist);
+
   await saveSymbolState(env, symbol, state);
 
   return {
@@ -1956,6 +2012,8 @@ async function scanSymbolSignals(env, symbol) {
     sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore,
     sparkOiDelta5m: oiMulti.delta5m, sparkOiDelta15m: oiMulti.delta15m, sparkOiDelta1h: oiMulti.delta1h,
     sparkVolRatio: volAccel.ratio, sparkChg1h, sparkChg4h, sparkExtended: sparkExtension.extended,
+    takerBuyPressure: takerFlow.buyPressureNow, takerDelta5m: takerFlow.delta5m,
+    takerDelta15m: takerFlow.delta15m, takerDelta1h: takerFlow.delta1h,
   };
 }
 

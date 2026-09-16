@@ -1114,6 +1114,39 @@ function calcRelativeFlow({ coinHasHardFactor, coinDirection, btcHasHardFactor, 
   return { classification, oiDivergence, volDivergence };
 }
 
+// ═══ TAKER BUY/SELL ОБЕМ - "CVD/Delta proxy" (инфраструктура за IDEA 01/05/06) ═
+// Binance klines дават само комбиниран обем (buy+sell слети) - без разбивка
+// не може да се различи "агресивно купуване" от "агресивна продажба", а точно
+// това търсят IDEA 01 (Absorption/Trap), IDEA 05 (Flow Warming) и IDEA 06
+// (Reload/Second Entry). futures/data/takerlongshortRatio е най-близкият
+// безплатен Binance proxy до истинско CVD/Delta - връща агресивен taker
+// buyVol/sellVol за периода (не suровен trader account ratio, какъвто е
+// globalLongShortAccountRatio по-горе). Изцяло нов, отделен слой - засега само
+// смята и връща данните (виж fetchTakerLongShortWorker в worker.js), не гейтва/
+// сменя нищо съществуващо.
+function calcTakerBuyPressure(entry) {
+  if (!entry) return null;
+  const total = entry.buyVol + entry.sellVol;
+  if (!total) return null;
+  return (entry.buyVol / total) * 100;
+}
+// Мулти-грануларна delta на taker buy pressure (5m/15m/1h), огледално на
+// calcOiMultiDelta по-горе - от ЕДНА история с period=5m смятаме и трите delta
+// (5m = 1 период назад, 15m = 3 периода назад, 1h = 12 периода назад).
+// Ускоряващ се buyPressure БЕЗ пропорционално движение на цената е точно
+// "абсорбция"/"flow warming" сигналът, който IDEA 01/05 търсят.
+function calcTakerFlowDelta(takerHist) {
+  const n = takerHist ? takerHist.length : 0;
+  const now = n ? calcTakerBuyPressure(takerHist[n - 1]) : null;
+  const deltaAt = (lookback) => {
+    if (n < lookback + 1 || now == null) return null;
+    const prev = calcTakerBuyPressure(takerHist[n - 1 - lookback]);
+    if (prev == null) return null;
+    return now - prev;
+  };
+  return { buyPressureNow: now, delta5m: deltaAt(1), delta15m: deltaAt(3), delta1h: deltaAt(12) };
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -1135,6 +1168,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcSqueezeCondition, calcPriceExtension, getSparkCoinTier, calcSparkScore,
     getSparkTier, SPARK_LABELS, SPARK_OI_THRESHOLD, SPARK_VOL_RATIO_THRESHOLD,
     SPARK_FUNDING_EXTREME, SPARK_EXTENSION_1H_PCT, SPARK_EXTENSION_4H_PCT,
-    calcRelativeFlow, RELATIVE_FLOW_LABELS
+    calcRelativeFlow, RELATIVE_FLOW_LABELS,
+    calcTakerBuyPressure, calcTakerFlowDelta
   };
 }

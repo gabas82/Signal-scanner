@@ -124,6 +124,26 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // За IDEA 01/05/06 (Absorption/Flow Warming/Reload - виж worker/worker.js) -
+  // Binance klines дават само комбиниран обем, без buy/sell разбивка.
+  // futures/data/takerlongshortRatio е най-близкият безплатен Binance proxy
+  // до истинско CVD/Delta (агресивен taker обем купуване срещу продаване),
+  // за разлика от globalLongShortAccountRatio по-горе (trader account ratio).
+  if (url.pathname === '/takerlongshort') {
+    if (!requireToken(url, res)) return;
+    const symbol = url.searchParams.get('symbol');
+    const period = url.searchParams.get('period') || '5m';
+    const limit = url.searchParams.get('limit') || '30';
+    if (!symbol) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'symbol is required' }));
+      return;
+    }
+    const target = `https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(limit)}`;
+    proxyToBinance(target, res);
+    return;
+  }
+
   // За PHASE CYCLE ENGINE (order book Buy/Sell стени - за wall bias с distance filter).
   if (url.pathname === '/depth') {
     if (!requireToken(url, res)) return;
