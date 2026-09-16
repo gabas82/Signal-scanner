@@ -2022,6 +2022,18 @@ async function scanSymbolSignals(env, symbol) {
   // wallBiasLong/sellWallDominant, fundingCycle, и същия oiHist fetch (вече
   // разширен на limit=13 по-горе, за да не се прави отделна мрежова заявка).
   // НЕ променя по никакъв начин cycleLongScore/cycleShortScore/cyclePhase.
+  // РЕАЛЕН БЪГ (открит при тестване на FLOW WARMING) - getSparkCoinTier
+  // (викана вътре в calcSparkScore/calcFlowWarmingScore) очаква "чист" символ
+  // без USDT наставка (MAJOR_COINS/SEMI_MAJOR_COINS съдържат 'BTC', 'ETH' и
+  // т.н., НЕ 'BTCUSDT'), но `symbol` тук е пълният watchlist символ
+  // ('BTCUSDT') - `MAJOR_COINS.has('BTCUSDT')` винаги е false, затова ВСЯКА
+  // монета (включително BTC) тихо падаше в 'minor' tier (най-строгите
+  // прагове: 8% OI/1.8x обем вместо 3%/1.3x за major). В Scanner UI
+  // (signal-scanner.html) този бъг го няма - там вече се подава coin.symbol
+  // (чист, без USDT). Поправка: чистим наставката ТУК, преди двете
+  // извиквания по-долу - byte-identical принцип не важи тук, защото UI-то
+  // никога не е имало бъга, само Worker-ът трябваше да го наследи погрешно.
+  const symbolNoUsdt = symbol.replace('USDT', '');
   const oiMulti = calcOiMultiDelta(oiHist);
   const volAccel = calcVolAcceleration(c1h, c4h);
   const sparkChg1h = calcPriceChangePct(c1h, 1);
@@ -2035,7 +2047,7 @@ async function scanSymbolSignals(env, symbol) {
   });
   const sparkExtension = calcPriceExtension(sparkChg1h, sparkChg4h);
   const sparkScore = calcSparkScore({
-    symbol, oiDelta15m: oiMulti.delta15m, volAccel, chg1h: sparkChg1h,
+    symbol: symbolNoUsdt, oiDelta15m: oiMulti.delta15m, volAccel, chg1h: sparkChg1h,
     structureShift: sparkStructureShift, squeeze: sparkSqueeze,
     wallBias: sparkWallBias, htfAligned: sparkHtfAligned,
   });
@@ -2064,7 +2076,7 @@ async function scanSymbolSignals(env, symbol) {
   // по-горе) - реюзва вече изчислените oiMulti/volAccel/sparkChg1h (нула нови
   // мрежови заявки), собствено, независимо известие/cooldown от SPARK.
   const flowWarmingScore = calcFlowWarmingScore({
-    symbol, oiDelta15m: oiMulti.delta15m, takerDelta15m: takerFlow.delta15m,
+    symbol: symbolNoUsdt, oiDelta15m: oiMulti.delta15m, takerDelta15m: takerFlow.delta15m,
     volAccel, chg1h: sparkChg1h,
   });
   const flowWarmingDirection = flowWarmingScore.longScore >= flowWarmingScore.shortScore ? 'long' : 'short';
