@@ -1147,6 +1147,53 @@ function calcTakerFlowDelta(takerHist) {
   return { buyPressureNow: now, delta5m: deltaAt(1), delta15m: deltaAt(3), delta1h: deltaAt(12) };
 }
 
+// ═══ IDEA 05 - "FLOW WARMING" (Position Flow / Impulse Fuel Engine) ═══════════
+// Ранно предупреждение ПРЕДИ SPARK/официалния IMPULSE да са се задействали.
+// SPARK (виж calcSparkScore по-горе) вече гледа OI ускорение И обемно
+// ускорение поотделно (ИЛИ едно от двете е достатъчно за hard factor), но
+// никога taker CVD. Тук изискваме ДВОЕН, едновременен твърд фактор - OI
+// ускорение И taker buy/sell CVD ускорение (calcTakerFlowDelta по-горе) в
+// СЪЩАТА посока - по-строго от SPARK нарочно, за да хване по-рано точно
+// комбинацията "капиталът/агресивният поток вече се събужда заедно", преди
+// да е събрала достатъчно "меки" точки, за да мине SPARK прага.
+const FLOW_WARMING_TAKER_DELTA_THRESHOLD = 3; // пунктове (% buy pressure delta за 15м)
+function calcFlowWarmingScore({ symbol, oiDelta15m, takerDelta15m, volAccel, chg1h }) {
+  const tier = getSparkCoinTier(symbol);
+  const oiThreshold = SPARK_OI_THRESHOLD[tier];
+  const volThreshold = SPARK_VOL_RATIO_THRESHOLD[tier];
+  const oiAccelUp = oiDelta15m != null && oiDelta15m >= oiThreshold;
+  const oiAccelDown = oiDelta15m != null && oiDelta15m <= -oiThreshold;
+  const takerAccelUp = takerDelta15m != null && takerDelta15m >= FLOW_WARMING_TAKER_DELTA_THRESHOLD;
+  const takerAccelDown = takerDelta15m != null && takerDelta15m <= -FLOW_WARMING_TAKER_DELTA_THRESHOLD;
+  const volAccelOK = volAccel != null && volAccel.ratio != null && volAccel.ratio >= volThreshold;
+  const priceCompressed = chg1h != null && Math.abs(chg1h) <= 4;
+
+  let longScore = 0, shortScore = 0;
+  if (oiAccelUp && takerAccelUp) longScore += 2;
+  if (oiAccelDown && takerAccelDown) shortScore += 2;
+  if (volAccelOK) { longScore++; shortScore++; }
+  if (priceCompressed) { longScore++; shortScore++; }
+
+  // Твърд фактор тук е ДВОЙНО условие (за разлика от SPARK-овия hasHardFactor,
+  // който е "ИЛИ") - изисква OI И CVD едновременно да ускоряват в СЪЩАТА
+  // посока, не поотделно. Именно тази комбинация е новото спрямо SPARK.
+  const hasHardFactorLong = oiAccelUp && takerAccelUp;
+  const hasHardFactorShort = oiAccelDown && takerAccelDown;
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort };
+}
+const FLOW_WARMING_LABELS = {
+  none: null,
+  warming: '🌡️ FLOW WARMING',
+  leader: '🔥 EARLY FLOW LEADER',
+};
+// Максимален score е 4 (2т от двойния твърд фактор + 1т обем + 1т компресия).
+function getFlowWarmingTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'leader';
+  if (score >= 3) return 'warming';
+  return 'none';
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -1169,6 +1216,7 @@ if (typeof module !== 'undefined' && module.exports) {
     getSparkTier, SPARK_LABELS, SPARK_OI_THRESHOLD, SPARK_VOL_RATIO_THRESHOLD,
     SPARK_FUNDING_EXTREME, SPARK_EXTENSION_1H_PCT, SPARK_EXTENSION_4H_PCT,
     calcRelativeFlow, RELATIVE_FLOW_LABELS,
-    calcTakerBuyPressure, calcTakerFlowDelta
+    calcTakerBuyPressure, calcTakerFlowDelta,
+    calcFlowWarmingScore, getFlowWarmingTier, FLOW_WARMING_LABELS, FLOW_WARMING_TAKER_DELTA_THRESHOLD
   };
 }

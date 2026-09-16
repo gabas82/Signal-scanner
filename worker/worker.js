@@ -1198,6 +1198,54 @@ async function fetchTakerLongShortWorker(env, symbol, period = '5m', limit = 13)
   }
 }
 
+// ═══ IDEA 05 - "FLOW WARMING" (Position Flow / Impulse Fuel Engine) ═══════════
+// Ранно предупреждение ПРЕДИ SPARK/официалния IMPULSE да са се задействали.
+// SPARK (виж calcSparkScore по-горе) вече гледа OI ускорение И обемно
+// ускорение поотделно (ИЛИ едно от двете е достатъчно за hard factor), но
+// никога taker CVD. Тук изискваме ДВОЕН, едновременен твърд фактор - OI
+// ускорение И taker buy/sell CVD ускорение (calcTakerFlowDelta по-горе) в
+// СЪЩАТА посока - по-строго от SPARK нарочно, за да хване по-рано точно
+// комбинацията "капиталът/агресивният поток вече се събужда заедно", преди
+// да е събрала достатъчно "меки" точки, за да мине SPARK прага. Byte-identical
+// копие на функциите от signal-logic.js.
+const FLOW_WARMING_TAKER_DELTA_THRESHOLD = 3; // пунктове (% buy pressure delta за 15м)
+function calcFlowWarmingScore({ symbol, oiDelta15m, takerDelta15m, volAccel, chg1h }) {
+  const tier = getSparkCoinTier(symbol);
+  const oiThreshold = SPARK_OI_THRESHOLD[tier];
+  const volThreshold = SPARK_VOL_RATIO_THRESHOLD[tier];
+  const oiAccelUp = oiDelta15m != null && oiDelta15m >= oiThreshold;
+  const oiAccelDown = oiDelta15m != null && oiDelta15m <= -oiThreshold;
+  const takerAccelUp = takerDelta15m != null && takerDelta15m >= FLOW_WARMING_TAKER_DELTA_THRESHOLD;
+  const takerAccelDown = takerDelta15m != null && takerDelta15m <= -FLOW_WARMING_TAKER_DELTA_THRESHOLD;
+  const volAccelOK = volAccel != null && volAccel.ratio != null && volAccel.ratio >= volThreshold;
+  const priceCompressed = chg1h != null && Math.abs(chg1h) <= 4;
+
+  let longScore = 0, shortScore = 0;
+  if (oiAccelUp && takerAccelUp) longScore += 2;
+  if (oiAccelDown && takerAccelDown) shortScore += 2;
+  if (volAccelOK) { longScore++; shortScore++; }
+  if (priceCompressed) { longScore++; shortScore++; }
+
+  // Твърд фактор тук е ДВОЙНО условие (за разлика от SPARK-овия hasHardFactor,
+  // който е "ИЛИ") - изисква OI И CVD едновременно да ускоряват в СЪЩАТА
+  // посока, не поотделно. Именно тази комбинация е новото спрямо SPARK.
+  const hasHardFactorLong = oiAccelUp && takerAccelUp;
+  const hasHardFactorShort = oiAccelDown && takerAccelDown;
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort };
+}
+const FLOW_WARMING_LABELS = {
+  none: null,
+  warming: '🌡️ FLOW WARMING',
+  leader: '🔥 EARLY FLOW LEADER',
+};
+// Максимален score е 4 (2т от двойния твърд фактор + 1т обем + 1т компресия).
+function getFlowWarmingTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'leader';
+  if (score >= 3) return 'warming';
+  return 'none';
+}
+
 // ============================================================================
 // PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
 // HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
@@ -1467,6 +1515,16 @@ function sparkCanFire(state, key) {
 }
 function markSparkFired(state, key) {
   state.spark = { key, at: Date.now() };
+}
+
+// FLOW WARMING - огледално на sparkCanFire/markSparkFired по-горе, собствен
+// KV state ключ (state.flowWarming, не state.spark) - собствено, независимо
+// известие, огледално на SPARK/🔮 ЦИКЪЛ.
+function flowWarmingCanFire(state, key) {
+  return key !== 'none' && state.flowWarming?.key !== key;
+}
+function markFlowWarmingFired(state, key) {
+  state.flowWarming = { key, at: Date.now() };
 }
 
 // WhatsApp/Android понякога разпознава "$" залепено директно за низ от цифри
@@ -2002,6 +2060,21 @@ async function scanSymbolSignals(env, symbol) {
   // за предстоящите IDEA 01/05/06 детектори (виж git history за плана).
   const takerFlow = calcTakerFlowDelta(takerHist);
 
+  // ---- FLOW WARMING (виж дефинициите непосредствено след fetchTakerLongShortWorker
+  // по-горе) - реюзва вече изчислените oiMulti/volAccel/sparkChg1h (нула нови
+  // мрежови заявки), собствено, независимо известие/cooldown от SPARK.
+  const flowWarmingScore = calcFlowWarmingScore({
+    symbol, oiDelta15m: oiMulti.delta15m, takerDelta15m: takerFlow.delta15m,
+    volAccel, chg1h: sparkChg1h,
+  });
+  const flowWarmingDirection = flowWarmingScore.longScore >= flowWarmingScore.shortScore ? 'long' : 'short';
+  const flowWarmingMaxScore = Math.max(flowWarmingScore.longScore, flowWarmingScore.shortScore);
+  const flowWarmingHasHardFactor = flowWarmingDirection === 'long' ? flowWarmingScore.hasHardFactorLong : flowWarmingScore.hasHardFactorShort;
+  const flowWarmingTier = getFlowWarmingTier(flowWarmingMaxScore, flowWarmingHasHardFactor);
+  const flowWarmingKey = (flowWarmingMaxScore >= 3 && flowWarmingHasHardFactor) ? `${flowWarmingDirection}:${flowWarmingTier}` : 'none';
+  const flowWarmingFired = flowWarmingCanFire(state, flowWarmingKey);
+  if (flowWarmingFired) markFlowWarmingFired(state, flowWarmingKey);
+
   await saveSymbolState(env, symbol, state);
 
   return {
@@ -2014,6 +2087,7 @@ async function scanSymbolSignals(env, symbol) {
     sparkVolRatio: volAccel.ratio, sparkChg1h, sparkChg4h, sparkExtended: sparkExtension.extended,
     takerBuyPressure: takerFlow.buyPressureNow, takerDelta5m: takerFlow.delta5m,
     takerDelta15m: takerFlow.delta15m, takerDelta1h: takerFlow.delta1h,
+    flowWarmingKey, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore,
   };
 }
 
@@ -2030,7 +2104,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -2131,6 +2205,24 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
         }
         sparkLines.push(`⚠️ Все още НЕ Е entry - следи за развитие`);
         await sendWhatsApp(env, sparkLines.join('\n'));
+      }
+      // FLOW WARMING (IDEA 05, виж calcFlowWarmingScore по-горе) - изцяло
+      // отделно известие, огледално на SPARK/"🔮 ЦИКЪЛ" - праща се САМО при
+      // нов/променен активен flow warming сигнал (flowWarmingFired, виж
+      // flowWarmingCanFire), независимо от sparkFired/sparkKey - целта е да
+      // хване монети, при които OI+CVD вече ускоряват заедно, ПРЕДИ SPARK
+      // да е събрал достатъчно "меки" точки, за да гръмне.
+      if (flowWarmingFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const flowWarmingLines = [
+          `${FLOW_WARMING_LABELS[flowWarmingTier]} ${symbolNoUsdt} ${flowWarmingDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `FLOW WARMING SCORE: ${flowWarmingMaxScore}/4`,
+          `OI 15м: ${fmtPct(sparkOiDelta15m)} · CVD (taker) 15м: ${fmtPct(takerDelta15m)}`,
+          `VOL 1ч/4ч ср.: ${sparkVolRatio != null ? sparkVolRatio.toFixed(2) + 'x' : '--'} · Цена 1ч: ${fmtPct(sparkChg1h)}`,
+          `⚠️ Все още НЕ Е entry - следи за развитие`,
+        ];
+        await sendWhatsApp(env, flowWarmingLines.join('\n'));
       }
     } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }
   }
