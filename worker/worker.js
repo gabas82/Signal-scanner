@@ -1121,6 +1121,33 @@ function getSparkTier(score, hasHardFactor) {
   return 'none';
 }
 
+// ═══ IDEA 07 - "RELATIVE FLOW" (BTC-independent flow) ═══════════════════════
+// Разграничава "монетата се събужда сама" от "монетата просто следва BTC".
+// Изцяло построен ВЪРХУ вече изчисления SPARK hard-factor gate (виж
+// calcSparkScore/getSparkTier по-горе) - нула нови мрежови заявки/данни:
+// BTC-ят вече минава през същия SPARK скан като всяка друга монета от
+// WATCHLIST (виж checkMarketSignals по-долу), само реюзваме неговия резултат
+// за сравнение. SHADOW MODE - изцяло информативно, не гейтва/блокира нищо
+// съществуващо. Byte-identical копие на функцията от signal-logic.js.
+const RELATIVE_FLOW_LABELS = {
+  none: null,
+  coinSpecific: '🎯 COIN-SPECIFIC',
+  marketDriven: '🌊 MARKET-DRIVEN',
+  mixed: '↔️ MIXED',
+};
+function calcRelativeFlow({ coinHasHardFactor, coinDirection, btcHasHardFactor, btcDirection, coinOiDelta15m, btcOiDelta15m, coinVolRatio, btcVolRatio }) {
+  if (!coinHasHardFactor) {
+    return { classification: 'none', oiDivergence: null, volDivergence: null };
+  }
+  const oiDivergence = (coinOiDelta15m ?? 0) - (btcOiDelta15m ?? 0);
+  const volDivergence = (coinVolRatio ?? 0) - (btcVolRatio ?? 0);
+  let classification;
+  if (!btcHasHardFactor) classification = 'coinSpecific';
+  else if (btcDirection === coinDirection) classification = 'marketDriven';
+  else classification = 'mixed';
+  return { classification, oiDivergence, volDivergence };
+}
+
 // ============================================================================
 // PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
 // HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
@@ -1936,9 +1963,22 @@ async function scanSymbolSignals(env, symbol) {
 // За разлика от checkDcaLevels(), сканира ВСИЧКИ записи от WATCHLIST -
 // entryPrice/side не са нужни тук (следим монетата, не конкретна позиция).
 async function checkMarketSignals(env, watchlist = WATCHLIST) {
+  // IDEA 07 - "RELATIVE FLOW" (виж calcRelativeFlow по-горе) - BTC е ВИНАГИ
+  // watchlist[0] (виж WATCHLIST по-горе), а for-of цикълът е строго
+  // последователен (await вътре), затова BTC гарантирано се обработва ПЪРВИ и
+  // резултатът му може да се преизползва за всички следващи монети в СЪЩИЯ
+  // тик - нула допълнителни заявки. Default стойността (без hard factor)
+  // важи само за самата BTC итерация, преди да е записан собственият ѝ резултат.
+  let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
       const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h } = await scanSymbolSignals(env, pos.symbol);
+      if (pos.symbol === 'BTCUSDT') {
+        btcFlowContext = {
+          hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
+          oiDelta15m: sparkOiDelta15m, volRatio: sparkVolRatio,
+        };
+      }
       // MIN_NOTIFY_SCORE - самотен слаб сигнал вече не праща цяло известие,
       // само защото нещо е "активно" (виж бележката при MIN_NOTIFY_SCORE).
       // ACTIVE SIGNAL MEMORY (т.4 от спецификацията) - стари сигнали от паметта
@@ -2012,13 +2052,26 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
       if (sparkFired) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
         const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        // IDEA 07 - "RELATIVE FLOW" - добавен ред към вече съществуващото SPARK
+        // известие (не ново отделно съобщение, за да не създава нов спам поток -
+        // виж git history за коментара за EARLY WATCH спама). SHADOW MODE -
+        // чисто информативно, не влияе на sparkFired/sparkKey firing логиката.
+        const relativeFlow = calcRelativeFlow({
+          coinHasHardFactor: sparkTier !== 'none', coinDirection: sparkDirection,
+          btcHasHardFactor: btcFlowContext.hasHardFactor, btcDirection: btcFlowContext.direction,
+          coinOiDelta15m: sparkOiDelta15m, btcOiDelta15m: btcFlowContext.oiDelta15m,
+          coinVolRatio: sparkVolRatio, btcVolRatio: btcFlowContext.volRatio,
+        });
         const sparkLines = [
           `${SPARK_LABELS[sparkTier]} ${symbolNoUsdt} ${sparkDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
           `SPARK SCORE: ${sparkMaxScore}/7`,
           `OI 5м: ${fmtPct(sparkOiDelta5m)} · OI 15м: ${fmtPct(sparkOiDelta15m)} · OI 1ч: ${fmtPct(sparkOiDelta1h)}`,
           `VOL 1ч/4ч ср.: ${sparkVolRatio != null ? sparkVolRatio.toFixed(2) + 'x' : '--'} · Цена 1ч: ${fmtPct(sparkChg1h)}`,
-          `⚠️ Все още НЕ Е entry - следи за развитие`,
         ];
+        if (RELATIVE_FLOW_LABELS[relativeFlow.classification]) {
+          sparkLines.push(`${RELATIVE_FLOW_LABELS[relativeFlow.classification]} спрямо BTC`);
+        }
+        sparkLines.push(`⚠️ Все още НЕ Е entry - следи за развитие`);
         await sendWhatsApp(env, sparkLines.join('\n'));
       }
     } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }

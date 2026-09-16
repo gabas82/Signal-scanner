@@ -939,6 +939,32 @@ async function fetchOiMultiHist(symbol) {
 async function loadSpark() {
   const content = document.getElementById('main-content');
   content.innerHTML = `<div class="loading">СКАНИРАНЕ ЗА SPARK (РАННИ КАНДИДАТИ)...<br><span style="font-size:10px;color:var(--text2)">Проверява ${allCoins.length} монети (OI 5м/15м/1ч + обем 1ч/4ч)</span><div class="loading-bar"><div class="loading-fill"></div></div></div>`;
+  // IDEA 07 - "RELATIVE FLOW" (виж calcRelativeFlow в signal-logic.js) - BTC
+  // reference точка, изтеглена ЕДНОКРАТНО преди цикъла (не за всяка монета
+  // поотделно) - нула допълнителни fetch типове отвъд вече съществуващите за
+  // SPARK, само за BTCUSDT вместо за текущата монета. Ако fetch-ът се провали,
+  // остава default (без hard factor), значи всяка монета пада в COIN-SPECIFIC -
+  // приемливо деградиране, не чупи скана.
+  let btcSparkContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
+  try {
+    const [btcK1h, btcK4h, btcOiHist] = await Promise.all([
+      fetchKlines('BTCUSDT', '1h', 60, SPARK_KLINE_TTL_MS),
+      fetchKlines('BTCUSDT', '4h', 30, SPARK_KLINE_TTL_MS),
+      fetchOiMultiHist('BTCUSDT'),
+    ]);
+    const btcC1h = klinesToCandles(btcK1h), btcC4h = klinesToCandles(btcK4h);
+    const btcOiMulti = calcOiMultiDelta(btcOiHist);
+    const btcVolAccel = calcVolAcceleration(btcC1h, btcC4h);
+    const btcScore = calcSparkScore({
+      symbol: 'BTC', oiDelta15m: btcOiMulti.delta15m, volAccel: btcVolAccel, chg1h: null,
+      structureShift: {}, squeeze: {}, wallBias: null, htfAligned: null,
+    });
+    btcSparkContext = {
+      hasHardFactor: btcScore.hasHardFactorLong || btcScore.hasHardFactorShort,
+      direction: (btcOiMulti.delta15m ?? 0) >= 0 ? 'long' : 'short',
+      oiDelta15m: btcOiMulti.delta15m, volRatio: btcVolAccel.ratio,
+    };
+  } catch (e) { /* остава default */ }
   const results = [];
   for (const coin of allCoins) {
     try {
@@ -964,6 +990,17 @@ async function loadSpark() {
         symbol: coin.symbol, oiDelta15m: oiMulti.delta15m, volAccel, chg1h,
         structureShift, squeeze, wallBias: coin.liqBias, htfAligned,
       });
+      // IDEA 07 - "RELATIVE FLOW" - сравнява дали ТАЗИ монета ускорява сама,
+      // докато BTC (btcSparkContext, изтеглен веднъж преди цикъла) е спокоен,
+      // или движението е MARKET-DRIVEN/MIXED. SHADOW MODE - чисто информативно.
+      const coinDirection = score.longScore >= score.shortScore ? 'long' : 'short';
+      const coinHasHardFactor = coinDirection === 'long' ? score.hasHardFactorLong : score.hasHardFactorShort;
+      const relativeFlow = calcRelativeFlow({
+        coinHasHardFactor, coinDirection,
+        btcHasHardFactor: btcSparkContext.hasHardFactor, btcDirection: btcSparkContext.direction,
+        coinOiDelta15m: oiMulti.delta15m, btcOiDelta15m: btcSparkContext.oiDelta15m,
+        coinVolRatio: volAccel.ratio, btcVolRatio: btcSparkContext.volRatio,
+      });
       coin.sparkSignal = {
         oiDelta5m: oiMulti.delta5m, oiDelta15m: oiMulti.delta15m, oiDelta1h: oiMulti.delta1h,
         volRatio: volAccel.ratio, chg1h, chg4h,
@@ -974,6 +1011,7 @@ async function loadSpark() {
         longTier: getSparkTier(score.longScore, score.hasHardFactorLong),
         shortTier: getSparkTier(score.shortScore, score.hasHardFactorShort),
         extended: extension.extended,
+        relativeFlow: relativeFlow.classification, oiDivergence: relativeFlow.oiDivergence, volDivergence: relativeFlow.volDivergence,
       };
       // Точка 9 от предложението - Price Extension филтър: ако вече е "избягала",
       // не е "ранна" - не влиза в резултатите, независимо от score-а. Сега
@@ -986,12 +1024,17 @@ async function loadSpark() {
   }
   if (results.length === 0) { content.innerHTML = `<div class="no-results">НЯМА SPARK КАНДИДАТИ В МОМЕНТА</div>`; return; }
 
-  // Точка 11 от предложението - сортиране: 1) най-висок SPARK score, 2) най-силно
-  // OI ускорение, 3) най-силно обемно ускорение, 4) най-малко Price Extension.
+  // Точка 11 от предложението - сортиране: 1) най-висок SPARK score, 2) IDEA 07
+  // COIN-SPECIFIC напред (виж calcRelativeFlow) - "монетата се събужда сама" е
+  // по-интересно от "цял пазар/BTC се движи заедно", 3) най-силно OI ускорение,
+  // 4) най-силно обемно ускорение, 5) най-малко Price Extension.
   results.sort((a, b) => {
     const aMax = Math.max(a.sparkSignal.longScore, a.sparkSignal.shortScore);
     const bMax = Math.max(b.sparkSignal.longScore, b.sparkSignal.shortScore);
     if (bMax !== aMax) return bMax - aMax;
+    const aSpecific = a.sparkSignal.relativeFlow === 'coinSpecific' ? 1 : 0;
+    const bSpecific = b.sparkSignal.relativeFlow === 'coinSpecific' ? 1 : 0;
+    if (bSpecific !== aSpecific) return bSpecific - aSpecific;
     const aOi = Math.abs(a.sparkSignal.oiDelta15m || 0), bOi = Math.abs(b.sparkSignal.oiDelta15m || 0);
     if (bOi !== aOi) return bOi - aOi;
     const aVol = a.sparkSignal.volRatio || 0, bVol = b.sparkSignal.volRatio || 0;
@@ -1337,6 +1380,12 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
   const sparkLabel = SPARK_LABELS[sparkTier];
   if (sparkLabel && !coin.sparkSignal.extended) {
     tags.push(`<span class="tag" style="background:${sparkDir==='long'?'rgba(0,200,120,0.2)':'rgba(220,60,60,0.2)'};color:${sparkDir==='long'?'var(--green)':'var(--red)'}">${sparkLabel} ${sparkDir==='long'?'▲':'▼'} (${sparkMax}/7)</span>`);
+    // IDEA 07 - "RELATIVE FLOW" (виж calcRelativeFlow в signal-logic.js) - само
+    // информативен таг до SPARK, не гейтва нищо (SHADOW MODE). COIN-SPECIFIC е
+    // единствената класификация, която маркираме визуално - точно тя е "монетата
+    // се събужда сама, докато BTC е спокоен", което търсим за ранно откриване.
+    const flowLabel = RELATIVE_FLOW_LABELS[coin.sparkSignal.relativeFlow];
+    if (flowLabel) tags.push(`<span class="tag" style="background:rgba(120,80,220,0.2);color:#a78bfa">${flowLabel}</span>`);
   }
   if (coin.sparkSignal?.extended) tags.push(`<span class="tag" style="background:rgba(180,140,0,0.2);color:var(--yellow)">⚠️ LATE/EXTENDED - DO NOT CHASE</span>`);
   const detectorBanner = isBottom ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>` : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding.toFixed(3)}% · L/S>${coin.longPct.toFixed(0)}% · OI↓</div>` : '';
@@ -1356,6 +1405,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
       <div style="font-weight:600;color:${sparkDir==='long'?'var(--green)':'var(--red)'}">${sparkLabel} ${sparkDir==='long'?'▲ LONG':'▼ SHORT'} · SPARK SCORE: ${sparkMax}/7</div>
       <div style="color:var(--text2);margin-top:2px;">OI 5m: ${fmtPct(s.oiDelta5m)} · OI 15m: ${fmtPct(s.oiDelta15m)} · OI 1h: ${fmtPct(s.oiDelta1h)}</div>
       <div style="color:var(--text2);">VOL 1h/4h avg: ${s.volRatio!=null?s.volRatio.toFixed(2)+'x':'--'} · PRICE 1h: ${fmtPct(s.chg1h)}</div>
+      ${RELATIVE_FLOW_LABELS[s.relativeFlow] ? `<div style="color:#a78bfa;margin-top:2px;">${RELATIVE_FLOW_LABELS[s.relativeFlow]} · спрямо BTC: OI ${fmtPct(s.oiDivergence)} · VOL ${s.volDivergence!=null?(s.volDivergence>0?'+':'')+s.volDivergence.toFixed(2)+'x':'--'}</div>` : ''}
     </div>`;
   }
   const detectorClass = (isBottom ? ' detector-bottom' : isTop ? ' detector-top' : '') + (coin.oiFlip ? ' oi-flip' : '');

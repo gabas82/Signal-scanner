@@ -1088,6 +1088,32 @@ function getSparkTier(score, hasHardFactor) {
   return 'none';
 }
 
+// ═══ IDEA 07 - "RELATIVE FLOW" (BTC-independent flow) ═══════════════════════
+// Разграничава "монетата се събужда сама" от "монетата просто следва BTC".
+// Изцяло построен ВЪРХУ вече изчисления SPARK hard-factor gate (виж
+// calcSparkScore/getSparkTier по-горе) - нула нови мрежови заявки/данни:
+// BTC-ят вече минава през същия SPARK скан като всяка друга монета от
+// watchlist-а, само реюзваме неговия резултат за сравнение. SHADOW MODE -
+// изцяло информативно, не гейтва/блокира нищо съществуващо.
+const RELATIVE_FLOW_LABELS = {
+  none: null,
+  coinSpecific: '🎯 COIN-SPECIFIC',
+  marketDriven: '🌊 MARKET-DRIVEN',
+  mixed: '↔️ MIXED',
+};
+function calcRelativeFlow({ coinHasHardFactor, coinDirection, btcHasHardFactor, btcDirection, coinOiDelta15m, btcOiDelta15m, coinVolRatio, btcVolRatio }) {
+  if (!coinHasHardFactor) {
+    return { classification: 'none', oiDivergence: null, volDivergence: null };
+  }
+  const oiDivergence = (coinOiDelta15m ?? 0) - (btcOiDelta15m ?? 0);
+  const volDivergence = (coinVolRatio ?? 0) - (btcVolRatio ?? 0);
+  let classification;
+  if (!btcHasHardFactor) classification = 'coinSpecific';
+  else if (btcDirection === coinDirection) classification = 'marketDriven';
+  else classification = 'mixed';
+  return { classification, oiDivergence, volDivergence };
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -1108,6 +1134,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcOiMultiDelta, calcVolAcceleration, calcPriceChangePct, calcStructureShift,
     calcSqueezeCondition, calcPriceExtension, getSparkCoinTier, calcSparkScore,
     getSparkTier, SPARK_LABELS, SPARK_OI_THRESHOLD, SPARK_VOL_RATIO_THRESHOLD,
-    SPARK_FUNDING_EXTREME, SPARK_EXTENSION_1H_PCT, SPARK_EXTENSION_4H_PCT
+    SPARK_FUNDING_EXTREME, SPARK_EXTENSION_1H_PCT, SPARK_EXTENSION_4H_PCT,
+    calcRelativeFlow, RELATIVE_FLOW_LABELS
   };
 }
