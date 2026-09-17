@@ -1509,6 +1509,67 @@ function markTargetFired(state, key) {
   state.target = { key, at: Date.now() };
 }
 
+// ═══ IDEA 03 - "AUCTION QUALITY" ═══════════════════════════════════════════════
+// Оценява БАЛАНСА на Value Area от Volume Profile Engine (виж по-горе): широка/
+// тясна (ширина спрямо POC цената) и симетрична/скосена (къде седи POC вътре
+// във VAL..VAH). Тясна + скосена Value Area = "IMBALANCED/TREND" пазар - едната
+// страна доминира, автентично двупосочно наддаване е спряло. За разлика от
+// IDEA 02 (чисто структурно), тук ИМА hard factor изискване (OI и/или CVD да
+// потвърждават посоката на скоса) - потвърдено с потребителя.
+const AUCTION_NARROW_WIDTH_PCT = 6; // Value Area под 6% от POC цената = "тясна"
+const AUCTION_SKEW_THRESHOLD = 0.15; // |skewRatio| >= 0.15 (от -0.5..+0.5 обхват) = достатъчно скосена от центъра
+
+// skewRatio: -0.5 (POC точно на VAL) .. 0 (POC точно по средата, симетрично) .. +0.5 (POC точно на VAH).
+function calcAuctionQualityScore({ poc, vah, val, oiDeltaPct, takerDelta, volAccel }) {
+  if (!poc || poc.price == null || vah == null || val == null || !(vah > val) || !(poc.price > 0)) {
+    return { longScore: 0, shortScore: 0, hasHardFactorLong: false, hasHardFactorShort: false, widthPct: null, skewRatio: null };
+  }
+  const widthPct = ((vah - val) / poc.price) * 100;
+  const skewRatio = (poc.price - val) / (vah - val) - 0.5;
+  const isNarrow = widthPct < AUCTION_NARROW_WIDTH_PCT;
+  const isSkewedLong = skewRatio >= AUCTION_SKEW_THRESHOLD; // POC изместен към VAH - купувачите защитават високите нива
+  const isSkewedShort = skewRatio <= -AUCTION_SKEW_THRESHOLD; // POC изместен към VAL - продавачите защитават ниските нива
+
+  const oiConfirmLong = oiDeltaPct != null && oiDeltaPct > 0;
+  const oiConfirmShort = oiDeltaPct != null && oiDeltaPct < 0;
+  const cvdConfirmLong = takerDelta != null && takerDelta > 0;
+  const cvdConfirmShort = takerDelta != null && takerDelta < 0;
+  const volOK = volAccel != null && volAccel.tier !== 'none';
+
+  const hasHardFactorLong = isNarrow && isSkewedLong && (oiConfirmLong || cvdConfirmLong);
+  const hasHardFactorShort = isNarrow && isSkewedShort && (oiConfirmShort || cvdConfirmShort);
+
+  let longScore = 0, shortScore = 0;
+  if (isNarrow) { longScore++; shortScore++; }
+  if (isSkewedLong) longScore += 2;
+  if (isSkewedShort) shortScore += 2;
+  if (volOK) { longScore++; shortScore++; }
+
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort, widthPct, skewRatio };
+}
+
+const AUCTION_LABELS = {
+  none: null,
+  watch: '⚖️ AUCTION WATCH',
+  confirmed: '⚖️ AUCTION CONFIRMED',
+};
+// Максимален score е 4 (1т тясна + 2т скос + 1т обем), огледално на getTrapTier по-горе.
+function getAuctionQualityTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'confirmed';
+  if (score >= 3) return 'watch';
+  return 'none';
+}
+
+// AUCTION - огледално на flowWarmingCanFire/markFlowWarmingFired по-горе (LIVE-
+// style, без candleTime), собствен KV state ключ (state.auction).
+function auctionCanFire(state, key) {
+  return key !== 'none' && state.auction?.key !== key;
+}
+function markAuctionFired(state, key) {
+  state.auction = { key, at: Date.now() };
+}
+
 // ============================================================================
 // PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
 // HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
@@ -2448,6 +2509,21 @@ async function scanSymbolSignals(env, symbol) {
   if (targetFired) markTargetFired(state, targetKey);
   const targetMagnets = findNearestMagnets(price, targetScore.direction, targetScore.targetPrice, vpNodes.hvn);
 
+  // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore по-горе) -
+  // изцяло отделно известие, огледално на TRAP (ИМА hard factor изискване,
+  // за разлика от TARGET по-горе - потвърдено с потребителя).
+  const auctionScore = calcAuctionQualityScore({
+    poc: vpPoc, vah: vpValueArea ? vpValueArea.vah : null, val: vpValueArea ? vpValueArea.val : null,
+    oiDeltaPct, takerDelta: takerFlow.delta5m, volAccel,
+  });
+  const auctionDirection = auctionScore.longScore >= auctionScore.shortScore ? 'long' : 'short';
+  const auctionMaxScore = Math.max(auctionScore.longScore, auctionScore.shortScore);
+  const auctionHasHardFactor = auctionDirection === 'long' ? auctionScore.hasHardFactorLong : auctionScore.hasHardFactorShort;
+  const auctionTier = getAuctionQualityTier(auctionMaxScore, auctionHasHardFactor);
+  const auctionKey = auctionTier !== 'none' ? `${auctionDirection}:${auctionTier}` : 'none';
+  const auctionFired = auctionCanFire(state, auctionKey);
+  if (auctionFired) markAuctionFired(state, auctionKey);
+
   await saveSymbolState(env, symbol, state);
 
   return {
@@ -2470,6 +2546,8 @@ async function scanSymbolSignals(env, symbol) {
     targetFired, targetTier, targetDirection: targetScore.direction, targetScore: targetScore.score,
     targetDistancePct: targetScore.distancePct, targetLevelStrengthPct: targetScore.levelStrengthPct,
     targetPrice: targetScore.targetPrice, targetMagnets,
+    auctionFired, auctionTier, auctionDirection, auctionMaxScore,
+    auctionWidthPct: auctionScore.widthPct, auctionSkewRatio: auctionScore.skewRatio,
   };
 }
 
@@ -2486,7 +2564,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -2565,6 +2643,22 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
         }
         targetLines.push(`⚠️ Ориентировъчна цел (mean-reversion) - НЕ Е entry сигнал`);
         await sendWhatsApp(env, targetLines.join('\n'));
+      }
+      // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore по-горе) -
+      // изцяло отделно известие, огледално на TRAP. Тясна+скосена Value Area,
+      // потвърдена от OI/CVD в посоката на скоса - "IMBALANCED/TREND" пазар,
+      // не двупосочен/balanced.
+      if (auctionFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const auctionLines = [
+          `${AUCTION_LABELS[auctionTier]} ${symbolNoUsdt} ${auctionDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `AUCTION SCORE: ${auctionMaxScore}/4`,
+          `Value Area ширина: ${auctionWidthPct != null ? auctionWidthPct.toFixed(1) + '%' : '--'} от POC · Skew: ${auctionSkewRatio != null ? (auctionSkewRatio * 200).toFixed(0) + '%' : '--'}`,
+          `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
+          `⚠️ Тесен/скосен профил - вероятен trend режим, НЕ Е entry сигнал сам по себе си`,
+        ];
+        await sendWhatsApp(env, auctionLines.join('\n'));
       }
       // PHASE CYCLE ENGINE - изцяло отделно известие от горното, независимо
       // от MIN_NOTIFY_SCORE/newFired на класическия LONG/SHORT поток. Праща се

@@ -1420,6 +1420,58 @@ function findNearestMagnets(price, direction, targetPrice, hvnList = [], limit =
   return relevant.slice(0, limit);
 }
 
+// ═══ IDEA 03 - "AUCTION QUALITY" ═══════════════════════════════════════════════
+// Оценява БАЛАНСА на Value Area от Volume Profile Engine (виж по-горе): широка/
+// тясна (ширина спрямо POC цената) и симетрична/скосена (къде седи POC вътре
+// във VAL..VAH). Тясна + скосена Value Area = "IMBALANCED/TREND" пазар - едната
+// страна доминира, автентично двупосочно наддаване е спряло. За разлика от
+// IDEA 02 (чисто структурно), тук ИМА hard factor изискване (OI и/или CVD да
+// потвърждават посоката на скоса) - потвърдено с потребителя.
+const AUCTION_NARROW_WIDTH_PCT = 6; // Value Area под 6% от POC цената = "тясна"
+const AUCTION_SKEW_THRESHOLD = 0.15; // |skewRatio| >= 0.15 (от -0.5..+0.5 обхват) = достатъчно скосена от центъра
+
+// skewRatio: -0.5 (POC точно на VAL) .. 0 (POC точно по средата, симетрично) .. +0.5 (POC точно на VAH).
+function calcAuctionQualityScore({ poc, vah, val, oiDeltaPct, takerDelta, volAccel }) {
+  if (!poc || poc.price == null || vah == null || val == null || !(vah > val) || !(poc.price > 0)) {
+    return { longScore: 0, shortScore: 0, hasHardFactorLong: false, hasHardFactorShort: false, widthPct: null, skewRatio: null };
+  }
+  const widthPct = ((vah - val) / poc.price) * 100;
+  const skewRatio = (poc.price - val) / (vah - val) - 0.5;
+  const isNarrow = widthPct < AUCTION_NARROW_WIDTH_PCT;
+  const isSkewedLong = skewRatio >= AUCTION_SKEW_THRESHOLD; // POC изместен към VAH - купувачите защитават високите нива
+  const isSkewedShort = skewRatio <= -AUCTION_SKEW_THRESHOLD; // POC изместен към VAL - продавачите защитават ниските нива
+
+  const oiConfirmLong = oiDeltaPct != null && oiDeltaPct > 0;
+  const oiConfirmShort = oiDeltaPct != null && oiDeltaPct < 0;
+  const cvdConfirmLong = takerDelta != null && takerDelta > 0;
+  const cvdConfirmShort = takerDelta != null && takerDelta < 0;
+  const volOK = volAccel != null && volAccel.tier !== 'none';
+
+  const hasHardFactorLong = isNarrow && isSkewedLong && (oiConfirmLong || cvdConfirmLong);
+  const hasHardFactorShort = isNarrow && isSkewedShort && (oiConfirmShort || cvdConfirmShort);
+
+  let longScore = 0, shortScore = 0;
+  if (isNarrow) { longScore++; shortScore++; }
+  if (isSkewedLong) longScore += 2;
+  if (isSkewedShort) shortScore += 2;
+  if (volOK) { longScore++; shortScore++; }
+
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort, widthPct, skewRatio };
+}
+
+const AUCTION_LABELS = {
+  none: null,
+  watch: '⚖️ AUCTION WATCH',
+  confirmed: '⚖️ AUCTION CONFIRMED',
+};
+// Максимален score е 4 (1т тясна + 2т скос + 1т обем), огледално на getTrapTier по-горе.
+function getAuctionQualityTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'confirmed';
+  if (score >= 3) return 'watch';
+  return 'none';
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -1446,6 +1498,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcFlowWarmingScore, getFlowWarmingTier, FLOW_WARMING_LABELS, FLOW_WARMING_TAKER_DELTA_THRESHOLD,
     calcLiquiditySweep, calcTrapScore, getTrapTier, TRAP_LABELS, TRAP_TAKER_DELTA_THRESHOLD,
     buildVolumeProfile, calcPOC, calcValueArea, getHVNLVN,
-    calcTargetDistancePct, calcTargetScore, getTargetTier, findNearestMagnets, TARGET_LABELS, TARGET_MIN_DISTANCE_PCT
+    calcTargetDistancePct, calcTargetScore, getTargetTier, findNearestMagnets, TARGET_LABELS, TARGET_MIN_DISTANCE_PCT,
+    calcAuctionQualityScore, getAuctionQualityTier, AUCTION_LABELS, AUCTION_NARROW_WIDTH_PCT, AUCTION_SKEW_THRESHOLD
   };
 }
