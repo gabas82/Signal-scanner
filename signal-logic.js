@@ -1260,6 +1260,101 @@ function getTrapTier(score, hasHardFactor) {
   return 'none';
 }
 
+// ===================== VOLUME PROFILE ENGINE (обща основа за идеи 02/03/04) =====================
+// Истински tick-ниво Volume Profile не е възможен през безплатните Binance REST
+// ендпойнти (няма нито volume-profile, нито историческо orderbook API - само
+// klines с общ обем на цялата свещ). Затова тук строим ПРИБЛИЖЕНИЕ: обемът на
+// всяка свещ се разпределя пропорционално по ценовите нива, които тя покрива
+// (high-low диапазонът ѝ), и се натрупва в bucketCount равни ценови кошчета през
+// целия подаден прозорец от свещи (напр. последните 30 дневни затворени свещи -
+// избора кои свещи и колко назад е на извикващия код, не на тази функция).
+function buildVolumeProfile(candles, opts = {}) {
+  const bucketCount = opts.bucketCount || 50;
+  if (!Array.isArray(candles) || candles.length === 0) return null;
+  let rangeLow = Infinity, rangeHigh = -Infinity;
+  for (const c of candles) {
+    if (c.low < rangeLow) rangeLow = c.low;
+    if (c.high > rangeHigh) rangeHigh = c.high;
+  }
+  if (!(rangeHigh > rangeLow)) return null;
+  const bucketSize = (rangeHigh - rangeLow) / bucketCount;
+  const buckets = [];
+  for (let i = 0; i < bucketCount; i++) {
+    buckets.push({ priceLow: rangeLow + i * bucketSize, priceHigh: rangeLow + (i + 1) * bucketSize, volume: 0 });
+  }
+  for (const c of candles) {
+    const vol = c.volume || 0;
+    if (!(vol > 0)) continue;
+    const cRange = c.high - c.low;
+    if (!(cRange > 0)) {
+      // Свещ без диапазон (high===low) - целият ѝ обем отива в единственото
+      // кошче, което съдържа тази цена.
+      const idx = Math.min(bucketCount - 1, Math.max(0, Math.floor((c.high - rangeLow) / bucketSize)));
+      buckets[idx].volume += vol;
+      continue;
+    }
+    for (const b of buckets) {
+      const overlapLow = Math.max(c.low, b.priceLow);
+      const overlapHigh = Math.min(c.high, b.priceHigh);
+      if (overlapHigh > overlapLow) {
+        b.volume += vol * ((overlapHigh - overlapLow) / cRange);
+      }
+    }
+  }
+  const totalVolume = buckets.reduce((s, b) => s + b.volume, 0);
+  return { buckets, rangeLow, rangeHigh, bucketSize, totalVolume };
+}
+
+// POC (Point of Control) - ценовото ниво (среда на кошчето) с най-голям натрупан обем.
+function calcPOC(profile) {
+  if (!profile || !profile.buckets || profile.buckets.length === 0) return null;
+  let best = profile.buckets[0];
+  for (const b of profile.buckets) if (b.volume > best.volume) best = b;
+  return { price: (best.priceLow + best.priceHigh) / 2, priceLow: best.priceLow, priceHigh: best.priceHigh, volume: best.volume };
+}
+
+// Value Area (VAH/VAL) - стандартният "разширяване от POC навън" алгоритъм:
+// тръгва се от кошчето на POC и се добавя по-обемното от двете съседни кошчета
+// (ляво/дясно), докато покритият обем стигне targetPct (по подразбиране 70% -
+// класическата стойност за volume/market profile) от общия обем на профила.
+function calcValueArea(profile, opts = {}) {
+  const targetPct = opts.targetPct || 0.70;
+  if (!profile || !profile.buckets || profile.buckets.length === 0) return null;
+  const buckets = profile.buckets;
+  const totalVolume = profile.totalVolume || buckets.reduce((s, b) => s + b.volume, 0);
+  if (!(totalVolume > 0)) return null;
+  let pocIdx = 0;
+  for (let i = 1; i < buckets.length; i++) if (buckets[i].volume > buckets[pocIdx].volume) pocIdx = i;
+  let loIdx = pocIdx, hiIdx = pocIdx;
+  let covered = buckets[pocIdx].volume;
+  const target = totalVolume * targetPct;
+  while (covered < target && (loIdx > 0 || hiIdx < buckets.length - 1)) {
+    const volLo = loIdx > 0 ? buckets[loIdx - 1].volume : -1;
+    const volHi = hiIdx < buckets.length - 1 ? buckets[hiIdx + 1].volume : -1;
+    if (volHi >= volLo) { hiIdx++; covered += buckets[hiIdx].volume; }
+    else { loIdx--; covered += buckets[loIdx].volume; }
+  }
+  return { val: buckets[loIdx].priceLow, vah: buckets[hiIdx].priceHigh, coveredPct: covered / totalVolume };
+}
+
+// HVN (High Volume Node) / LVN (Low Volume Node) - локални върхове/долини в
+// профила спрямо средния обем на кошче. HVN = зони на приемане на цената
+// ("магнити" - идея 02 ще ги ползва за target/destination score), LVN = зони на
+// отхвърляне (пазарът обикновено минава бързо през тях, "празноти" в профила).
+function getHVNLVN(profile) {
+  if (!profile || !profile.buckets || profile.buckets.length < 3) return { hvn: [], lvn: [] };
+  const buckets = profile.buckets;
+  const avgVolume = profile.totalVolume / buckets.length;
+  const hvn = [], lvn = [];
+  for (let i = 1; i < buckets.length - 1; i++) {
+    const prev = buckets[i - 1].volume, cur = buckets[i].volume, next = buckets[i + 1].volume;
+    const mid = (buckets[i].priceLow + buckets[i].priceHigh) / 2;
+    if (cur > prev && cur > next && cur > avgVolume) hvn.push({ price: mid, volume: cur });
+    else if (cur < prev && cur < next && cur < avgVolume) lvn.push({ price: mid, volume: cur });
+  }
+  return { hvn, lvn };
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -1284,6 +1379,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcRelativeFlow, RELATIVE_FLOW_LABELS,
     calcTakerBuyPressure, calcTakerFlowDelta,
     calcFlowWarmingScore, getFlowWarmingTier, FLOW_WARMING_LABELS, FLOW_WARMING_TAKER_DELTA_THRESHOLD,
-    calcLiquiditySweep, calcTrapScore, getTrapTier, TRAP_LABELS, TRAP_TAKER_DELTA_THRESHOLD
+    calcLiquiditySweep, calcTrapScore, getTrapTier, TRAP_LABELS, TRAP_TAKER_DELTA_THRESHOLD,
+    buildVolumeProfile, calcPOC, calcValueArea, getHVNLVN
   };
 }
