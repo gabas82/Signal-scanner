@@ -1194,6 +1194,72 @@ function getFlowWarmingTier(score, hasHardFactor) {
   return 'none';
 }
 
+// ═══ IDEA 01 - "ABSORPTION / TRAP GATE" (PRE-IMPULSE) ═══════════════════════
+// Търси "капан" за трейдъри на грешната страна - цена помита близка
+// swing high/low (ликвидиране на стопове/лимитни поръчки на грешната страна),
+// но веднага се "reclaim"-ва (SFP - Swing Failure Pattern), докато агресивният
+// (taker CVD) поток в посоката на помитането е бил ПОГЪЛНАТ, не е продължил.
+// ВАЖНО (изрично изискване на предложението): това е САМО ранно
+// предупреждение/watch - НЕ автоматичен entry сигнал, виж TRAP_LABELS и
+// известието по-долу.
+// Liquidity sweep - последната ЗАТВОРЕНА свещ помита lowest low/highest high
+// на предходните `lookback` свещи (БЕЗ самата себе си), но затваря обратно
+// В рамките на стария диапазон, в посока противоположна на помитането
+// (bullish reclaim след sweep надолу, bearish reclaim след sweep нагоре).
+function calcLiquiditySweep(candles, opts = {}) {
+  const lookback = opts.lookback ?? 20;
+  const n = candles.length;
+  if (n < lookback + 2) return { bullish: false, bearish: false, lowestLow: null, highestHigh: null };
+  const last = candles[n - 1];
+  const window = candles.slice(n - 1 - lookback, n - 1);
+  const lowestLow = Math.min(...window.map(c => c.low));
+  const highestHigh = Math.max(...window.map(c => c.high));
+  const bullish = last.low < lowestLow && last.close > lowestLow && last.close > last.open;
+  const bearish = last.high > highestHigh && last.close < highestHigh && last.close < last.open;
+  return { bullish, bearish, lowestLow, highestHigh };
+}
+
+// Колко пункта разлика в taker buy pressure (calcTakerFlowDelta по-горе) се
+// смята за реално "поглъщане" на противоположния агресивен поток по време на
+// sweep-а - по-нисък от FLOW_WARMING_TAKER_DELTA_THRESHOLD нарочно (тук
+// търсим бърза, локална промяна около самия sweep, не по-широко 15м ускорение).
+const TRAP_TAKER_DELTA_THRESHOLD = 2;
+// TRAP SCORE - изисква sweep+reclaim (calcLiquiditySweep) КАТО ЗАДЪЛЖИТЕЛНА
+// основа, потвърдена от CVD ("буйърите/селърите вече доминират в obратната
+// посока на sweep-а точно СЕГА") - именно комбинацията sweep + CVD поглъщане
+// е твърдият фактор (hasHardFactor), не поотделно. OI (не се затваря по време
+// на движението - реално натрупване, не чист liquidation wick) и обемно
+// ускорение (calcVolAcceleration) са допълнителни, незадължителни потвърждения.
+function calcTrapScore({ symbol, sweepBullish, sweepBearish, takerBuyPressure, takerDelta5m, oiDeltaPct, volAccel }) {
+  const tier = getSparkCoinTier(symbol);
+  const volThreshold = SPARK_VOL_RATIO_THRESHOLD[tier];
+  const bullishAbsorbed = sweepBullish && ((takerBuyPressure != null && takerBuyPressure >= 50) || (takerDelta5m != null && takerDelta5m >= TRAP_TAKER_DELTA_THRESHOLD));
+  const bearishAbsorbed = sweepBearish && ((takerBuyPressure != null && takerBuyPressure <= 50) || (takerDelta5m != null && takerDelta5m <= -TRAP_TAKER_DELTA_THRESHOLD));
+  const oiHeld = oiDeltaPct != null && oiDeltaPct >= 0;
+  const volAccelOK = volAccel != null && volAccel.ratio != null && volAccel.ratio >= volThreshold;
+
+  let longScore = 0, shortScore = 0;
+  if (bullishAbsorbed) longScore += 2;
+  if (bearishAbsorbed) shortScore += 2;
+  if (oiHeld) { longScore++; shortScore++; }
+  if (volAccelOK) { longScore++; shortScore++; }
+
+  return { longScore, shortScore, hasHardFactorLong: bullishAbsorbed, hasHardFactorShort: bearishAbsorbed };
+}
+const TRAP_LABELS = {
+  none: null,
+  watch: '🪤 TRAP WATCH',
+  confirmed: '🪤 TRAP CONFIRMED',
+};
+// Максимален score е 4 (2т sweep+CVD поглъщане + 1т OI + 1т обем), огледално
+// на getFlowWarmingTier по-горе.
+function getTrapTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'confirmed';
+  if (score >= 3) return 'watch';
+  return 'none';
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -1217,6 +1283,7 @@ if (typeof module !== 'undefined' && module.exports) {
     SPARK_FUNDING_EXTREME, SPARK_EXTENSION_1H_PCT, SPARK_EXTENSION_4H_PCT,
     calcRelativeFlow, RELATIVE_FLOW_LABELS,
     calcTakerBuyPressure, calcTakerFlowDelta,
-    calcFlowWarmingScore, getFlowWarmingTier, FLOW_WARMING_LABELS, FLOW_WARMING_TAKER_DELTA_THRESHOLD
+    calcFlowWarmingScore, getFlowWarmingTier, FLOW_WARMING_LABELS, FLOW_WARMING_TAKER_DELTA_THRESHOLD,
+    calcLiquiditySweep, calcTrapScore, getTrapTier, TRAP_LABELS, TRAP_TAKER_DELTA_THRESHOLD
   };
 }

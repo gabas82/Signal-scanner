@@ -1027,6 +1027,20 @@ async function loadSpark() {
       const flowWarmingMaxScore = Math.max(flowWarmingScore.longScore, flowWarmingScore.shortScore);
       const flowWarmingHasHardFactor = flowWarmingDirection === 'long' ? flowWarmingScore.hasHardFactorLong : flowWarmingScore.hasHardFactorShort;
       const flowWarmingTier = getFlowWarmingTier(flowWarmingMaxScore, flowWarmingHasHardFactor);
+      // IDEA 01 - "ABSORPTION / TRAP GATE" (виж calcLiquiditySweep/calcTrapScore
+      // в signal-logic.js) - sweep+reclaim на 1ч свещ, потвърден от CVD
+      // поглъщане на противоположния агресивен поток. САМО ранно
+      // предупреждение - виж trapBanner по-долу.
+      const sweep = calcLiquiditySweep(c1h);
+      const trapScore = calcTrapScore({
+        symbol: coin.symbol, sweepBullish: sweep.bullish, sweepBearish: sweep.bearish,
+        takerBuyPressure: takerFlow.buyPressureNow, takerDelta5m: takerFlow.delta5m,
+        oiDeltaPct: oiMulti.delta15m, volAccel,
+      });
+      const trapDirection = trapScore.longScore >= trapScore.shortScore ? 'long' : 'short';
+      const trapMaxScore = Math.max(trapScore.longScore, trapScore.shortScore);
+      const trapHasHardFactor = trapDirection === 'long' ? trapScore.hasHardFactorLong : trapScore.hasHardFactorShort;
+      const trapTier = getTrapTier(trapMaxScore, trapHasHardFactor);
       coin.sparkSignal = {
         oiDelta5m: oiMulti.delta5m, oiDelta15m: oiMulti.delta15m, oiDelta1h: oiMulti.delta1h,
         volRatio: volAccel.ratio, chg1h, chg4h,
@@ -1038,8 +1052,9 @@ async function loadSpark() {
         shortTier: getSparkTier(score.shortScore, score.hasHardFactorShort),
         extended: extension.extended,
         relativeFlow: relativeFlow.classification, oiDivergence: relativeFlow.oiDivergence, volDivergence: relativeFlow.volDivergence,
-        takerDelta15m: takerFlow.delta15m,
+        takerDelta15m: takerFlow.delta15m, takerDelta5m: takerFlow.delta5m,
         flowWarmingTier, flowWarmingDirection, flowWarmingMaxScore,
+        trapTier, trapDirection, trapMaxScore,
       };
       // Точка 9 от предложението - Price Extension филтър: ако вече е "избягала",
       // не е "ранна" - не влиза в резултатите, независимо от score-а. Сега
@@ -1047,8 +1062,10 @@ async function loadSpark() {
       // FLOW WARMING (IDEA 05) добавя ТРЕТА, самостоятелна причина за влизане в
       // резултатите - монета с ДВОЕН (OI+CVD) твърд фактор може все още да няма
       // sparkTier (не е събрала достатъчно "меки" точки за SPARK), но точно
-      // това е случаят, който FLOW WARMING цели да хване по-рано.
-      if (!extension.extended && (coin.sparkSignal.longTier !== 'none' || coin.sparkSignal.shortTier !== 'none' || flowWarmingTier !== 'none')) {
+      // това е случаят, който FLOW WARMING цели да хване по-рано. TRAP (IDEA 01)
+      // добавя ЧЕТВЪРТА причина - sweep+reclaim+CVD поглъщане е самостоятелно
+      // ранно предупреждение, независимо от другите тагове.
+      if (!extension.extended && (coin.sparkSignal.longTier !== 'none' || coin.sparkSignal.shortTier !== 'none' || flowWarmingTier !== 'none' || trapTier !== 'none')) {
         results.push(coin);
       }
     } catch(e) { coin.sparkSignal = null; }
@@ -1437,6 +1454,13 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     const fwDir = coin.sparkSignal.flowWarmingDirection;
     tags.push(`<span class="tag" style="background:${fwDir==='long'?'rgba(255,140,0,0.25)':'rgba(255,90,90,0.25)'};color:${fwDir==='long'?'#ffb84d':'#ff8080'}">${flowWarmingLabel} ${fwDir==='long'?'▲':'▼'} (${coin.sparkSignal.flowWarmingMaxScore}/4)</span>`);
   }
+  // IDEA 01 - "TRAP" (виж calcTrapScore в signal-logic.js) - самостоятелен таг,
+  // огледален на FLOW WARMING по-горе - излиза дори без sparkLabel/flowWarmingLabel.
+  const trapLabel = coin.sparkSignal ? TRAP_LABELS[coin.sparkSignal.trapTier] : null;
+  if (trapLabel && !coin.sparkSignal.extended) {
+    const trDir = coin.sparkSignal.trapDirection;
+    tags.push(`<span class="tag" style="background:rgba(160,100,220,0.25);color:#c084fc">${trapLabel} ${trDir==='long'?'▲':'▼'} (${coin.sparkSignal.trapMaxScore}/4)</span>`);
+  }
   if (coin.sparkSignal?.extended) tags.push(`<span class="tag" style="background:rgba(180,140,0,0.2);color:var(--yellow)">⚠️ LATE/EXTENDED - DO NOT CHASE</span>`);
   const detectorBanner = isBottom ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>` : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding.toFixed(3)}% · L/S>${coin.longPct.toFixed(0)}% · OI↓</div>` : '';
   let setupBanner = '';
@@ -1470,6 +1494,18 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
       <div style="font-weight:600;color:${fwDir==='long'?'#ffb84d':'#ff8080'}">${flowWarmingLabel} ${fwDir==='long'?'▲ LONG':'▼ SHORT'} · FLOW WARMING SCORE: ${s.flowWarmingMaxScore}/4</div>
       <div style="color:var(--text2);margin-top:2px;">OI 15m: ${fmtPct(s.oiDelta15m)} · CVD (taker) 15m: ${fmtPct(s.takerDelta15m)}</div>
       <div style="color:var(--text2);">VOL 1h/4h avg: ${s.volRatio!=null?s.volRatio.toFixed(2)+'x':'--'} · PRICE 1h: ${fmtPct(s.chg1h)}</div>
+    </div>`;
+  }
+  // TRAP детайлен банер (IDEA 01) - отделен от SPARK/FLOW WARMING банерите
+  // по-горе, огледален подход - излиза дори без другите два тага.
+  let trapBanner = '';
+  if (trapLabel && !coin.sparkSignal.extended) {
+    const s = coin.sparkSignal;
+    const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+    trapBanner = `<div style="margin:6px 0;padding:6px 8px;border-radius:4px;background:rgba(160,100,220,0.10);border-left:3px solid #c084fc;font-size:10px;">
+      <div style="font-weight:600;color:#c084fc">${trapLabel} ${s.trapDirection==='long'?'▲ LONG':'▼ SHORT'} · TRAP SCORE: ${s.trapMaxScore}/4</div>
+      <div style="color:var(--text2);margin-top:2px;">OI 15m: ${fmtPct(s.oiDelta15m)} · CVD (taker) 5m: ${fmtPct(s.takerDelta5m)}</div>
+      <div style="color:var(--yellow);margin-top:2px;">⚠️ САМО ранно предупреждение - НЕ Е entry сигнал</div>
     </div>`;
   }
   const detectorClass = (isBottom ? ' detector-bottom' : isTop ? ' detector-top' : '') + (coin.oiFlip ? ' oi-flip' : '');
@@ -1515,6 +1551,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     ${setupBanner}
     ${sparkBanner}
     ${flowWarmingBanner}
+    ${trapBanner}
     <div style="color:var(--text2);font-size:9px;letter-spacing:.5px;margin:6px 0 -2px;">⚡ МОМЕНТУМ ПОСОКА (24ч/L-S/funding/обем) — независимо от паттърн таговете горе</div>
     <div class="signal-box">
       <div class="signal-badge badge-${sc}">${sig.signal}</div>
