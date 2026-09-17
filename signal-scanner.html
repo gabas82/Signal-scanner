@@ -1052,10 +1052,22 @@ async function loadSpark() {
       const c1dClosed = klinesToCandles(k1d).slice(0, -1);
       const volumeProfile = buildVolumeProfile(c1dClosed);
       const vpPoc = calcPOC(volumeProfile);
+      const vpValueArea = calcValueArea(volumeProfile);
       const vpNodes = getHVNLVN(volumeProfile);
       const targetScore = calcTargetScore({ price: coin.price, poc: vpPoc, profileTotalVolume: volumeProfile?.totalVolume });
       const targetTier = getTargetTier(targetScore.score, targetScore.distancePct);
       const targetMagnets = findNearestMagnets(coin.price, targetScore.direction, targetScore.targetPrice, vpNodes.hvn);
+      // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore в
+      // signal-logic.js) - баланс на Value Area (широчина+скос), потвърден от
+      // OI/CVD. Огледално на TRAP - ИМА hard factor изискване.
+      const auctionScore = calcAuctionQualityScore({
+        poc: vpPoc, vah: vpValueArea ? vpValueArea.vah : null, val: vpValueArea ? vpValueArea.val : null,
+        oiDeltaPct: oiMulti.delta15m, takerDelta: takerFlow.delta5m, volAccel,
+      });
+      const auctionDirection = auctionScore.longScore >= auctionScore.shortScore ? 'long' : 'short';
+      const auctionMaxScore = Math.max(auctionScore.longScore, auctionScore.shortScore);
+      const auctionHasHardFactor = auctionDirection === 'long' ? auctionScore.hasHardFactorLong : auctionScore.hasHardFactorShort;
+      const auctionTier = getAuctionQualityTier(auctionMaxScore, auctionHasHardFactor);
       coin.sparkSignal = {
         oiDelta5m: oiMulti.delta5m, oiDelta15m: oiMulti.delta15m, oiDelta1h: oiMulti.delta1h,
         volRatio: volAccel.ratio, chg1h, chg4h,
@@ -1073,6 +1085,8 @@ async function loadSpark() {
         targetTier, targetDirection: targetScore.direction, targetScoreValue: targetScore.score,
         targetDistancePct: targetScore.distancePct, targetLevelStrengthPct: targetScore.levelStrengthPct,
         targetPrice: targetScore.targetPrice, targetMagnets,
+        auctionTier, auctionDirection, auctionMaxScore,
+        auctionWidthPct: auctionScore.widthPct, auctionSkewRatio: auctionScore.skewRatio,
       };
       // Точка 9 от предложението - Price Extension филтър: ако вече е "избягала",
       // не е "ранна" - не влиза в резултатите, независимо от score-а. Сега
@@ -1083,7 +1097,7 @@ async function loadSpark() {
       // това е случаят, който FLOW WARMING цели да хване по-рано. TRAP (IDEA 01)
       // добавя ЧЕТВЪРТА причина - sweep+reclaim+CVD поглъщане е самостоятелно
       // ранно предупреждение, независимо от другите тагове.
-      if (!extension.extended && (coin.sparkSignal.longTier !== 'none' || coin.sparkSignal.shortTier !== 'none' || flowWarmingTier !== 'none' || trapTier !== 'none' || targetTier !== 'none')) {
+      if (!extension.extended && (coin.sparkSignal.longTier !== 'none' || coin.sparkSignal.shortTier !== 'none' || flowWarmingTier !== 'none' || trapTier !== 'none' || targetTier !== 'none' || auctionTier !== 'none')) {
         results.push(coin);
       }
     } catch(e) { coin.sparkSignal = null; }
@@ -1487,6 +1501,13 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     const tgDir = coin.sparkSignal.targetDirection;
     tags.push(`<span class="tag" style="background:${tgDir==='long'?'rgba(0,180,220,0.25)':'rgba(0,140,220,0.25)'};color:#5ec8e8">${targetLabel} ${tgDir==='long'?'▲':'▼'} (${coin.sparkSignal.targetScoreValue}/5)</span>`);
   }
+  // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore в signal-logic.js) -
+  // самостоятелен таг, огледален на TRAP - излиза дори без другите тагове.
+  const auctionLabel = coin.sparkSignal ? AUCTION_LABELS[coin.sparkSignal.auctionTier] : null;
+  if (auctionLabel && !coin.sparkSignal.extended) {
+    const acDir = coin.sparkSignal.auctionDirection;
+    tags.push(`<span class="tag" style="background:rgba(220,180,0,0.25);color:#e8c85e">${auctionLabel} ${acDir==='long'?'▲':'▼'} (${coin.sparkSignal.auctionMaxScore}/4)</span>`);
+  }
   if (coin.sparkSignal?.extended) tags.push(`<span class="tag" style="background:rgba(180,140,0,0.2);color:var(--yellow)">⚠️ LATE/EXTENDED - DO NOT CHASE</span>`);
   const detectorBanner = isBottom ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>` : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding.toFixed(3)}% · L/S>${coin.longPct.toFixed(0)}% · OI↓</div>` : '';
   let setupBanner = '';
@@ -1547,6 +1568,19 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
       <div style="color:var(--yellow);margin-top:2px;">⚠️ Ориентировъчна цел (mean-reversion) - НЕ Е entry сигнал</div>
     </div>`;
   }
+  // AUCTION QUALITY детайлен банер (IDEA 03) - отделен от другите банери
+  // по-горе, огледален подход - излиза дори без другите тагове.
+  let auctionBanner = '';
+  if (auctionLabel && !coin.sparkSignal.extended) {
+    const s = coin.sparkSignal;
+    const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+    auctionBanner = `<div style="margin:6px 0;padding:6px 8px;border-radius:4px;background:rgba(220,180,0,0.10);border-left:3px solid #e8c85e;font-size:10px;">
+      <div style="font-weight:600;color:#e8c85e">${auctionLabel} ${s.auctionDirection==='long'?'▲ LONG':'▼ SHORT'} · AUCTION SCORE: ${s.auctionMaxScore}/4</div>
+      <div style="color:var(--text2);margin-top:2px;">Value Area ширина: ${s.auctionWidthPct!=null?s.auctionWidthPct.toFixed(1)+'%':'--'} от POC · Skew: ${s.auctionSkewRatio!=null?(s.auctionSkewRatio*200).toFixed(0)+'%':'--'}</div>
+      <div style="color:var(--text2);">OI 15m: ${fmtPct(s.oiDelta15m)} · CVD (taker) 5m: ${fmtPct(s.takerDelta5m)}</div>
+      <div style="color:var(--yellow);margin-top:2px;">⚠️ Тесен/скосен профил - вероятен trend режим, НЕ Е entry сигнал сам по себе си</div>
+    </div>`;
+  }
   const detectorClass = (isBottom ? ' detector-bottom' : isTop ? ' detector-top' : '') + (coin.oiFlip ? ' oi-flip' : '');
   let athBarHtml = coin.pctFromAth !== null
     ? `<div class="ath-bar"><span style="color:var(--text2)">ATH: <span style="color:${coin.pctFromAth>-15?'var(--red)':coin.pctFromAth>-50?'var(--yellow)':'var(--green)'}">${coin.pctFromAth.toFixed(0)}%</span></span><span style="color:var(--text2)">MCap: <span style="color:var(--text)">$${coin.marketCap>0?formatNum(coin.marketCap):'--'}</span></span><span style="color:var(--text2)">ATL: <span style="color:${coin.pctFromAtl&&coin.pctFromAtl<100?'var(--green)':'var(--text2)'}">+${coin.pctFromAtl?coin.pctFromAtl.toFixed(0):'?'}%</span></span></div>`
@@ -1592,6 +1626,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     ${flowWarmingBanner}
     ${trapBanner}
     ${targetBanner}
+    ${auctionBanner}
     <div style="color:var(--text2);font-size:9px;letter-spacing:.5px;margin:6px 0 -2px;">⚡ МОМЕНТУМ ПОСОКА (24ч/L-S/funding/обем) — независимо от паттърн таговете горе</div>
     <div class="signal-box">
       <div class="signal-badge badge-${sc}">${sig.signal}</div>
