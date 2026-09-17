@@ -1434,6 +1434,81 @@ function getHVNLVN(profile) {
   return { hvn, lvn };
 }
 
+// ═══ IDEA 02 - "TARGET / DESTINATION SCORE" ═══════════════════════════════════
+// POC-ът от Volume Profile Engine (виж по-горе) е ОСНОВНАТА цел - "магнит", към
+// който пазарът обичайно се връща (mean-reversion) след достатъчно отдалечаване
+// от него. HVN зоните са ДОПЪЛНИТЕЛНИ магнити по пътя - чисто информативни,
+// НЕ участват в score-а. Score-ът е нарочно САМО разстояние+сила на нивото (БЕЗ
+// OI/CVD hard factor изискване, за разлика от TRAP/FLOW WARMING) - потвърден с
+// потребителя.
+const TARGET_MIN_DISTANCE_PCT = 3; // под това % разстояние от POC няма смисъл от "цел" - вече е твърде близо
+
+function calcTargetDistancePct(price, targetPrice) {
+  if (price == null || targetPrice == null || !(price > 0)) return null;
+  return ((targetPrice - price) / price) * 100;
+}
+
+// Score 0-5: до 3т за разстояние (колкото по-отдалечена е цената от POC, толкова
+// по-силен обратен "пул"), до 2т за силата на самия POC (какъв дял държи от
+// целия обем на профила - по-голям дял = по-ясно изразен, по-надежден магнит).
+function calcTargetScore({ price, poc, profileTotalVolume }) {
+  if (price == null || !poc || poc.price == null) {
+    return { score: 0, direction: null, distancePct: null, levelStrengthPct: null, targetPrice: null };
+  }
+  const distancePct = calcTargetDistancePct(price, poc.price);
+  const absDistance = Math.abs(distancePct);
+  const direction = distancePct > 0 ? 'long' : 'short'; // POC над цената -> очакван "пул" нагоре (LONG); под цената -> надолу (SHORT)
+  const levelStrengthPct = (profileTotalVolume != null && profileTotalVolume > 0) ? (poc.volume / profileTotalVolume) * 100 : null;
+
+  let distancePts = 0;
+  if (absDistance >= 10) distancePts = 3;
+  else if (absDistance >= 6) distancePts = 2;
+  else if (absDistance >= TARGET_MIN_DISTANCE_PCT) distancePts = 1;
+
+  let strengthPts = 0;
+  if (levelStrengthPct != null) {
+    if (levelStrengthPct >= 8) strengthPts = 2;
+    else if (levelStrengthPct >= 4) strengthPts = 1;
+  }
+
+  return { score: distancePts + strengthPts, direction, distancePct, levelStrengthPct, targetPrice: poc.price };
+}
+
+const TARGET_LABELS = {
+  none: null,
+  watch: '🎯 TARGET WATCH',
+  strong: '🎯 TARGET STRONG',
+};
+// Изисква ЯВНО минимално разстояние (TARGET_MIN_DISTANCE_PCT) - под него цената
+// е твърде близо до POC, за да има смисъл от "цел" (вече почти е стигнала).
+function getTargetTier(score, distancePct) {
+  if (distancePct == null || Math.abs(distancePct) < TARGET_MIN_DISTANCE_PCT) return 'none';
+  if (score >= 4) return 'strong';
+  if (score >= 2) return 'watch';
+  return 'none';
+}
+
+// Намира най-близките HVN "магнити" ПО ПЪТЯ към POC (строго между текущата цена
+// и целта, в правилната посока) - чисто информативни, НЕ влизат в score-а.
+function findNearestMagnets(price, direction, targetPrice, hvnList = [], limit = 2) {
+  if (price == null || !direction || targetPrice == null || !Array.isArray(hvnList)) return [];
+  const relevant = hvnList.filter(n => direction === 'long'
+    ? (n.price > price && n.price <= targetPrice)
+    : (n.price < price && n.price >= targetPrice));
+  relevant.sort((a, b) => Math.abs(a.price - price) - Math.abs(b.price - price));
+  return relevant.slice(0, limit);
+}
+
+// TARGET - огледално на flowWarmingCanFire/markFlowWarmingFired по-горе (LIVE-
+// style, без candleTime - key е чисто direction:tier, защото профилът се мени
+// бавно, веднъж на затворен ден), собствен KV state ключ (state.target).
+function targetCanFire(state, key) {
+  return key !== 'none' && state.target?.key !== key;
+}
+function markTargetFired(state, key) {
+  state.target = { key, at: Date.now() };
+}
+
 // ============================================================================
 // PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
 // HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
@@ -2362,6 +2437,17 @@ async function scanSymbolSignals(env, symbol) {
   const vpValueArea = calcValueArea(volumeProfile);
   const vpNodes = getHVNLVN(volumeProfile);
 
+  // IDEA 02 - "TARGET / DESTINATION SCORE" (виж calcTargetScore по-горе) -
+  // изцяло отделно известие, огледално на FLOW WARMING/TRAP. Строи се directly
+  // върху горния Volume Profile - POC е целта, HVN nodes-ите по-долу са само
+  // информативни допълнителни магнити (не влизат в score-а).
+  const targetScore = calcTargetScore({ price, poc: vpPoc, profileTotalVolume: volumeProfile?.totalVolume });
+  const targetTier = getTargetTier(targetScore.score, targetScore.distancePct);
+  const targetKey = targetTier !== 'none' ? `${targetScore.direction}:${targetTier}` : 'none';
+  const targetFired = targetCanFire(state, targetKey);
+  if (targetFired) markTargetFired(state, targetKey);
+  const targetMagnets = findNearestMagnets(price, targetScore.direction, targetScore.targetPrice, vpNodes.hvn);
+
   await saveSymbolState(env, symbol, state);
 
   return {
@@ -2381,6 +2467,9 @@ async function scanSymbolSignals(env, symbol) {
     vpVah: vpValueArea ? vpValueArea.vah : null,
     vpVal: vpValueArea ? vpValueArea.val : null,
     vpHvn: vpNodes.hvn, vpLvn: vpNodes.lvn,
+    targetFired, targetTier, targetDirection: targetScore.direction, targetScore: targetScore.score,
+    targetDistancePct: targetScore.distancePct, targetLevelStrengthPct: targetScore.levelStrengthPct,
+    targetPrice: targetScore.targetPrice, targetMagnets,
   };
 }
 
@@ -2397,7 +2486,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -2455,6 +2544,27 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
           lines.push(...previouslyActive);
         }
         await sendWhatsApp(env, lines.join('\n'));
+      }
+      // IDEA 02 - "TARGET / DESTINATION SCORE" (виж calcTargetScore по-горе) -
+      // изцяло отделно известие, огледално на FLOW WARMING/TRAP. POC е целта
+      // (mean-reversion магнит), HVN nodes-ите по пътя са само информативни
+      // допълнителни магнити - НЕ влизат в score-а. Score-ът е чисто
+      // разстояние+сила на нивото, БЕЗ OI/CVD hard factor изискване (потвърдено
+      // изрично с потребителя - виж дискусията за идея 02).
+      if (targetFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const targetLines = [
+          `${TARGET_LABELS[targetTier]} ${symbolNoUsdt} ${targetDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `TARGET SCORE: ${targetScore}/5`,
+          `POC (цел): ${formatPrice(targetPrice)} USD · Разстояние: ${fmtPct(targetDistancePct)}`,
+          `Сила на нивото: ${targetLevelStrengthPct != null ? targetLevelStrengthPct.toFixed(1) + '%' : '--'} от обема`,
+        ];
+        if (targetMagnets.length) {
+          targetLines.push(`Магнити по пътя: ${targetMagnets.map(m => formatPrice(m.price)).join(' → ')}`);
+        }
+        targetLines.push(`⚠️ Ориентировъчна цел (mean-reversion) - НЕ Е entry сигнал`);
+        await sendWhatsApp(env, targetLines.join('\n'));
       }
       // PHASE CYCLE ENGINE - изцяло отделно известие от горното, независимо
       // от MIN_NOTIFY_SCORE/newFired на класическия LONG/SHORT поток. Праща се
