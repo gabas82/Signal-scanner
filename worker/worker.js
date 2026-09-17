@@ -1296,6 +1296,49 @@ function getTrapTier(score, hasHardFactor) {
   return 'none';
 }
 
+// ═══ IDEA 06 - "IMPULSE RELOAD / SECOND-ENTRY ENGINE" ═══════════════════════
+// Решава "изпуснах първия вход" - IMPULSE -> контролиран pullback -> FLOW
+// RELOAD (обем спада, CVD се обръща обратно в посоката на импулса) -> SECOND
+// IMPULSE trigger (reclaim на micro-high/low + обем + CVD потвърждение).
+// ИЗРИЧНО НЕ Е DCA модул (виж спецификацията) - RELOAD е НОВ, независим
+// сигнал за вход, не осредняване на съществуваща позиция. "IMPULSE MEMORY" -
+// за разлика от обикновения candleTime cooldown на IMPULSE тага по-горе (той
+// само пречи на повторно известие за СЪЩИЯ impulse), тук изрично ПАЗИМ
+// impulse-а "жив" в state.reloadWindow вместо да го забравяме веднага, точно
+// за да хванем евентуален ВТОРИ вход. Изцяло Worker-only (виж прецедента с
+// PHASE CYCLE ENGINE по-горе - state machine, специфична за WhatsApp cron
+// потока, не част от browser Scanner UI-то, затова не се мирори в
+// signal-logic.js/signal-scanner.html).
+const RELOAD_MAX_HOURS = 12; // ако pullback+reload не се случат в тоя прозорец, забравяме impulse-а
+const RELOAD_PULLBACK_MIN_PCT = 0.5; // под това е шум, не истински pullback
+const RELOAD_PULLBACK_MAX_PCT = 8; // над това вече не е "контролиран" - инвалидира прозореца
+const RELOAD_VOL_CONFIRM_RATIO = 1.3; // първоначална преценка, нужна калибрация с реални данни
+
+function calcReloadPullbackPct(dir, extremePrice, price) {
+  if (extremePrice == null || price == null || !extremePrice) return null;
+  return dir === 1 ? ((extremePrice - price) / extremePrice) * 100 : ((price - extremePrice) / extremePrice) * 100;
+}
+// Веднъж открит истински pullback (pullbackPct >= MIN), "замразяваме" фазата -
+// extremePrice спира да следва движението (виж wiring-а в scanSymbolSignals)
+// и става фиксираният micro-high/low, който SECOND IMPULSE трябва да reclaim-не.
+function calcReloadPhaseTransition({ phase, pullbackPct }) {
+  if (phase === 'tracking' && pullbackPct != null && pullbackPct >= RELOAD_PULLBACK_MIN_PCT) return 'pullback';
+  return phase;
+}
+function calcReloadInvalidated(pullbackPct) {
+  return pullbackPct != null && pullbackPct > RELOAD_PULLBACK_MAX_PCT;
+}
+// SECOND IMPULSE trigger - reclaim на замразения micro-high/low + обем + CVD
+// потвърждение, САМО след като реално сме преминали през 'pullback' фаза
+// (не позволява да гръмне направо от 'tracking', без изобщо да е имало pullback).
+function calcSecondImpulseTrigger({ phase, dir, extremePrice, price, volAccel, takerDelta5m }) {
+  if (phase !== 'pullback' || extremePrice == null || price == null) return false;
+  const reclaimed = dir === 1 ? price > extremePrice : price < extremePrice;
+  const volConfirm = volAccel != null && volAccel.ratio != null && volAccel.ratio >= RELOAD_VOL_CONFIRM_RATIO;
+  const cvdConfirm = dir === 1 ? (takerDelta5m != null && takerDelta5m > 0) : (takerDelta5m != null && takerDelta5m < 0);
+  return reclaimed && volConfirm && cvdConfirm;
+}
+
 // ============================================================================
 // PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
 // HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
@@ -2168,6 +2211,50 @@ async function scanSymbolSignals(env, symbol) {
   const trapFired = trapCanFire(state, trapKey);
   if (trapFired) markTrapFired(state, trapKey);
 
+  // ---- RELOAD (IDEA 06, виж дефинициите непосредствено след getTrapTier
+  // по-горе) - реюзва вече изчислените impulse/price/volAccel/takerFlow, нула
+  // нови мрежови заявки. IMPULSE MEMORY (state.reloadWindow) е независима от
+  // sparkKey/flowWarmingKey/trapKey - собствено, изцяло отделно известие.
+  if (impulse.long || impulse.short) {
+    const dir = impulse.long ? 1 : -1;
+    const existing = state.reloadWindow;
+    // Ре-армираме САМО ако няма активен прозорец, той е изтекъл, или новият
+    // impulse е в ПРОТИВОПОЛОЖНА посока (flip) - ако вече следим impulse в
+    // СЪЩАТА посока, не нулираме прогреса му (pullback фазата) на всеки тик.
+    if (!existing || Date.now() >= existing.until || existing.dir !== dir) {
+      state.reloadWindow = { dir, extremePrice: price, until: Date.now() + RELOAD_MAX_HOURS * 3600000, phase: 'tracking' };
+    }
+  }
+  const reloadWindow = state.reloadWindow;
+  const reloadActive = !!reloadWindow && Date.now() < reloadWindow.until;
+  let reloadFired = false, reloadDirection = null;
+  if (reloadActive && price != null) {
+    // Докато сме във фаза 'tracking', extremePrice продължава да следва
+    // движението (нов екстремум) - "замръзва" чак когато реален pullback
+    // е засечен (виж calcReloadPhaseTransition).
+    if (reloadWindow.phase === 'tracking') {
+      if (reloadWindow.dir === 1 && price > reloadWindow.extremePrice) reloadWindow.extremePrice = price;
+      if (reloadWindow.dir === -1 && price < reloadWindow.extremePrice) reloadWindow.extremePrice = price;
+    }
+    const pullbackPct = calcReloadPullbackPct(reloadWindow.dir, reloadWindow.extremePrice, price);
+    if (calcReloadInvalidated(pullbackPct)) {
+      // Pullback-ът стана твърде дълбок - вече не е "контролиран" (IDEA 06
+      // изрично НЕ Е DCA модул) - забравяме impulse-а изцяло.
+      state.reloadWindow = null;
+    } else {
+      reloadWindow.phase = calcReloadPhaseTransition({ phase: reloadWindow.phase, pullbackPct });
+      const triggered = calcSecondImpulseTrigger({
+        phase: reloadWindow.phase, dir: reloadWindow.dir, extremePrice: reloadWindow.extremePrice,
+        price, volAccel, takerDelta5m: takerFlow.delta5m,
+      });
+      if (triggered) {
+        reloadFired = true;
+        reloadDirection = reloadWindow.dir === 1 ? 'long' : 'short';
+        state.reloadWindow = null; // веднъж отключен, забравяме - следващ RELOAD изисква нов IMPULSE
+      }
+    }
+  }
+
   await saveSymbolState(env, symbol, state);
 
   return {
@@ -2182,6 +2269,7 @@ async function scanSymbolSignals(env, symbol) {
     takerDelta15m: takerFlow.delta15m, takerDelta1h: takerFlow.delta1h,
     flowWarmingKey, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore,
     trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct,
+    reloadFired, reloadDirection,
   };
 }
 
@@ -2198,7 +2286,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -2334,6 +2422,21 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
           `⚠️ САМО ранно предупреждение - НЕ Е entry сигнал, изчакай потвърждение`,
         ];
         await sendWhatsApp(env, trapLines.join('\n'));
+      }
+      // RELOAD (IDEA 06, виж calcSecondImpulseTrigger по-горе) - изцяло
+      // отделно известие. За разлика от SPARK/FLOW WARMING/TRAP, това е
+      // реален, независим сигнал за ВТОРИ вход (не DCA, не просто watch) -
+      // IMPULSE MEMORY (state.reloadWindow) вече е потвърдила контролиран
+      // pullback + reclaim + обем + CVD преди да гръмне.
+      if (reloadFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const reloadLines = [
+          `🔁 RELOAD ${symbolNoUsdt} ${reloadDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `Втори вход след контролиран pullback (IMPULSE MEMORY)`,
+        ];
+        if (price != null) reloadLines.push(`Цена: ${formatPrice(price)} USD`);
+        reloadLines.push(`⚠️ Провери графиката преди вход - независим сигнал, не DCA`);
+        await sendWhatsApp(env, reloadLines.join('\n'));
       }
     } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }
   }
