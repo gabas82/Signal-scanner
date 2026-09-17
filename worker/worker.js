@@ -1246,6 +1246,56 @@ function getFlowWarmingTier(score, hasHardFactor) {
   return 'none';
 }
 
+// ═══ IDEA 01 - "ABSORPTION / TRAP GATE" (PRE-IMPULSE) ═══════════════════════
+// Търси "капан" за трейдъри на грешната страна - цена помита близка
+// swing high/low (ликвидиране на стопове/лимитни поръчки на грешната страна),
+// но веднага се "reclaim"-ва (SFP - Swing Failure Pattern), докато агресивният
+// (taker CVD) поток в посоката на помитането е бил ПОГЪЛНАТ, не е продължил.
+// ВАЖНО (изрично изискване на предложението): това е САМО ранно
+// предупреждение/watch - НЕ автоматичен entry сигнал, виж TRAP_LABELS и
+// известието по-долу. Byte-identical копие на функциите от signal-logic.js.
+function calcLiquiditySweep(candles, opts = {}) {
+  const lookback = opts.lookback ?? 20;
+  const n = candles.length;
+  if (n < lookback + 2) return { bullish: false, bearish: false, lowestLow: null, highestHigh: null };
+  const last = candles[n - 1];
+  const window = candles.slice(n - 1 - lookback, n - 1);
+  const lowestLow = Math.min(...window.map(c => c.low));
+  const highestHigh = Math.max(...window.map(c => c.high));
+  const bullish = last.low < lowestLow && last.close > lowestLow && last.close > last.open;
+  const bearish = last.high > highestHigh && last.close < highestHigh && last.close < last.open;
+  return { bullish, bearish, lowestLow, highestHigh };
+}
+
+const TRAP_TAKER_DELTA_THRESHOLD = 2;
+function calcTrapScore({ symbol, sweepBullish, sweepBearish, takerBuyPressure, takerDelta5m, oiDeltaPct, volAccel }) {
+  const tier = getSparkCoinTier(symbol);
+  const volThreshold = SPARK_VOL_RATIO_THRESHOLD[tier];
+  const bullishAbsorbed = sweepBullish && ((takerBuyPressure != null && takerBuyPressure >= 50) || (takerDelta5m != null && takerDelta5m >= TRAP_TAKER_DELTA_THRESHOLD));
+  const bearishAbsorbed = sweepBearish && ((takerBuyPressure != null && takerBuyPressure <= 50) || (takerDelta5m != null && takerDelta5m <= -TRAP_TAKER_DELTA_THRESHOLD));
+  const oiHeld = oiDeltaPct != null && oiDeltaPct >= 0;
+  const volAccelOK = volAccel != null && volAccel.ratio != null && volAccel.ratio >= volThreshold;
+
+  let longScore = 0, shortScore = 0;
+  if (bullishAbsorbed) longScore += 2;
+  if (bearishAbsorbed) shortScore += 2;
+  if (oiHeld) { longScore++; shortScore++; }
+  if (volAccelOK) { longScore++; shortScore++; }
+
+  return { longScore, shortScore, hasHardFactorLong: bullishAbsorbed, hasHardFactorShort: bearishAbsorbed };
+}
+const TRAP_LABELS = {
+  none: null,
+  watch: '🪤 TRAP WATCH',
+  confirmed: '🪤 TRAP CONFIRMED',
+};
+function getTrapTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'confirmed';
+  if (score >= 3) return 'watch';
+  return 'none';
+}
+
 // ============================================================================
 // PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
 // HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
@@ -1525,6 +1575,15 @@ function flowWarmingCanFire(state, key) {
 }
 function markFlowWarmingFired(state, key) {
   state.flowWarming = { key, at: Date.now() };
+}
+
+// TRAP - огледално на flowWarmingCanFire/markFlowWarmingFired по-горе,
+// собствен KV state ключ (state.trap).
+function trapCanFire(state, key) {
+  return key !== 'none' && state.trap?.key !== key;
+}
+function markTrapFired(state, key) {
+  state.trap = { key, at: Date.now() };
 }
 
 // WhatsApp/Android понякога разпознава "$" залепено директно за низ от цифри
@@ -2087,6 +2146,28 @@ async function scanSymbolSignals(env, symbol) {
   const flowWarmingFired = flowWarmingCanFire(state, flowWarmingKey);
   if (flowWarmingFired) markFlowWarmingFired(state, flowWarmingKey);
 
+  // ---- TRAP (IDEA 01, виж дефинициите непосредствено след
+  // fetchTakerLongShortWorker по-горе) - реюзва вече изчислените c1hClosed
+  // (sweep detection на затворена свещ, огледално на SHIFT/CONFIRMED),
+  // oiDeltaPct/volAccel/takerFlow - нула нови мрежови заявки.
+  const sweep = calcLiquiditySweep(c1hClosed);
+  const trapScore = calcTrapScore({
+    symbol: symbolNoUsdt, sweepBullish: sweep.bullish, sweepBearish: sweep.bearish,
+    takerBuyPressure: takerFlow.buyPressureNow, takerDelta5m: takerFlow.delta5m,
+    oiDeltaPct, volAccel,
+  });
+  const trapDirection = trapScore.longScore >= trapScore.shortScore ? 'long' : 'short';
+  const trapMaxScore = Math.max(trapScore.longScore, trapScore.shortScore);
+  const trapHasHardFactor = trapDirection === 'long' ? trapScore.hasHardFactorLong : trapScore.hasHardFactorShort;
+  const trapTier = getTrapTier(trapMaxScore, trapHasHardFactor);
+  // sweep candleTime (последната затворена 1ч свещ) - собствен key компонент,
+  // за да не се повтори известието на СЪЩАТА затворена свещ (огледално на
+  // candleTime конвенцията за структурните тагове, но с key вместо label).
+  const trapCandleTime = c1hClosed.length ? c1hClosed[c1hClosed.length - 1].openTime : null;
+  const trapKey = (trapMaxScore >= 3 && trapHasHardFactor) ? `${trapDirection}:${trapTier}:${trapCandleTime}` : 'none';
+  const trapFired = trapCanFire(state, trapKey);
+  if (trapFired) markTrapFired(state, trapKey);
+
   await saveSymbolState(env, symbol, state);
 
   return {
@@ -2100,6 +2181,7 @@ async function scanSymbolSignals(env, symbol) {
     takerBuyPressure: takerFlow.buyPressureNow, takerDelta5m: takerFlow.delta5m,
     takerDelta15m: takerFlow.delta15m, takerDelta1h: takerFlow.delta1h,
     flowWarmingKey, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore,
+    trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct,
   };
 }
 
@@ -2116,7 +2198,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -2235,6 +2317,23 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
           `⚠️ Все още НЕ Е entry - следи за развитие`,
         ];
         await sendWhatsApp(env, flowWarmingLines.join('\n'));
+      }
+      // TRAP (IDEA 01, виж calcTrapScore по-горе) - изцяло отделно известие,
+      // огледално на SPARK/FLOW WARMING. ИЗРИЧНО НЕ Е entry сигнал (виж
+      // предупредителния ред по-долу) - само ранно предупреждение за
+      // потенциален капан (sweep + reclaim + CVD поглъщане на противоположния
+      // агресивен поток) - потвърждаването/невалидирането му идва от
+      // следващото реално движение, не от самия TRAP сигнал.
+      if (trapFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const trapLines = [
+          `${TRAP_LABELS[trapTier]} ${symbolNoUsdt} ${trapDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `TRAP SCORE: ${trapMaxScore}/4`,
+          `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
+          `⚠️ САМО ранно предупреждение - НЕ Е entry сигнал, изчакай потвърждение`,
+        ];
+        await sendWhatsApp(env, trapLines.join('\n'));
       }
     } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }
   }
