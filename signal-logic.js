@@ -1355,6 +1355,71 @@ function getHVNLVN(profile) {
   return { hvn, lvn };
 }
 
+// ═══ IDEA 02 - "TARGET / DESTINATION SCORE" ═══════════════════════════════════
+// POC-ът от Volume Profile Engine (виж по-горе) е ОСНОВНАТА цел - "магнит", към
+// който пазарът обичайно се връща (mean-reversion) след достатъчно отдалечаване
+// от него. HVN зоните са ДОПЪЛНИТЕЛНИ магнити по пътя - чисто информативни,
+// НЕ участват в score-а. Score-ът е нарочно САМО разстояние+сила на нивото (БЕЗ
+// OI/CVD hard factor изискване, за разлика от TRAP/FLOW WARMING) - потвърден с
+// потребителя.
+const TARGET_MIN_DISTANCE_PCT = 3; // под това % разстояние от POC няма смисъл от "цел" - вече е твърде близо
+
+function calcTargetDistancePct(price, targetPrice) {
+  if (price == null || targetPrice == null || !(price > 0)) return null;
+  return ((targetPrice - price) / price) * 100;
+}
+
+// Score 0-5: до 3т за разстояние (колкото по-отдалечена е цената от POC, толкова
+// по-силен обратен "пул"), до 2т за силата на самия POC (какъв дял държи от
+// целия обем на профила - по-голям дял = по-ясно изразен, по-надежден магнит).
+function calcTargetScore({ price, poc, profileTotalVolume }) {
+  if (price == null || !poc || poc.price == null) {
+    return { score: 0, direction: null, distancePct: null, levelStrengthPct: null, targetPrice: null };
+  }
+  const distancePct = calcTargetDistancePct(price, poc.price);
+  const absDistance = Math.abs(distancePct);
+  const direction = distancePct > 0 ? 'long' : 'short'; // POC над цената -> очакван "пул" нагоре (LONG); под цената -> надолу (SHORT)
+  const levelStrengthPct = (profileTotalVolume != null && profileTotalVolume > 0) ? (poc.volume / profileTotalVolume) * 100 : null;
+
+  let distancePts = 0;
+  if (absDistance >= 10) distancePts = 3;
+  else if (absDistance >= 6) distancePts = 2;
+  else if (absDistance >= TARGET_MIN_DISTANCE_PCT) distancePts = 1;
+
+  let strengthPts = 0;
+  if (levelStrengthPct != null) {
+    if (levelStrengthPct >= 8) strengthPts = 2;
+    else if (levelStrengthPct >= 4) strengthPts = 1;
+  }
+
+  return { score: distancePts + strengthPts, direction, distancePct, levelStrengthPct, targetPrice: poc.price };
+}
+
+const TARGET_LABELS = {
+  none: null,
+  watch: '🎯 TARGET WATCH',
+  strong: '🎯 TARGET STRONG',
+};
+// Изисква ЯВНО минимално разстояние (TARGET_MIN_DISTANCE_PCT) - под него цената
+// е твърде близо до POC, за да има смисъл от "цел" (вече почти е стигнала).
+function getTargetTier(score, distancePct) {
+  if (distancePct == null || Math.abs(distancePct) < TARGET_MIN_DISTANCE_PCT) return 'none';
+  if (score >= 4) return 'strong';
+  if (score >= 2) return 'watch';
+  return 'none';
+}
+
+// Намира най-близките HVN "магнити" ПО ПЪТЯ към POC (строго между текущата цена
+// и целта, в правилната посока) - чисто информативни, НЕ влизат в score-а.
+function findNearestMagnets(price, direction, targetPrice, hvnList = [], limit = 2) {
+  if (price == null || !direction || targetPrice == null || !Array.isArray(hvnList)) return [];
+  const relevant = hvnList.filter(n => direction === 'long'
+    ? (n.price > price && n.price <= targetPrice)
+    : (n.price < price && n.price >= targetPrice));
+  relevant.sort((a, b) => Math.abs(a.price - price) - Math.abs(b.price - price));
+  return relevant.slice(0, limit);
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -1380,6 +1445,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcTakerBuyPressure, calcTakerFlowDelta,
     calcFlowWarmingScore, getFlowWarmingTier, FLOW_WARMING_LABELS, FLOW_WARMING_TAKER_DELTA_THRESHOLD,
     calcLiquiditySweep, calcTrapScore, getTrapTier, TRAP_LABELS, TRAP_TAKER_DELTA_THRESHOLD,
-    buildVolumeProfile, calcPOC, calcValueArea, getHVNLVN
+    buildVolumeProfile, calcPOC, calcValueArea, getHVNLVN,
+    calcTargetDistancePct, calcTargetScore, getTargetTier, findNearestMagnets, TARGET_LABELS, TARGET_MIN_DISTANCE_PCT
   };
 }

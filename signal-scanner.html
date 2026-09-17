@@ -980,11 +980,15 @@ async function loadSpark() {
   const results = [];
   for (const coin of allCoins) {
     try {
-      const [k1h, k4h, oiHist, takerHist] = await Promise.all([
+      const [k1h, k4h, oiHist, takerHist, k1d] = await Promise.all([
         fetchKlines(coin.fullSymbol, '1h', 60, SPARK_KLINE_TTL_MS),
         fetchKlines(coin.fullSymbol, '4h', 30, SPARK_KLINE_TTL_MS),
         fetchOiMultiHist(coin.fullSymbol),
         fetchTakerFlowHist(coin.fullSymbol),
+        // IDEA 02 - "TARGET / DESTINATION SCORE" - 31 дневни свещи (последната
+        // недовършена се маха по-долу -> 30 затворени дни), огледално на
+        // прозореца в scanSymbolSignals (worker.js).
+        fetchKlines(coin.fullSymbol, '1d', 31, SPARK_KLINE_TTL_MS),
       ]);
       const c1h = klinesToCandles(k1h), c4h = klinesToCandles(k4h);
       const oiMulti = calcOiMultiDelta(oiHist);
@@ -1041,6 +1045,17 @@ async function loadSpark() {
       const trapMaxScore = Math.max(trapScore.longScore, trapScore.shortScore);
       const trapHasHardFactor = trapDirection === 'long' ? trapScore.hasHardFactorLong : trapScore.hasHardFactorShort;
       const trapTier = getTrapTier(trapMaxScore, trapHasHardFactor);
+      // IDEA 02 - "TARGET / DESTINATION SCORE" (виж calcTargetScore в
+      // signal-logic.js) - Volume Profile Engine от 30-те затворени дневни
+      // свещи (само в браузъра, БЕЗ persist между презарежданията - всеки
+      // load е свеж). POC е целта, HVN nodes-ите са само информативни магнити.
+      const c1dClosed = klinesToCandles(k1d).slice(0, -1);
+      const volumeProfile = buildVolumeProfile(c1dClosed);
+      const vpPoc = calcPOC(volumeProfile);
+      const vpNodes = getHVNLVN(volumeProfile);
+      const targetScore = calcTargetScore({ price: coin.price, poc: vpPoc, profileTotalVolume: volumeProfile?.totalVolume });
+      const targetTier = getTargetTier(targetScore.score, targetScore.distancePct);
+      const targetMagnets = findNearestMagnets(coin.price, targetScore.direction, targetScore.targetPrice, vpNodes.hvn);
       coin.sparkSignal = {
         oiDelta5m: oiMulti.delta5m, oiDelta15m: oiMulti.delta15m, oiDelta1h: oiMulti.delta1h,
         volRatio: volAccel.ratio, chg1h, chg4h,
@@ -1055,6 +1070,9 @@ async function loadSpark() {
         takerDelta15m: takerFlow.delta15m, takerDelta5m: takerFlow.delta5m,
         flowWarmingTier, flowWarmingDirection, flowWarmingMaxScore,
         trapTier, trapDirection, trapMaxScore,
+        targetTier, targetDirection: targetScore.direction, targetScoreValue: targetScore.score,
+        targetDistancePct: targetScore.distancePct, targetLevelStrengthPct: targetScore.levelStrengthPct,
+        targetPrice: targetScore.targetPrice, targetMagnets,
       };
       // Точка 9 от предложението - Price Extension филтър: ако вече е "избягала",
       // не е "ранна" - не влиза в резултатите, независимо от score-а. Сега
@@ -1065,7 +1083,7 @@ async function loadSpark() {
       // това е случаят, който FLOW WARMING цели да хване по-рано. TRAP (IDEA 01)
       // добавя ЧЕТВЪРТА причина - sweep+reclaim+CVD поглъщане е самостоятелно
       // ранно предупреждение, независимо от другите тагове.
-      if (!extension.extended && (coin.sparkSignal.longTier !== 'none' || coin.sparkSignal.shortTier !== 'none' || flowWarmingTier !== 'none' || trapTier !== 'none')) {
+      if (!extension.extended && (coin.sparkSignal.longTier !== 'none' || coin.sparkSignal.shortTier !== 'none' || flowWarmingTier !== 'none' || trapTier !== 'none' || targetTier !== 'none')) {
         results.push(coin);
       }
     } catch(e) { coin.sparkSignal = null; }
@@ -1461,6 +1479,14 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     const trDir = coin.sparkSignal.trapDirection;
     tags.push(`<span class="tag" style="background:rgba(160,100,220,0.25);color:#c084fc">${trapLabel} ${trDir==='long'?'▲':'▼'} (${coin.sparkSignal.trapMaxScore}/4)</span>`);
   }
+  // IDEA 02 - "TARGET / DESTINATION SCORE" (виж calcTargetScore в
+  // signal-logic.js) - самостоятелен таг, огледален на FLOW WARMING/TRAP -
+  // излиза дори без другите тагове (POC mean-reversion не зависи от SPARK).
+  const targetLabel = coin.sparkSignal ? TARGET_LABELS[coin.sparkSignal.targetTier] : null;
+  if (targetLabel && !coin.sparkSignal.extended) {
+    const tgDir = coin.sparkSignal.targetDirection;
+    tags.push(`<span class="tag" style="background:${tgDir==='long'?'rgba(0,180,220,0.25)':'rgba(0,140,220,0.25)'};color:#5ec8e8">${targetLabel} ${tgDir==='long'?'▲':'▼'} (${coin.sparkSignal.targetScoreValue}/5)</span>`);
+  }
   if (coin.sparkSignal?.extended) tags.push(`<span class="tag" style="background:rgba(180,140,0,0.2);color:var(--yellow)">⚠️ LATE/EXTENDED - DO NOT CHASE</span>`);
   const detectorBanner = isBottom ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>` : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding.toFixed(3)}% · L/S>${coin.longPct.toFixed(0)}% · OI↓</div>` : '';
   let setupBanner = '';
@@ -1508,6 +1534,19 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
       <div style="color:var(--yellow);margin-top:2px;">⚠️ САМО ранно предупреждение - НЕ Е entry сигнал</div>
     </div>`;
   }
+  // TARGET детайлен банер (IDEA 02) - отделен от SPARK/FLOW WARMING/TRAP
+  // банерите по-горе, огледален подход - излиза дори без другите тагове.
+  let targetBanner = '';
+  if (targetLabel && !coin.sparkSignal.extended) {
+    const s = coin.sparkSignal;
+    const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+    targetBanner = `<div style="margin:6px 0;padding:6px 8px;border-radius:4px;background:rgba(0,180,220,0.10);border-left:3px solid #5ec8e8;font-size:10px;">
+      <div style="font-weight:600;color:#5ec8e8">${targetLabel} ${s.targetDirection==='long'?'▲ LONG':'▼ SHORT'} · TARGET SCORE: ${s.targetScoreValue}/5</div>
+      <div style="color:var(--text2);margin-top:2px;">POC (цел): $${formatPrice(s.targetPrice)} · Разстояние: ${fmtPct(s.targetDistancePct)}</div>
+      <div style="color:var(--text2);">Сила на нивото: ${s.targetLevelStrengthPct!=null?s.targetLevelStrengthPct.toFixed(1)+'%':'--'} от обема${s.targetMagnets && s.targetMagnets.length ? ' · Магнити по пътя: '+s.targetMagnets.map(m=>'$'+formatPrice(m.price)).join(' → ') : ''}</div>
+      <div style="color:var(--yellow);margin-top:2px;">⚠️ Ориентировъчна цел (mean-reversion) - НЕ Е entry сигнал</div>
+    </div>`;
+  }
   const detectorClass = (isBottom ? ' detector-bottom' : isTop ? ' detector-top' : '') + (coin.oiFlip ? ' oi-flip' : '');
   let athBarHtml = coin.pctFromAth !== null
     ? `<div class="ath-bar"><span style="color:var(--text2)">ATH: <span style="color:${coin.pctFromAth>-15?'var(--red)':coin.pctFromAth>-50?'var(--yellow)':'var(--green)'}">${coin.pctFromAth.toFixed(0)}%</span></span><span style="color:var(--text2)">MCap: <span style="color:var(--text)">$${coin.marketCap>0?formatNum(coin.marketCap):'--'}</span></span><span style="color:var(--text2)">ATL: <span style="color:${coin.pctFromAtl&&coin.pctFromAtl<100?'var(--green)':'var(--text2)'}">+${coin.pctFromAtl?coin.pctFromAtl.toFixed(0):'?'}%</span></span></div>`
@@ -1552,6 +1591,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     ${sparkBanner}
     ${flowWarmingBanner}
     ${trapBanner}
+    ${targetBanner}
     <div style="color:var(--text2);font-size:9px;letter-spacing:.5px;margin:6px 0 -2px;">⚡ МОМЕНТУМ ПОСОКА (24ч/L-S/funding/обем) — независимо от паттърн таговете горе</div>
     <div class="signal-box">
       <div class="signal-badge badge-${sc}">${sig.signal}</div>
