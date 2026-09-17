@@ -1472,6 +1472,88 @@ function getAuctionQualityTier(score, hasHardFactor) {
   return 'none';
 }
 
+// ═══ IDEA 04 - "VALUE MIGRATION" ═══════════════════════════════════════════════
+// Сравнява POC на ВЧЕРАШНИЯ (затворен) дневен профил с POC на ДНЕШНИЯ (все още
+// незавършен) дневен профил, построени от 1ч свещи - миграция на POC нагоре/
+// надолу през деня е ранен индикатор, че пазарът приема нова "справедлива цена"
+// (value), не просто шум около старата. ИМА hard factor изискване (OI/CVD да
+// потвърждават посоката на миграцията) - потвърдено с потребителя, огледално
+// на TRAP/AUCTION.
+const MIGRATION_MIN_PCT = 1; // под това % разлика между двата POC - шум, не истинска миграция
+const MIGRATION_MIN_CANDLES = 3; // минимум свещи за "днес", преди да има смисъл от сравнение
+
+// Разделя подадените 1ч свещи по UTC календарен ден (openTime в ms) - връща Map
+// от "YYYY-MM-DD" -> масив свещи, само за съответния ден.
+function splitCandlesByUtcDay(candles) {
+  const map = new Map();
+  if (!Array.isArray(candles)) return map;
+  for (const c of candles) {
+    if (c.openTime == null) continue;
+    const dayKey = new Date(c.openTime).toISOString().slice(0, 10);
+    if (!map.has(dayKey)) map.set(dayKey, []);
+    map.get(dayKey).push(c);
+  }
+  return map;
+}
+
+// Взима свещите за "днес" (последния наличен UTC ден в данните) и "вчера"
+// (предходния) - последните 2 УНИКАЛНИ дни в подадения масив, не системния
+// часовник директно (детерминирано, работи еднакво и в тестове).
+function getTodayYesterdayCandles(candles) {
+  const byDay = splitCandlesByUtcDay(candles);
+  const days = Array.from(byDay.keys()).sort();
+  if (days.length < 2) return { today: [], yesterday: [] };
+  return { today: byDay.get(days[days.length - 1]) || [], yesterday: byDay.get(days[days.length - 2]) || [] };
+}
+
+// Score 0-4: hard factor (OI/CVD потвърждение на посоката) гейтва tier-а изцяло
+// (виж getValueMigrationTier) - огледално на TRAP/AUCTION.
+function calcValueMigrationScore({ todayCandles, yesterdayCandles, oiDeltaPct, takerDelta, volAccel }) {
+  if (!Array.isArray(todayCandles) || todayCandles.length < MIGRATION_MIN_CANDLES ||
+      !Array.isArray(yesterdayCandles) || yesterdayCandles.length === 0) {
+    return { longScore: 0, shortScore: 0, hasHardFactorLong: false, hasHardFactorShort: false, migrationPct: null, todayPoc: null, yesterdayPoc: null };
+  }
+  const todayPoc = calcPOC(buildVolumeProfile(todayCandles));
+  const yesterdayPoc = calcPOC(buildVolumeProfile(yesterdayCandles));
+  if (!todayPoc || !yesterdayPoc || !(yesterdayPoc.price > 0)) {
+    return { longScore: 0, shortScore: 0, hasHardFactorLong: false, hasHardFactorShort: false, migrationPct: null, todayPoc: null, yesterdayPoc: null };
+  }
+  const migrationPct = ((todayPoc.price - yesterdayPoc.price) / yesterdayPoc.price) * 100;
+  const absMigration = Math.abs(migrationPct);
+  const migratingUp = migrationPct >= MIGRATION_MIN_PCT;
+  const migratingDown = migrationPct <= -MIGRATION_MIN_PCT;
+
+  const oiConfirmLong = oiDeltaPct != null && oiDeltaPct > 0;
+  const oiConfirmShort = oiDeltaPct != null && oiDeltaPct < 0;
+  const cvdConfirmLong = takerDelta != null && takerDelta > 0;
+  const cvdConfirmShort = takerDelta != null && takerDelta < 0;
+  const volOK = volAccel != null && volAccel.tier !== 'none';
+
+  const hasHardFactorLong = migratingUp && (oiConfirmLong || cvdConfirmLong);
+  const hasHardFactorShort = migratingDown && (oiConfirmShort || cvdConfirmShort);
+
+  let longScore = 0, shortScore = 0;
+  if (migratingUp) longScore += 2;
+  if (migratingDown) shortScore += 2;
+  if (absMigration >= MIGRATION_MIN_PCT * 3) { if (migratingUp) longScore++; if (migratingDown) shortScore++; }
+  if (volOK) { longScore++; shortScore++; }
+
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort, migrationPct, todayPoc: todayPoc.price, yesterdayPoc: yesterdayPoc.price };
+}
+
+const MIGRATION_LABELS = {
+  none: null,
+  watch: '🔀 VALUE MIGRATION WATCH',
+  confirmed: '🔀 VALUE MIGRATION CONFIRMED',
+};
+// Максимален score е 4 (2т посока + 1т силна миграция + 1т обем), огледално на getTrapTier по-горе.
+function getValueMigrationTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'confirmed';
+  if (score >= 3) return 'watch';
+  return 'none';
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -1499,6 +1581,8 @@ if (typeof module !== 'undefined' && module.exports) {
     calcLiquiditySweep, calcTrapScore, getTrapTier, TRAP_LABELS, TRAP_TAKER_DELTA_THRESHOLD,
     buildVolumeProfile, calcPOC, calcValueArea, getHVNLVN,
     calcTargetDistancePct, calcTargetScore, getTargetTier, findNearestMagnets, TARGET_LABELS, TARGET_MIN_DISTANCE_PCT,
-    calcAuctionQualityScore, getAuctionQualityTier, AUCTION_LABELS, AUCTION_NARROW_WIDTH_PCT, AUCTION_SKEW_THRESHOLD
+    calcAuctionQualityScore, getAuctionQualityTier, AUCTION_LABELS, AUCTION_NARROW_WIDTH_PCT, AUCTION_SKEW_THRESHOLD,
+    splitCandlesByUtcDay, getTodayYesterdayCandles, calcValueMigrationScore, getValueMigrationTier,
+    MIGRATION_LABELS, MIGRATION_MIN_PCT, MIGRATION_MIN_CANDLES
   };
 }
