@@ -1505,14 +1505,34 @@ function findNearestMagnets(price, direction, targetPrice, hvnList = [], limit =
   return relevant.slice(0, limit);
 }
 
+// ═══ HYSTERESIS (анти-flapping буфер) ═══════════════════════════════════════
+// Общ помощник за ВСИЧКИ score-базирани детектори (TARGET/TRAP/AUCTION/
+// MIGRATION/FLOW WARMING/LIQUIDATION GRAVITY) - без него дребно колебание на
+// score-а точно около границата на tier (напр. TARGET distancePct 10.0% ->
+// 9.8%, score 4 -> 3) сменя key-я (long:strong -> long:watch) и предизвиква
+// НОВО известие само на минути разстояние, макар посоката да е СЪЩАТА (реален
+// случай, видян в production). Правило: смяна на key ВИНАГИ пали известие
+// ВЕДНАГА, АКО посоката (direction) също се е сменила (long<->short е
+// съществена промяна, не шум) - но ако посоката е СЪЩАТА, а само tier/score-ът
+// е трепнал, изчакваме поне HYSTERESIS_COOLDOWN_MIN минути от последното
+// известие на този детектор, преди да позволим ново.
+const HYSTERESIS_COOLDOWN_MIN = 30;
+function canFireWithHysteresis(entry, key, direction, cooldownMin = HYSTERESIS_COOLDOWN_MIN) {
+  if (key === 'none') return false;
+  if (!entry || entry.key == null) return true;
+  if (entry.key === key) return false;
+  if (entry.direction !== direction) return true;
+  return (Date.now() - entry.at) >= cooldownMin * 60000;
+}
+
 // TARGET - огледално на flowWarmingCanFire/markFlowWarmingFired по-горе (LIVE-
 // style, без candleTime - key е чисто direction:tier, защото профилът се мени
 // бавно, веднъж на затворен ден), собствен KV state ключ (state.target).
-function targetCanFire(state, key) {
-  return key !== 'none' && state.target?.key !== key;
+function targetCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.target, key, direction);
 }
-function markTargetFired(state, key) {
-  state.target = { key, at: Date.now() };
+function markTargetFired(state, key, direction) {
+  state.target = { key, direction, at: Date.now() };
 }
 
 // ═══ IDEA 03 - "AUCTION QUALITY" ═══════════════════════════════════════════════
@@ -1569,11 +1589,11 @@ function getAuctionQualityTier(score, hasHardFactor) {
 
 // AUCTION - огледално на flowWarmingCanFire/markFlowWarmingFired по-горе (LIVE-
 // style, без candleTime), собствен KV state ключ (state.auction).
-function auctionCanFire(state, key) {
-  return key !== 'none' && state.auction?.key !== key;
+function auctionCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.auction, key, direction);
 }
-function markAuctionFired(state, key) {
-  state.auction = { key, at: Date.now() };
+function markAuctionFired(state, key, direction) {
+  state.auction = { key, direction, at: Date.now() };
 }
 
 // ═══ IDEA 04 - "VALUE MIGRATION" ═══════════════════════════════════════════════
@@ -1660,11 +1680,11 @@ function getValueMigrationTier(score, hasHardFactor) {
 
 // VALUE MIGRATION - огледално на auctionCanFire/markAuctionFired по-горе (LIVE-
 // style, без candleTime), собствен KV state ключ (state.migration).
-function migrationCanFire(state, key) {
-  return key !== 'none' && state.migration?.key !== key;
+function migrationCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.migration, key, direction);
 }
-function markMigrationFired(state, key) {
-  state.migration = { key, at: Date.now() };
+function markMigrationFired(state, key, direction) {
+  state.migration = { key, direction, at: Date.now() };
 }
 
 // ═══ IDEA 08 - "LIQUIDATION GRAVITY" ═══════════════════════════════════════════
@@ -1777,11 +1797,11 @@ function getLiquidationGravityTier(score, hasHardFactor) {
 // LIQUIDATION GRAVITY - огледално на auctionCanFire/markAuctionFired по-горе
 // (LIVE-style, без candleTime), собствен KV state ключ (state.liqGravityFired -
 // различен от state.liqGravity по-горе, който пази самия натрупан профил).
-function liqGravityCanFire(state, key) {
-  return key !== 'none' && state.liqGravityFired?.key !== key;
+function liqGravityCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.liqGravityFired, key, direction);
 }
-function markLiqGravityFired(state, key) {
-  state.liqGravityFired = { key, at: Date.now() };
+function markLiqGravityFired(state, key, direction) {
+  state.liqGravityFired = { key, direction, at: Date.now() };
 }
 
 // ============================================================================
@@ -2058,20 +2078,20 @@ function markSparkFired(state, key) {
 // FLOW WARMING - огледално на sparkCanFire/markSparkFired по-горе, собствен
 // KV state ключ (state.flowWarming, не state.spark) - собствено, независимо
 // известие, огледално на SPARK/🔮 ЦИКЪЛ.
-function flowWarmingCanFire(state, key) {
-  return key !== 'none' && state.flowWarming?.key !== key;
+function flowWarmingCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.flowWarming, key, direction);
 }
-function markFlowWarmingFired(state, key) {
-  state.flowWarming = { key, at: Date.now() };
+function markFlowWarmingFired(state, key, direction) {
+  state.flowWarming = { key, direction, at: Date.now() };
 }
 
 // TRAP - огледално на flowWarmingCanFire/markFlowWarmingFired по-горе,
 // собствен KV state ключ (state.trap).
-function trapCanFire(state, key) {
-  return key !== 'none' && state.trap?.key !== key;
+function trapCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.trap, key, direction);
 }
-function markTrapFired(state, key) {
-  state.trap = { key, at: Date.now() };
+function markTrapFired(state, key, direction) {
+  state.trap = { key, direction, at: Date.now() };
 }
 
 // WhatsApp/Android понякога разпознава "$" залепено директно за низ от цифри
@@ -2631,8 +2651,8 @@ async function scanSymbolSignals(env, symbol) {
   const flowWarmingHasHardFactor = flowWarmingDirection === 'long' ? flowWarmingScore.hasHardFactorLong : flowWarmingScore.hasHardFactorShort;
   const flowWarmingTier = getFlowWarmingTier(flowWarmingMaxScore, flowWarmingHasHardFactor);
   const flowWarmingKey = (flowWarmingMaxScore >= 3 && flowWarmingHasHardFactor) ? `${flowWarmingDirection}:${flowWarmingTier}` : 'none';
-  const flowWarmingFired = flowWarmingCanFire(state, flowWarmingKey);
-  if (flowWarmingFired) markFlowWarmingFired(state, flowWarmingKey);
+  const flowWarmingFired = flowWarmingCanFire(state, flowWarmingKey, flowWarmingDirection);
+  if (flowWarmingFired) markFlowWarmingFired(state, flowWarmingKey, flowWarmingDirection);
 
   // ---- TRAP (IDEA 01, виж дефинициите непосредствено след
   // fetchTakerLongShortWorker по-горе) - реюзва вече изчислените c1hClosed
@@ -2653,8 +2673,8 @@ async function scanSymbolSignals(env, symbol) {
   // candleTime конвенцията за структурните тагове, но с key вместо label).
   const trapCandleTime = c1hClosed.length ? c1hClosed[c1hClosed.length - 1].openTime : null;
   const trapKey = (trapMaxScore >= 3 && trapHasHardFactor) ? `${trapDirection}:${trapTier}:${trapCandleTime}` : 'none';
-  const trapFired = trapCanFire(state, trapKey);
-  if (trapFired) markTrapFired(state, trapKey);
+  const trapFired = trapCanFire(state, trapKey, trapDirection);
+  if (trapFired) markTrapFired(state, trapKey, trapDirection);
 
   // ---- RELOAD (IDEA 06, виж дефинициите непосредствено след getTrapTier
   // по-горе) - реюзва вече изчислените impulse/price/volAccel/takerFlow, нула
@@ -2719,8 +2739,8 @@ async function scanSymbolSignals(env, symbol) {
   const targetScore = calcTargetScore({ price, poc: vpPoc, profileTotalVolume: volumeProfile?.totalVolume });
   const targetTier = getTargetTier(targetScore.score, targetScore.distancePct);
   const targetKey = targetTier !== 'none' ? `${targetScore.direction}:${targetTier}` : 'none';
-  const targetFired = targetCanFire(state, targetKey);
-  if (targetFired) markTargetFired(state, targetKey);
+  const targetFired = targetCanFire(state, targetKey, targetScore.direction);
+  if (targetFired) markTargetFired(state, targetKey, targetScore.direction);
   const targetMagnets = findNearestMagnets(price, targetScore.direction, targetScore.targetPrice, vpNodes.hvn);
 
   // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore по-горе) -
@@ -2735,8 +2755,8 @@ async function scanSymbolSignals(env, symbol) {
   const auctionHasHardFactor = auctionDirection === 'long' ? auctionScore.hasHardFactorLong : auctionScore.hasHardFactorShort;
   const auctionTier = getAuctionQualityTier(auctionMaxScore, auctionHasHardFactor);
   const auctionKey = auctionTier !== 'none' ? `${auctionDirection}:${auctionTier}` : 'none';
-  const auctionFired = auctionCanFire(state, auctionKey);
-  if (auctionFired) markAuctionFired(state, auctionKey);
+  const auctionFired = auctionCanFire(state, auctionKey, auctionDirection);
+  if (auctionFired) markAuctionFired(state, auctionKey, auctionDirection);
 
   // IDEA 04 - "VALUE MIGRATION" (виж calcValueMigrationScore по-горе) -
   // изцяло отделно известие, огледално на TRAP/AUCTION. Строи се от c1h (ЖИВИ
@@ -2752,8 +2772,8 @@ async function scanSymbolSignals(env, symbol) {
   const migrationHasHardFactor = migrationDirection === 'long' ? migrationScore.hasHardFactorLong : migrationScore.hasHardFactorShort;
   const migrationTier = getValueMigrationTier(migrationMaxScore, migrationHasHardFactor);
   const migrationKey = migrationTier !== 'none' ? `${migrationDirection}:${migrationTier}` : 'none';
-  const migrationFired = migrationCanFire(state, migrationKey);
-  if (migrationFired) markMigrationFired(state, migrationKey);
+  const migrationFired = migrationCanFire(state, migrationKey, migrationDirection);
+  if (migrationFired) markMigrationFired(state, migrationKey, migrationDirection);
 
   // IDEA 08 - "LIQUIDATION GRAVITY" (виж calcLiquidationGravityScore по-горе) -
   // изцяло отделно известие, огледално на TRAP/AUCTION/MIGRATION. Реизползва
@@ -2768,8 +2788,8 @@ async function scanSymbolSignals(env, symbol) {
   const liqGravityHasHardFactor = liqGravityDirection === 'long' ? liqGravityScore.hasHardFactorLong : liqGravityScore.hasHardFactorShort;
   const liqGravityTier = getLiquidationGravityTier(liqGravityMaxScore, liqGravityHasHardFactor);
   const liqGravityKey = liqGravityTier !== 'none' ? `${liqGravityDirection}:${liqGravityTier}` : 'none';
-  const liqGravityFired = liqGravityCanFire(state, liqGravityKey);
-  if (liqGravityFired) markLiqGravityFired(state, liqGravityKey);
+  const liqGravityFired = liqGravityCanFire(state, liqGravityKey, liqGravityDirection);
+  if (liqGravityFired) markLiqGravityFired(state, liqGravityKey, liqGravityDirection);
 
   await saveSymbolState(env, symbol, state);
 
