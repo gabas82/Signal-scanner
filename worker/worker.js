@@ -953,9 +953,15 @@ async function fetchFundingWorker(env, symbol) {
 // тества на живо. Прагът LIQUIDATION_CASCADE_USD_MIN е първоначална преценка,
 // не калибрирана с реални данни - очаква се наблюдение и евентуална корекция
 // след deploy (вижда се и в PR описанието).
+// ПОПРАВКА (IDEA 08): `min_liquidation_amount` е ЗАДЪЛЖИТЕЛЕН query параметър
+// според документацията, но липсваше досега - добавен с ниска стойност (1
+// USD), за да не филтрира реално нищо, само да удовлетвори изискването.
+// `price` полето вече също се извлича - нужно е за LIQUIDATION GRAVITY
+// (виж по-долу), CASCADE логиката по-долу не го е ползвала и продължава да
+// не го ползва.
 async function fetchLiquidationOrdersWorker(env, symbol) {
   try {
-    const r = await fetch(`https://open-api-v4.coinglass.com/api/futures/liquidation/order?symbol=${symbol}&exchange=Binance`, {
+    const r = await fetch(`https://open-api-v4.coinglass.com/api/futures/liquidation/order?symbol=${symbol}&exchange=Binance&min_liquidation_amount=1`, {
       headers: { 'CG-API-KEY': env.CG_API_KEY },
     });
     if (!r.ok) return null;
@@ -963,7 +969,7 @@ async function fetchLiquidationOrdersWorker(env, symbol) {
     const data = Array.isArray(json?.data) ? json.data : null;
     if (!data) return null;
     return data
-      .map(d => ({ side: Number(d.side), usdValue: parseFloat(d.usd_value), time: Number(d.time) }))
+      .map(d => ({ side: Number(d.side), usdValue: parseFloat(d.usd_value), time: Number(d.time), price: parseFloat(d.price) }))
       .filter(d => isFinite(d.usdValue) && isFinite(d.time));
   } catch (e) {
     return null;
@@ -1659,6 +1665,123 @@ function migrationCanFire(state, key) {
 }
 function markMigrationFired(state, key) {
   state.migration = { key, at: Date.now() };
+}
+
+// ═══ IDEA 08 - "LIQUIDATION GRAVITY" ═══════════════════════════════════════════
+// Worker-only (огледално на IDEA 06/PHASE CYCLE ENGINE прецедент - виж git
+// history) - за разлика от Volume Profile Engine (строи се НАНОВО всеки тик от
+// вече изтеглени свещи), тук профилът се НАТРУПВА постоянно в KV между
+// тиковете, месеци напред. Причината: Binance klines може да се преизтеглят
+// назад по всяко време (история), но CoinGlass `/liquidation/order` връща само
+// последните 7 дни И максимум 200 записа на заявка - НЯМА начин да се построи
+// профил еднократно от миналото, той расте единствено напред във времето,
+// натрупвайки новите ликвидации тик по тик (виж accumulateLiquidationGravity).
+// Затова профилът структурно не може да съществува извън persistent KV state -
+// UI-то (signal-scanner.html) няма собствено персистентно съхранение и не се
+// мирorира там, същата логика като PHASE CYCLE/RELOAD.
+//
+// Логаритмични (не линейни) ценови кошчета - за разлика от Volume Profile
+// buckets (фиксиран линеен диапазон от ЕДНА моментна снимка свещи), тук
+// профилът обхваща месеци движение на цената без предварително известен
+// диапазон, затова процентно-базирано (log-scale) кошче е единственият начин
+// да остане смислено сравним, докато цената се движи през времето.
+const LIQ_GRAVITY_BUCKET_PCT = 0.005; // 0.5% логаритмична ширина на кошче
+const LIQ_GRAVITY_PROXIMITY_PCT = 2; // "наближава" клъстер = под 2% разстояние - първоначална преценка, нужна калибрация
+const LIQ_GRAVITY_CLUSTER_MIN_USD = 2000000; // 2 млн. USD натрупани в кошче = "силен" клъстер - първоначална преценка, нужна калибрация
+
+function priceToLiqBucket(price) {
+  if (!(price > 0)) return null;
+  return Math.round(Math.log(price) / Math.log(1 + LIQ_GRAVITY_BUCKET_PCT));
+}
+function liqBucketToPrice(bucketIndex) {
+  return Math.pow(1 + LIQ_GRAVITY_BUCKET_PCT, bucketIndex);
+}
+
+// Натрупва само НОВИТЕ поръчки (o.time > lastSeenTime) в state.liqGravity.buckets
+// - вика се веднъж на тик, БЕЗ да пресмята нищо наново, само добавя delta.
+// Мутира state directly (както buildUpWindow/reloadWindow другаде в този файл).
+function accumulateLiquidationGravity(state, orders) {
+  if (!state.liqGravity) state.liqGravity = { buckets: {}, lastSeenTime: 0 };
+  const g = state.liqGravity;
+  if (!Array.isArray(orders)) return;
+  let maxTime = g.lastSeenTime;
+  for (const o of orders) {
+    if (!(o.time > g.lastSeenTime) || !(o.price > 0) || !(o.usdValue > 0)) continue;
+    const bucket = priceToLiqBucket(o.price);
+    if (bucket == null) continue;
+    g.buckets[bucket] = (g.buckets[bucket] || 0) + o.usdValue;
+    if (o.time > maxTime) maxTime = o.time;
+  }
+  g.lastSeenTime = maxTime;
+}
+
+// Намира най-близкия "силен" клъстер (кошче с натрупан USD обем >= usdMin) до
+// текущата цена - null, ако profile-ът е празен или няма нито едно кошче над прага.
+function findNearestLiquidationCluster(state, price, opts = {}) {
+  const usdMin = opts.usdMin ?? LIQ_GRAVITY_CLUSTER_MIN_USD;
+  const g = state?.liqGravity;
+  if (!g || !g.buckets || price == null) return null;
+  let best = null, bestDist = Infinity;
+  for (const key of Object.keys(g.buckets)) {
+    const usd = g.buckets[key];
+    if (usd < usdMin) continue;
+    const bucketPrice = liqBucketToPrice(Number(key));
+    const dist = Math.abs(bucketPrice - price);
+    if (dist < bestDist) { bestDist = dist; best = { price: bucketPrice, usd }; }
+  }
+  return best;
+}
+
+// Score 0-4: hard factor (OI/CVD потвърждение на посоката) гейтва tier-а
+// изцяло (виж getLiquidationGravityTier) - огледално на TRAP/AUCTION/MIGRATION.
+function calcLiquidationGravityScore({ price, cluster, oiDeltaPct, takerDelta, volAccel }) {
+  if (price == null || !(price > 0) || !cluster) {
+    return { longScore: 0, shortScore: 0, hasHardFactorLong: false, hasHardFactorShort: false, distancePct: null, clusterPrice: null, clusterUsd: null };
+  }
+  const distancePct = ((cluster.price - price) / price) * 100;
+  const absDistance = Math.abs(distancePct);
+  const isNear = absDistance <= LIQ_GRAVITY_PROXIMITY_PCT;
+  const direction = distancePct > 0 ? 'long' : 'short'; // клъстер НАД цената -> цената приближава го отдолу (LONG посока на движение натам)
+
+  const oiConfirmLong = oiDeltaPct != null && oiDeltaPct > 0;
+  const oiConfirmShort = oiDeltaPct != null && oiDeltaPct < 0;
+  const cvdConfirmLong = takerDelta != null && takerDelta > 0;
+  const cvdConfirmShort = takerDelta != null && takerDelta < 0;
+  const volOK = volAccel != null && volAccel.tier !== 'none';
+
+  const hasHardFactorLong = isNear && direction === 'long' && (oiConfirmLong || cvdConfirmLong);
+  const hasHardFactorShort = isNear && direction === 'short' && (oiConfirmShort || cvdConfirmShort);
+
+  let longScore = 0, shortScore = 0;
+  if (isNear && direction === 'long') longScore += 2;
+  if (isNear && direction === 'short') shortScore += 2;
+  if (volOK) { longScore++; shortScore++; }
+  if (cluster.usd >= LIQ_GRAVITY_CLUSTER_MIN_USD * 2) { if (direction === 'long') longScore++; if (direction === 'short') shortScore++; }
+
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort, distancePct, clusterPrice: cluster.price, clusterUsd: cluster.usd };
+}
+
+const LIQ_GRAVITY_LABELS = {
+  none: null,
+  watch: '🧲 LIQUIDATION GRAVITY WATCH',
+  confirmed: '🧲 LIQUIDATION GRAVITY CONFIRMED',
+};
+// Максимален score е 4 (2т посока+близост + 1т обем + 1т особено силен клъстер), огледално на getTrapTier по-горе.
+function getLiquidationGravityTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'confirmed';
+  if (score >= 3) return 'watch';
+  return 'none';
+}
+
+// LIQUIDATION GRAVITY - огледално на auctionCanFire/markAuctionFired по-горе
+// (LIVE-style, без candleTime), собствен KV state ключ (state.liqGravityFired -
+// различен от state.liqGravity по-горе, който пази самия натрупан профил).
+function liqGravityCanFire(state, key) {
+  return key !== 'none' && state.liqGravityFired?.key !== key;
+}
+function markLiqGravityFired(state, key) {
+  state.liqGravityFired = { key, at: Date.now() };
 }
 
 // ============================================================================
@@ -2632,6 +2755,22 @@ async function scanSymbolSignals(env, symbol) {
   const migrationFired = migrationCanFire(state, migrationKey);
   if (migrationFired) markMigrationFired(state, migrationKey);
 
+  // IDEA 08 - "LIQUIDATION GRAVITY" (виж calcLiquidationGravityScore по-горе) -
+  // изцяло отделно известие, огледално на TRAP/AUCTION/MIGRATION. Реизползва
+  // liquidationOrders (вече изтеглени по-горе за LIQUIDATION CASCADE) - БЕЗ
+  // никакви допълнителни мрежови заявки. Натрупва delta-та в state, после
+  // проверява дали цената наближава вече идентифициран силен клъстер.
+  accumulateLiquidationGravity(state, liquidationOrders);
+  const liqCluster = findNearestLiquidationCluster(state, price);
+  const liqGravityScore = calcLiquidationGravityScore({ price, cluster: liqCluster, oiDeltaPct, takerDelta: takerFlow.delta5m, volAccel });
+  const liqGravityDirection = liqGravityScore.longScore >= liqGravityScore.shortScore ? 'long' : 'short';
+  const liqGravityMaxScore = Math.max(liqGravityScore.longScore, liqGravityScore.shortScore);
+  const liqGravityHasHardFactor = liqGravityDirection === 'long' ? liqGravityScore.hasHardFactorLong : liqGravityScore.hasHardFactorShort;
+  const liqGravityTier = getLiquidationGravityTier(liqGravityMaxScore, liqGravityHasHardFactor);
+  const liqGravityKey = liqGravityTier !== 'none' ? `${liqGravityDirection}:${liqGravityTier}` : 'none';
+  const liqGravityFired = liqGravityCanFire(state, liqGravityKey);
+  if (liqGravityFired) markLiqGravityFired(state, liqGravityKey);
+
   await saveSymbolState(env, symbol, state);
 
   return {
@@ -2658,6 +2797,8 @@ async function scanSymbolSignals(env, symbol) {
     auctionWidthPct: auctionScore.widthPct, auctionSkewRatio: auctionScore.skewRatio,
     migrationFired, migrationTier, migrationDirection, migrationMaxScore,
     migrationPct: migrationScore.migrationPct, migrationTodayPoc: migrationScore.todayPoc, migrationYesterdayPoc: migrationScore.yesterdayPoc,
+    liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore,
+    liqGravityDistancePct: liqGravityScore.distancePct, liqGravityClusterPrice: liqGravityScore.clusterPrice, liqGravityClusterUsd: liqGravityScore.clusterUsd,
   };
 }
 
@@ -2674,7 +2815,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -2785,6 +2926,24 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
           `⚠️ Value migration - НЕ Е entry сигнал сам по себе си`,
         ];
         await sendWhatsApp(env, migrationLines.join('\n'));
+      }
+      // IDEA 08 - "LIQUIDATION GRAVITY" (виж calcLiquidationGravityScore
+      // по-горе) - изцяло отделно известие, огледално на TRAP/AUCTION/
+      // MIGRATION. Профилът е ХИПОТЕЗА за тестване (натрупан от реални
+      // станали ликвидации, НЕ прогнозен heatmap) - дали цена, отдалечена от
+      // зона с много исторически ликвидации, се връща пак там, предстои да
+      // видим емпирично.
+      if (liqGravityFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const liqGravityLines = [
+          `${LIQ_GRAVITY_LABELS[liqGravityTier]} ${symbolNoUsdt} ${liqGravityDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `LIQUIDATION GRAVITY SCORE: ${liqGravityMaxScore}/4`,
+          `Клъстер: ${formatPrice(liqGravityClusterPrice)} USD (${liqGravityClusterUsd != null ? Math.round(liqGravityClusterUsd).toLocaleString('en-US') : '--'} USD натрупани) · Разстояние: ${fmtPct(liqGravityDistancePct)}`,
+          `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
+          `⚠️ Хипотеза за тестване (историческа ликвидационна зона) - НЕ Е entry сигнал`,
+        ];
+        await sendWhatsApp(env, liqGravityLines.join('\n'));
       }
       // PHASE CYCLE ENGINE - изцяло отделно известие от горното, независимо
       // от MIN_NOTIFY_SCORE/newFired на класическия LONG/SHORT поток. Праща се
