@@ -34,6 +34,14 @@ function proxyToBinance(targetUrl, res) {
   });
 }
 
+// DISCOVERY RADAR (Stage A) - symbol=null/undefined/'' -> bulk URL (целия
+// пазар в 1 заявка), иначе непроменено per-symbol поведение.
+function buildTicker24hrTarget(symbol) {
+  return symbol
+    ? `https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${encodeURIComponent(symbol)}`
+    : `https://fapi.binance.com/fapi/v1/ticker/24hr`;
+}
+
 function requireToken(url, res) {
   if (!TOKEN) return true; // no token configured - allow (not recommended, but don't hard-fail)
   const supplied = (url.searchParams.get('token') || '').trim();
@@ -159,17 +167,15 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // За PHASE CYCLE ENGINE (24ч % промяна - за OVERHEATED/NO CHASE детектора).
+  // За PHASE CYCLE ENGINE (24ч % промяна - за OVERHEATED/NO CHASE детектора) +
+  // DISCOVERY RADAR (Stage A) - symbol вече е опционален: без него Binance
+  // връща 24ч статистика за ВСИЧКИ futures контракти в 1 заявка ("bulk"
+  // режим) - радарът така сканира целия пазар без per-symbol заявки. Старото
+  // per-symbol поведение (worker.js OVERHEATED детекторът) е непроменено.
   if (url.pathname === '/ticker24hr') {
     if (!requireToken(url, res)) return;
     const symbol = url.searchParams.get('symbol');
-    if (!symbol) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'symbol is required' }));
-      return;
-    }
-    const target = `https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
-    proxyToBinance(target, res);
+    proxyToBinance(buildTicker24hrTarget(symbol), res);
     return;
   }
 
