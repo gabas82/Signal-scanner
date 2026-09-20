@@ -3982,7 +3982,97 @@ function calcDiscoveryConfidence(metrics, baseline, direction) {
   return Math.max(0, Math.min(1, confidence));
 }
 
-export { calcDCALevels, checkDcaLevels, checkPriceLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals, checkMacroSqueeze };
+// ---- DISCOVERY RADAR (Stage C) - bulk fetch + 15-мин gate + persistence ---
+// Свързва Stage B чистите функции с реални данни: relay bulk /ticker24hr
+// (Stage A - целия пазар в 1 заявка) + KV persistence на snapshot/baseline
+// състоянието на монета. Пуска се на ВСЕКИ CORE cron tick (5 мин), но
+// вътрешно е no-op освен на всеки ~3-ти тик (DISCOVERY_RADAR_INTERVAL_MIN) -
+// същия KV-timestamp gate патерн като HYSTERESIS_COOLDOWN_MIN/
+// VAHVAL_REARM_COOLDOWN_MIN. Все още БЕЗ pool ranking/eviction (Stage D) и
+// БЕЗ FULL ANALYSIS wiring (Stage E) - тук само сканираме и пазим score-овете.
+const DISCOVERY_RADAR_INTERVAL_MIN = 15; // v1 начална точка - виж чата (5м прекалено шумно за rolling 24ч delta, 30м прекалено бавно)
+
+async function fetchMarketWideTicker24hrWorker(env) {
+  const r = await fetch(`${env.RELAY_URL}/ticker24hr?token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+  if (!r.ok) throw new Error(`bulk /ticker24hr HTTP ${r.status}`);
+  return await r.json();
+}
+
+// Филтрира bulk отговора до DISCOVERY "вселената": само USDT-M perpetual (без
+// quarterly/delivery контракти, разпознаваеми по "_" в символа), без монетите
+// вече в CORE WATCHLIST (те си имат пълно 24/7 покритие - DISCOVERY е само за
+// ОСТАНАЛИЯ пазар). Пропуска редове с невалидни/липсващи числови полета, без
+// throw.
+function filterDiscoveryUniverse(bulkTicker, coreSymbols) {
+  const coreSet = new Set(coreSymbols);
+  const bySymbol = {};
+  if (!Array.isArray(bulkTicker)) return bySymbol;
+  for (const t of bulkTicker) {
+    if (!t || typeof t.symbol !== 'string') continue;
+    if (!t.symbol.endsWith('USDT') || t.symbol.includes('_')) continue;
+    if (coreSet.has(t.symbol)) continue;
+    const price = parseFloat(t.lastPrice);
+    const quoteVolume = parseFloat(t.quoteVolume);
+    const count = parseFloat(t.count);
+    const high = parseFloat(t.highPrice);
+    const low = parseFloat(t.lowPrice);
+    if (![price, quoteVolume, count, high, low].every(Number.isFinite)) continue;
+    bySymbol[t.symbol] = { price, quoteVolume, count, high, low };
+  }
+  return bySymbol;
+}
+
+// Гейтнато обновяване (извиква се от scheduled() на всеки CORE тик, но реално
+// работи само на ~DISCOVERY_RADAR_INTERVAL_MIN мин). Собствени KV ключове
+// (discoverysnapshot/discoverybaseline/discoveryscores) - не споделя нищо със
+// sigstate:/pricelevel:/macrosqueeze:, за да няма race condition. Собствен
+// try/catch на най-горно ниво - грешка тук (напр. relay недостъпен) не бива
+// да чупи error видимостта на другите, вече работещи проверки в Promise.all.
+async function updateDiscoverySnapshotState(env, watchlist = WATCHLIST) {
+  try {
+    if (!env.ALERT_STATE || !env.RELAY_URL) return;
+    const rawState = await env.ALERT_STATE.get('discoverysnapshot');
+    const state = rawState ? JSON.parse(rawState) : { at: 0, bySymbol: {} };
+    const now = Date.now();
+    if (now - state.at < DISCOVERY_RADAR_INTERVAL_MIN * 60000) return; // още не е време
+
+    const bulk = await fetchMarketWideTicker24hrWorker(env);
+    const coreSymbols = watchlist.map((w) => w.symbol);
+    const currBySymbol = filterDiscoveryUniverse(bulk, coreSymbols);
+
+    const rawBaseline = await env.ALERT_STATE.get('discoverybaseline');
+    const baselines = rawBaseline ? JSON.parse(rawBaseline) : {};
+
+    const newBaselines = {};
+    const newScores = {};
+    for (const [symbol, curr] of Object.entries(currBySymbol)) {
+      const prev = state.bySymbol[symbol];
+      const metrics = calcDiscoverySnapshotMetrics(prev, curr);
+      const oldBaseline = baselines[symbol] || null;
+      const direction = calcDiscoveryDirection(metrics);
+      if (metrics) {
+        const activity = calcDiscoveryActivityScore(metrics, oldBaseline);
+        const confidence = calcDiscoveryConfidence(metrics, oldBaseline, direction);
+        newScores[symbol] = {
+          score: activity.score, acceleration: activity.acceleration, compressionExpansion: activity.compressionExpansion,
+          wasCompressing: activity.wasCompressing, nowExpanding: activity.nowExpanding,
+          volumeRatio: activity.volumeRatio, countRatio: activity.countRatio,
+          direction, confidence, price: curr.price, at: now,
+        };
+      }
+      newBaselines[symbol] = updateDiscoveryBaseline(oldBaseline, metrics, direction);
+    }
+
+    await env.ALERT_STATE.put('discoverysnapshot', JSON.stringify({ at: now, bySymbol: currBySymbol }));
+    await env.ALERT_STATE.put('discoverybaseline', JSON.stringify(newBaselines));
+    await env.ALERT_STATE.put('discoveryscores', JSON.stringify(newScores));
+  } catch (e) { console.error(`DISCOVERY RADAR snapshot update error: ${e.message}`); }
+}
+
+export {
+  calcDCALevels, checkDcaLevels, checkPriceLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals, checkMacroSqueeze,
+  updateDiscoverySnapshotState,
+};
 
 export default {
   async fetch(request, env) {
@@ -4193,6 +4283,6 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env), checkPriceLevels(env)]));
+    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env), checkPriceLevels(env), updateDiscoverySnapshotState(env)]));
   }
 };
