@@ -1755,8 +1755,8 @@ function setupCanFire(state, direction) {
   if (!direction) return false;
   return !state.setup || state.setup.direction !== direction;
 }
-function markSetupFired(state, direction, score) {
-  state.setup = { direction, score, at: Date.now() };
+function markSetupFired(state, direction, score, price) {
+  state.setup = { direction, score, at: Date.now(), price: price ?? null };
 }
 
 // ═══ ENTRY ENGINE - ЕТАП 2: "ARMED" ══════════════════════════════════════════════
@@ -3206,7 +3206,7 @@ async function scanSymbolSignals(env, symbol) {
     trapDirection, trapTier, auctionDirection, auctionTier, migrationDirection, migrationTier,
   });
   const setupFired = setupCanFire(state, setupState.direction);
-  if (setupFired) markSetupFired(state, setupState.direction, setupState.score);
+  if (setupFired) markSetupFired(state, setupState.direction, setupState.score, price);
   if (!setupState.direction) state.setup = null; // деактивирано - следваща активация ще пали НАНОВО
 
   // ENTRY ENGINE - ЕТАП 2: "ARMED" (виж calcArmedTrigger по-горе) - чисто
@@ -4160,6 +4160,12 @@ function computeDiscoveryPoolUpdate({ currentPool, scoresBySymbol, lockedSymbols
       symbol, enteredAt: now, weakTicks: 0, locked: false,
       lastScore: scoresBySymbol[symbol].score, lastDirection: scoresBySymbol[symbol].direction,
       lastConfidence: scoresBySymbol[symbol].confidence,
+      // Immutable "снимка" от МОМЕНТА на влизане в pool-а (за разлика от
+      // last* по-горе, които се презаписват всеки tick) - DISCOVERY EPISODE
+      // TELEMETRY (Stage F) се нуждае от ОРИГИНАЛНАТА цена/score/посока/
+      // увереност, не от най-скорошните.
+      discoveryPrice: scoresBySymbol[symbol].price, discoveryScore: scoresBySymbol[symbol].score,
+      discoveryDirection: scoresBySymbol[symbol].direction, discoveryConfidence: scoresBySymbol[symbol].confidence,
     }));
 
   const openSlots = Math.max(0, config.maxSize - lockedMembers.length);
@@ -4233,7 +4239,158 @@ async function runDiscoveryFullAnalysis(env, watchlist = WATCHLIST) {
     const btcFlowContext = rawBtc ? JSON.parse(rawBtc) : null; // null -> checkMarketSignals пада на neutral default (виж по-горе)
     const poolWatchlist = dedupedPool.map((m) => ({ symbol: m.symbol }));
     await checkMarketSignals(env, poolWatchlist, btcFlowContext);
+    // Stage F - ХРОНОЛОГИЧНО СЛЕД FULL ANALYSIS по-горе (не отделен Promise.all
+    // запис), за да вижда най-пресните sigstate/telemetry от тик-а, който
+    // току-що приключи, вместо да рискува ~5-мин race condition.
+    await updateDiscoveryEpisodes(env, dedupedPool);
   } catch (e) { console.error(`DISCOVERY RADAR full analysis error: ${e.message}`); }
+}
+
+// ---- DISCOVERY RADAR (Stage F) - discovery episode telemetry --------------
+// Свързва целия lifecycle DISCOVERY -> SETUP -> ARMED -> ENTRY -> OUTCOME в
+// ЕДНО проследимо "episode" гнездо на symbol (собствен KV namespace
+// discoveryepisode:{symbol}:{enteredAt} - enteredAt е и episode ID, и
+// DISCOVERY timestamp-а, вече пазен от Stage D pool member-а). ЧИСТО
+// telemetry - нито един праг/gate/notification по-горе не чете тия записи
+// обратно. Всички данни идват от вече съществуващи, вече изчислени
+// източници - НУЛА нови мрежови заявки:
+//   - discovery: discoveryPrice/discoveryScore/discoveryDirection/
+//     discoveryConfidence от самия pool member (Stage D, вече immutable)
+//   - setup: sigstate.setup.{at,price} - price добавен в markSetupFired
+//     по-горе (чисто описателно поле, никой threshold/gate не го чете)
+//   - armed: sigstate.armed.{at,priceAtArm} - priceAtArm вече съществуваше
+//     отпреди (ENTRY TRIGGER контекст), само го четем тук
+//   - entry/outcome: съществуващият telemetry:{symbol}:{at} запис
+//     (buildTelemetryRecord/finalizePendingOutcomes по-горе) - четем го, не
+//     го променяме
+
+// Първи (най-ранен) SETUP след DISCOVERY - еднократно, никога не се презаписва.
+function applyDiscoveryEpisodeSetup(episode, sigstate) {
+  if (episode.setup || !sigstate || !sigstate.setup) return episode;
+  const at = sigstate.setup.at;
+  const setupPrice = sigstate.setup.price ?? null;
+  const leadTimeSetupMin = (at - episode.discovery.at) / 60000;
+  const pctMoveToSetup = (setupPrice != null && episode.discovery.price > 0)
+    ? ((setupPrice - episode.discovery.price) / episode.discovery.price) * 100 : null;
+  return {
+    ...episode, setup: { at, price: setupPrice },
+    derived: { ...episode.derived, leadTimeSetupMin, pctMoveToSetup },
+    status: 'setup',
+  };
+}
+
+// Първи (най-ранен) ARMED след DISCOVERY - еднократно, никога не се презаписва.
+function applyDiscoveryEpisodeArmed(episode, sigstate) {
+  if (episode.armed || !sigstate || !sigstate.armed) return episode;
+  const at = sigstate.armed.at;
+  const armedPrice = sigstate.armed.priceAtArm ?? null;
+  const leadTimeArmedMin = (at - episode.discovery.at) / 60000;
+  const pctMoveToArmed = (armedPrice != null && episode.discovery.price > 0)
+    ? ((armedPrice - episode.discovery.price) / episode.discovery.price) * 100 : null;
+  return {
+    ...episode, armed: { at, price: armedPrice },
+    derived: { ...episode.derived, leadTimeArmedMin, pctMoveToArmed },
+    status: 'armed',
+  };
+}
+
+// Първо ENTRY/MISSED/VETO телеметрично събитие след DISCOVERY - еднократно.
+// ATR-нормализираният price travel (atrMoveToEntry) се смята САМО тук, защото
+// atr5m е вече изчислен и записан в СЪЩЕСТВУВАЩИЯ telemetry запис - никакъв
+// нов fetch, точно за SETUP/ARMED нямаме готов ATR под ръка, затова там няма
+// ATR-нормализирана метрика (умишлено, виж заявката).
+function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord) {
+  if (episode.entry || !entryTelemetryRecord) return episode;
+  const { at, decision, triggerClose: entryPrice, entryScore, atr5m, chaseDistanceAtrRatio, outcome15m } = entryTelemetryRecord;
+  const leadTimeEntryMin = (at - episode.discovery.at) / 60000;
+  const pctMoveToEntry = (entryPrice != null && episode.discovery.price > 0)
+    ? ((entryPrice - episode.discovery.price) / episode.discovery.price) * 100 : null;
+  const atrMoveToEntry = (atr5m > 0 && entryPrice != null && episode.discovery.price != null)
+    ? Math.abs(entryPrice - episode.discovery.price) / atr5m : null;
+  return {
+    ...episode,
+    entry: {
+      at, price: entryPrice, decision, entryScore: entryScore ?? null,
+      atr5m: atr5m ?? null, chaseDistanceAtrRatio: chaseDistanceAtrRatio ?? null,
+      outcome15m: outcome15m ?? null,
+    },
+    derived: { ...episode.derived, leadTimeEntryMin, pctMoveToEntry, atrMoveToEntry },
+    // 'missed'/'veto' нямат смислен outcome за измерване (нищо не е отворено) -
+    // завършваме епизода веднага; 'confirmed' чака съществуващия +15м outcome механизъм.
+    status: decision === 'confirmed' ? 'entry_pending_outcome' : 'complete',
+  };
+}
+
+// Опреснява outcome15m от СЪЩИЯ вече записан entry telemetry запис, веднъж
+// щом съществуващият +15м outcome механизъм (finalizePendingOutcomes) го
+// попълни - чисто четене, никаква нова логика за самия outcome.
+function applyDiscoveryEpisodeOutcome(episode, freshOutcome15m) {
+  if (!episode.entry || episode.entry.decision !== 'confirmed' || episode.entry.outcome15m != null || freshOutcome15m == null) {
+    return episode;
+  }
+  return { ...episode, entry: { ...episode.entry, outcome15m: freshOutcome15m }, status: 'complete' };
+}
+
+// Построява НАЧАЛНИЯ episode запис от pool member-а (Stage D discoveryPrice/
+// discoveryScore/discoveryDirection/discoveryConfidence - immutable снимка
+// от момента на влизане в pool-а).
+function buildDiscoveryEpisode(poolMember) {
+  return {
+    symbol: poolMember.symbol,
+    enteredAt: poolMember.enteredAt,
+    discovery: {
+      at: poolMember.enteredAt, price: poolMember.discoveryPrice ?? null,
+      activityScore: poolMember.discoveryScore ?? null, direction: poolMember.discoveryDirection ?? null,
+      confidence: poolMember.discoveryConfidence ?? null,
+    },
+    setup: null, armed: null, entry: null, derived: {},
+    status: 'discovery',
+  };
+}
+
+// Намира ПЪРВИЯ (най-ранен) telemetry:{symbol}:* запис с at >= sinceAt - без
+// да тегли стойностите на всички кандидати, само листва ключовете (евтино),
+// сортира по вградения в самия ключ timestamp, после чете САМО избрания.
+async function findFirstEntryTelemetryRecord(env, symbol, sinceAt) {
+  const listResult = await env.ALERT_STATE.list({ prefix: `telemetry:${symbol}:` });
+  const candidates = (listResult.keys || [])
+    .map((k) => ({ name: k.name, at: parseInt(k.name.split(':')[2], 10) }))
+    .filter((c) => Number.isFinite(c.at) && c.at >= sinceAt)
+    .sort((a, b) => a.at - b.at);
+  if (!candidates.length) return null;
+  const raw = await env.ALERT_STATE.get(candidates[0].name);
+  return raw ? JSON.parse(raw) : null;
+}
+
+// Wiring: за всеки текущ (дедупликиран, виж runDiscoveryFullAnalysis) pool
+// член - зарежда/създава episode-а, напредва setup/armed от sigstate,
+// намира/опреснява entry+outcome от съществуващия telemetry:. Собствен
+// try/catch НА СИМВОЛ (един счупен episode не бива да спре останалите).
+async function updateDiscoveryEpisodes(env, pool) {
+  if (!env.ALERT_STATE || !pool || !pool.length) return;
+  for (const member of pool) {
+    try {
+      const episodeKey = `discoveryepisode:${member.symbol}:${member.enteredAt}`;
+      const rawEpisode = await env.ALERT_STATE.get(episodeKey);
+      let episode = rawEpisode ? JSON.parse(rawEpisode) : buildDiscoveryEpisode(member);
+      if (episode.status === 'complete') continue;
+
+      const sigstate = await loadSymbolState(env, member.symbol);
+      episode = applyDiscoveryEpisodeSetup(episode, sigstate);
+      episode = applyDiscoveryEpisodeArmed(episode, sigstate);
+
+      if (!episode.entry) {
+        const entryRecord = await findFirstEntryTelemetryRecord(env, member.symbol, episode.discovery.at);
+        episode = applyDiscoveryEpisodeEntry(episode, entryRecord);
+      } else if (episode.status === 'entry_pending_outcome') {
+        const rawTelemetry = await env.ALERT_STATE.get(`telemetry:${member.symbol}:${episode.entry.at}`);
+        const freshRecord = rawTelemetry ? JSON.parse(rawTelemetry) : null;
+        episode = applyDiscoveryEpisodeOutcome(episode, freshRecord ? freshRecord.outcome15m : null);
+      }
+
+      await env.ALERT_STATE.put(episodeKey, JSON.stringify(episode));
+    } catch (e) { console.error(`DISCOVERY RADAR episode update error for ${member.symbol}: ${e.message}`); }
+  }
 }
 
 export {
