@@ -4214,15 +4214,24 @@ async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now()) {
 // ъпдейт (двете вървят паралелно в Promise.all, не последователно) - дребно,
 // самокоригиращо се разминаване на следващия tick, приемливо на фона на
 // вече съществуващата ~5-мин "davност" на BTC контекста по-долу.
-async function runDiscoveryFullAnalysis(env) {
+async function runDiscoveryFullAnalysis(env, watchlist = WATCHLIST) {
   try {
     if (!env.ALERT_STATE) return;
     const rawPool = await env.ALERT_STATE.get('discoverypool');
     const pool = rawPool ? JSON.parse(rawPool) : [];
     if (!pool.length) return;
+    // Explicit dedup guard (defense-in-depth) - filterDiscoveryUniverse (Stage
+    // C) вече изключва CORE символите при влизане в pool-а, но тук пак
+    // филтрираме - за да не разчитаме СИГУРНОСТТА "един symbol никога не се
+    // анализира два пъти в един цикъл" единствено на коректността на друг,
+    // по-раншен stage. Дори ако CORE WATCHLIST/pool-ът се разминат по някаква
+    // бъдеща причина, тоя ред гарантира нулево дублиране тук и сега.
+    const coreSymbols = new Set(watchlist.map((w) => w.symbol));
+    const dedupedPool = pool.filter((m) => !coreSymbols.has(m.symbol));
+    if (!dedupedPool.length) return;
     const rawBtc = await env.ALERT_STATE.get('btcflowcontext');
     const btcFlowContext = rawBtc ? JSON.parse(rawBtc) : null; // null -> checkMarketSignals пада на neutral default (виж по-горе)
-    const poolWatchlist = pool.map((m) => ({ symbol: m.symbol }));
+    const poolWatchlist = dedupedPool.map((m) => ({ symbol: m.symbol }));
     await checkMarketSignals(env, poolWatchlist, btcFlowContext);
   } catch (e) { console.error(`DISCOVERY RADAR full analysis error: ${e.message}`); }
 }
