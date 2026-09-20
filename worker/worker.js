@@ -3775,6 +3775,29 @@ function calcLevelReaction(candle, levelLow, levelHigh) {
   return 'none';
 }
 
+// Чете последно записаното PRICE LEVEL състояние от KV. Поддържа и стария
+// формат (`reaction:openTime`, plain string) за backward-compat веднага след
+// deploy - връща само reaction частта, timestamp-ът не участва в dedup-а.
+function parsePriceLevelState(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.reaction === 'string') return parsed.reaction;
+  } catch (e) { /* стар формат - "reaction:openTime" plain string */ }
+  const legacyMatch = /^(reclaim|rejection)/.exec(raw);
+  return legacyMatch ? legacyMatch[1] : null;
+}
+
+// State-transition dedup (НЕ cooldown) - известие само при РЕАЛНА смяна на
+// състоянието спрямо последно записаното, независимо колко свещи е траяло:
+// NEUTRAL/REJECTION -> RECLAIM = SEND, RECLAIM -> RECLAIM = NO SEND,
+// RECLAIM -> REJECTION = SEND, REJECTION -> REJECTION = NO SEND,
+// REJECTION -> RECLAIM = SEND. Cooldown умишлено не се ползва - той само би
+// скрил проблема и след изтичането му непроменено състояние пак би пратило.
+function shouldNotifyPriceLevel(lastReaction, reaction) {
+  return lastReaction !== reaction;
+}
+
 // ---- Ръчни ценови нива следене (извиква се от scheduled()) -----------------
 // Worker-only (огледално на checkDcaLevels по-горе - собствен KV namespace
 // `pricelevel:`, НЕ споделя `sigstate:` с scanSymbolSignals, за да няма race
@@ -3790,9 +3813,9 @@ async function checkPriceLevels(env, watchlist = PRICE_LEVELS_WATCHLIST) {
       const reaction = calcLevelReaction(lastClosed, lvl.levelLow, lvl.levelHigh);
       if (reaction === 'none') continue;
       const kvKey = `pricelevel:${lvl.symbol}:${lvl.levelLow}`;
-      const composite = `${reaction}:${lastClosed.openTime}`;
-      const last = env.ALERT_STATE ? await env.ALERT_STATE.get(kvKey) : null;
-      if (last === composite) continue; // вече известено за тази точно свещ+реакция
+      const stored = env.ALERT_STATE ? await env.ALERT_STATE.get(kvKey) : null;
+      const lastReaction = parsePriceLevelState(stored);
+      if (!shouldNotifyPriceLevel(lastReaction, reaction)) continue; // същото състояние - вече известено
       const symbolNoUsdt = lvl.symbol.replace('USDT', '');
       const label = lvl.label || 'зона';
       const zoneStr = `${formatPrice(lvl.levelLow)}–${formatPrice(lvl.levelHigh)} USD`;
@@ -3800,7 +3823,9 @@ async function checkPriceLevels(env, watchlist = PRICE_LEVELS_WATCHLIST) {
         ? [`🟩 RECLAIM ${symbolNoUsdt}`, `15м свещ затвори НАД ${label} (${zoneStr})`, `Close: ${formatPrice(lastClosed.close)} USD`]
         : [`🟥 REJECTION ${symbolNoUsdt}`, `Цената тества ${label} (${zoneStr}), но 15м свещ затвори обратно под нея`, `Close: ${formatPrice(lastClosed.close)} USD`];
       await sendWhatsApp(env, lines.join('\n'));
-      if (env.ALERT_STATE) await env.ALERT_STATE.put(kvKey, composite);
+      // timestamp-ът (openTime на свещта) се пази само за бъдещ анализ - не
+      // участва в dedup решението (виж shouldNotifyPriceLevel по-горе).
+      if (env.ALERT_STATE) await env.ALERT_STATE.put(kvKey, JSON.stringify({ reaction, at: lastClosed.openTime }));
     } catch (e) { console.error(`Price level check error for ${lvl.symbol}: ${e.message}`); }
   }
 }
