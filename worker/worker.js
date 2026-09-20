@@ -4393,6 +4393,47 @@ async function updateDiscoveryEpisodes(env, pool) {
   }
 }
 
+// Агрегира вече заредени/филтрирани discoveryepisode: записи (чисто
+// in-memory, БЕЗ KV достъп тук - виж /discovery-episodes ендпойнта по-долу),
+// огледално на buildTelemetrySummary по-горе.
+function buildDiscoveryEpisodeSummary(episodes) {
+  const summary = {
+    total: episodes.length,
+    byStatus: { discovery: 0, setup: 0, armed: 0, entry_pending_outcome: 0, complete: 0 },
+    bySymbol: {},
+    avgLeadTimeSetupMin: null, avgLeadTimeArmedMin: null, avgLeadTimeEntryMin: null,
+    avgPctMoveToSetup: null, avgPctMoveToArmed: null, avgPctMoveToEntry: null,
+    avgAtrMoveToEntry: null,
+    outcome: { count: 0, avgOutcomePct: null, winRatePct: null },
+  };
+  const acc = { leadSetup: [], leadArmed: [], leadEntry: [], pctSetup: [], pctArmed: [], pctEntry: [], atrEntry: [], outcomes: [] };
+  for (const ep of episodes) {
+    if (summary.byStatus[ep.status] != null) summary.byStatus[ep.status]++;
+    summary.bySymbol[ep.symbol] = (summary.bySymbol[ep.symbol] || 0) + 1;
+    const d = ep.derived || {};
+    if (d.leadTimeSetupMin != null) acc.leadSetup.push(d.leadTimeSetupMin);
+    if (d.leadTimeArmedMin != null) acc.leadArmed.push(d.leadTimeArmedMin);
+    if (d.leadTimeEntryMin != null) acc.leadEntry.push(d.leadTimeEntryMin);
+    if (d.pctMoveToSetup != null) acc.pctSetup.push(d.pctMoveToSetup);
+    if (d.pctMoveToArmed != null) acc.pctArmed.push(d.pctMoveToArmed);
+    if (d.pctMoveToEntry != null) acc.pctEntry.push(d.pctMoveToEntry);
+    if (d.atrMoveToEntry != null) acc.atrEntry.push(d.atrMoveToEntry);
+    if (ep.entry && ep.entry.decision === 'confirmed' && ep.entry.outcome15m != null) acc.outcomes.push(ep.entry.outcome15m);
+  }
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  summary.avgLeadTimeSetupMin = avg(acc.leadSetup);
+  summary.avgLeadTimeArmedMin = avg(acc.leadArmed);
+  summary.avgLeadTimeEntryMin = avg(acc.leadEntry);
+  summary.avgPctMoveToSetup = avg(acc.pctSetup);
+  summary.avgPctMoveToArmed = avg(acc.pctArmed);
+  summary.avgPctMoveToEntry = avg(acc.pctEntry);
+  summary.avgAtrMoveToEntry = avg(acc.atrEntry);
+  summary.outcome.count = acc.outcomes.length;
+  summary.outcome.avgOutcomePct = avg(acc.outcomes);
+  summary.outcome.winRatePct = acc.outcomes.length ? (acc.outcomes.filter((o) => o > 0).length / acc.outcomes.length) * 100 : null;
+  return summary;
+}
+
 export {
   calcDCALevels, checkDcaLevels, checkPriceLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals, checkMacroSqueeze,
   updateDiscoverySnapshotState, runDiscoveryFullAnalysis,
@@ -4571,6 +4612,63 @@ export default {
         count: records.length, truncated,
         records: records.slice(0, limit),
         summary: buildTelemetrySummary(records),
+      }), { headers: { "Content-Type": "application/json" } });
+    }
+
+    // DISCOVERY RADAR - discoveryepisode: read-only debug ендпойнт (Stage F
+    // companion, виж buildDiscoveryEpisodeSummary по-горе). Огледален на
+    // /telemetry по-горе - същия TELEMETRY_TOKEN, същия fail-closed auth,
+    // същия MAX_KEYS_SCANNED таван. Чисто READ - никакво управление на pool/
+    // episode състоянието тук.
+    if (path === "/discovery-episodes" && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ALERT_STATE) {
+        return new Response(JSON.stringify({ error: "ALERT_STATE not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const symbolFilter = url.searchParams.get("symbol");
+      const statusFilter = url.searchParams.get("status"); // discovery|setup|armed|entry_pending_outcome|complete
+      const since = url.searchParams.get("since") ? Number(url.searchParams.get("since")) : null;
+      const until = url.searchParams.get("until") ? Number(url.searchParams.get("until")) : null;
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 500);
+      const MAX_KEYS_SCANNED = 2000;
+
+      const prefix = symbolFilter ? `discoveryepisode:${symbolFilter}:` : "discoveryepisode:";
+      let allKeys = [];
+      let cursor;
+      do {
+        const listResult = await env.ALERT_STATE.list({ prefix, cursor, limit: 1000 });
+        allKeys.push(...listResult.keys);
+        cursor = listResult.list_complete ? undefined : listResult.cursor;
+      } while (cursor && allKeys.length < MAX_KEYS_SCANNED);
+      const truncated = allKeys.length > MAX_KEYS_SCANNED;
+      allKeys = allKeys.slice(0, MAX_KEYS_SCANNED);
+
+      const records = [];
+      for (const k of allKeys) {
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        if (statusFilter && rec.status !== statusFilter) continue;
+        const discoveredAt = rec.discovery ? rec.discovery.at : null;
+        if (since != null && (discoveredAt == null || discoveredAt < since)) continue;
+        if (until != null && (discoveredAt == null || discoveredAt > until)) continue;
+        records.push(rec);
+      }
+      records.sort((a, b) => (b.discovery ? b.discovery.at : 0) - (a.discovery ? a.discovery.at : 0)); // най-новите първи
+
+      return new Response(JSON.stringify({
+        count: records.length, truncated,
+        records: records.slice(0, limit),
+        summary: buildDiscoveryEpisodeSummary(records),
       }), { headers: { "Content-Type": "application/json" } });
     }
 

@@ -146,6 +146,23 @@ GET /telemetry?token=...&decision=missed&direction=short
 
 Без валиден `token` заявката връща 401 — пази URL-а по същия начин като останалите тайни ключове.
 
+## DISCOVERY RADAR - discovery episode telemetry (read-only debug ендпойнт)
+
+`worker.js` приема `GET /discovery-episodes?token=TELEMETRY_TOKEN` (същия token като `/telemetry` по-горе) — чисто READ, никакво управление на DISCOVERY_POOL/ENTRY ENGINE логиката. Извлича `discoveryepisode:` KV записите (виж `buildDiscoveryEpisode`/`applyDiscoveryEpisode*` в кода) - целия lifecycle DISCOVERY → SETUP → ARMED → ENTRY → OUTCOME за всяка монета, минала през DISCOVERY_POOL.
+
+Опционални query параметри (могат да се комбинират):
+- `symbol` — напр. `SAGAUSDT`
+- `status` — `discovery` / `setup` / `armed` / `entry_pending_outcome` / `complete`
+- `since` / `until` — Unix ms timestamp граница (спрямо DISCOVERY timestamp-а)
+- `limit` — макс. брой върнати записи (default 100, таван 500)
+
+Отговорът съдържа `records` (масив episode-и, най-новите discovery първи - всеки с `discovery`/`setup`/`armed`/`entry` под-обекти + `derived` метрики: lead time в минути и % price move до всеки етап, плюс ATR-нормализирано движение до ENTRY) и `summary` (общо по статус/symbol, средни lead time-ове, средни % move-ове, outcome статистика).
+
+Пример:
+```
+GET /discovery-episodes?token=...&status=complete&limit=20
+```
+
 ## Локални тестове
 
 Цялата логика (`calcDCALevels`, `checkDcaLevels`, `sendWhatsApp`, `scanSymbolSignals`, `checkMarketSignals`) е тествана локално с Node (mock `fetch` + mock KV), плюс diff-проверка байт-по-байт срещу оригиналните функции в `signal-logic.js` - виж историята на промените, ако искаш да пуснеш проверката пак.
