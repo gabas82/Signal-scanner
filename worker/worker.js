@@ -40,6 +40,18 @@ const WATCHLIST = [
   { symbol: 'AAVEUSDT' },
   { symbol: 'RENDERUSDT' },
   { symbol: 'ALGOUSDT' },
+  { symbol: 'SEIUSDT' },
+  { symbol: 'ARBUSDT' },
+  { symbol: 'JUPUSDT' },
+  { symbol: 'ENAUSDT' },
+  { symbol: 'PENDLEUSDT' },
+  { symbol: 'WIFUSDT' },
+  { symbol: 'PEPEUSDT' },
+  { symbol: 'DOGEUSDT' },
+  { symbol: 'AVAXUSDT' },
+  { symbol: 'FETUSDT' },
+  { symbol: 'UBUSDT' },
+  { symbol: 'KASUSDT' },
 ];
 
 const DCA_ALERT_COOLDOWN_MS = 24 * 3600000; // не повтаря едно и също DCA ниво по-често от 24ч
