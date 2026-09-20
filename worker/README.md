@@ -26,6 +26,7 @@ Dashboard → orange-grass-d809 → **Settings → Variables and Secrets** → A
 | `RELAY_URL` | адресът на DigitalOcean relay-я, напр. `https://signal-scanner-relay-l7rin.ondigitalocean.app` (виж `relay/README.md`) |
 | `RELAY_TOKEN` | същият таен код, зададен като `RELAY_TOKEN` в DigitalOcean |
 | `TV_ALERT_TOKEN` | произволен таен код по твой избор (виж "ALT CYCLE RADAR webhook" по-долу) |
+| `TELEMETRY_TOKEN` | произволен таен код по твой избор (виж "ENTRY ENGINE TELEMETRY" по-долу) |
 
 ### Защо има relay
 
@@ -114,6 +115,25 @@ Dashboard → orange-grass-d809 → **Settings → Triggers → Cron Triggers �
 ## ALT CYCLE RADAR webhook (TradingView → WhatsApp)
 
 `worker.js` приема `POST /tv-alert?token=TV_ALERT_TOKEN` — приема JSON тяло `{phase, score, btcD, altBtc, breadth30, breadth60, breadth90, time}` и праща WhatsApp известие през `sendWhatsApp` (същата функция/секрети като пазарните сигнали). Предназначен е за webhook alert на Pine Script индикатора "ALT CYCLE RADAR" (`worker/alt-cycle-radar.pine`).
+
+## ENTRY ENGINE TELEMETRY (read-only debug ендпойнт)
+
+`worker.js` приема `GET /telemetry?token=TELEMETRY_TOKEN` — чисто READ, никакво управление/промяна на ENTRY ENGINE праговете. Извлича вече натрупаните `telemetry:` KV записи (виж `buildTelemetryRecord` в кода) за всяко ENTRY CONFIRMED/MISSED/FLOW VETO събитие.
+
+Опционални query параметри (могат да се комбинират):
+- `symbol` — напр. `BTCUSDT`
+- `decision` — `confirmed` / `missed` / `veto`
+- `direction` — `long` / `short`
+- `since` / `until` — Unix ms timestamp граница
+- `limit` — макс. брой върнати записи (default 100, таван 500)
+
+Отговорът съдържа `records` (масив, най-новите първи) и `summary` (общ брой по decision/symbol/direction, среден ENTRY SCORE, среден chaseDistance/ATR, outcome статистика за наличните +15м хоризонти).
+
+Примери:
+```
+GET /telemetry?token=...&symbol=BTCUSDT&limit=20
+GET /telemetry?token=...&decision=missed&direction=short
+```
 
 Настройка:
 1. Добави `TV_ALERT_TOKEN` secret (стъпка 2 по-горе) — произволен таен низ по твой избор.
