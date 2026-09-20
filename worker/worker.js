@@ -1607,6 +1607,84 @@ function markAuctionFired(state, key, direction) {
   state.auction = { key, direction, at: Date.now() };
 }
 
+// ═══ AUTO VAH/VAL STRUCTURE DETECTOR ═══════════════════════════════════════════
+// Автоматично следи VAH/VAL (от Volume Profile Engine по-горе, вече изчислени
+// за ВСЯКА монета) за ВСИЧКИТЕ 23 WATCHLIST монети - БЕЗ ръчно въвеждане (за
+// разлика от PRICE_LEVELS_WATCHLIST по-долу, който остава отделен модул за
+// специфични ръчни нива). Чисто structure/price-based - OI/CVD НЕ са hard
+// factor тук (за разлика от TRAP/AUCTION/MIGRATION) - самият reclaim/rejection
+// на VAH/VAL Е структурното потвърждение. Изцяло независим от TARGET - двата
+// НЕ се гейтват едно друго; комбинацията им (напр. TARGET SHORT + VAH
+// REJECTION) е чисто информационна конвергенция, наблюдавана в известията.
+//
+// 4 събития: VAH RECLAIM/REJECTION, VAL RECLAIM/REJECTION - и двете нива се
+// "атакуват" САМО откъм страната, от която цената идва (виж бележките при
+// calcVahValStructureEvent) - WICK ≠ SIGNAL, изисква се CONFIRMED close отвъд
+// нивото (VAHVAL_CONFIRM_BUFFER_PCT буфер, не просто минимално прекосяване).
+//
+// Anti-spam: "armed/re-arm" state machine, не candleTime dedup (chop около
+// нивото би дал различен candleTime на всяка свещ и пак би спамил) - веднъж
+// произведено събитие, detector-ът се "обезоръжава" (armed=false) и чака ЕДНО
+// от: (а) цената да се отдалечи достатъчно (VAHVAL_REARM_DISTANCE_PCT), (б)
+// cooldown да изтече (VAHVAL_REARM_COOLDOWN_MIN), или (в) самото ниво да се
+// измести структурно (>=1%, Volume Profile-ът се обновява дневно) - преди да
+// позволи ново събитие на СЪЩОТО ниво.
+//
+// Timeframe: ползва последната затворена 15м свещ (c15Closed, вече изтеглена
+// за структурните тагове) - нарочно изолирано в call site-а по-долу, лесно
+// сменяемо с c1hClosed/c4hClosed, ако бъде решено по-късно след наблюдение.
+const VAHVAL_CONFIRM_BUFFER_PCT = 0.15; // % отвъд нивото, нужен за "потвърден" close
+const VAHVAL_REARM_DISTANCE_PCT = 1.5; // % отдалечаване от нивото -> re-arm
+const VAHVAL_REARM_COOLDOWN_MIN = 60; // алтернативно: толкова минути от последното събитие -> re-arm
+
+// Обновява/връща резултат за ЕДНО ниво (VAH или VAL) - вика се 2 пъти
+// (веднъж за VAH, веднъж за VAL) от scanSymbolSignals по-долу. `entry` е
+// state.vahStruct/state.valStruct - мутира се directly (огледално на
+// reloadWindow другаде в този файл).
+function calcVahValStructureEvent(entry, candle, level) {
+  if (!candle || level == null || !(level > 0)) return { fired: false };
+  const bufferAbs = level * VAHVAL_CONFIRM_BUFFER_PCT / 100;
+  const confirmedAbove = candle.close > level + bufferAbs;
+  const confirmedBelow = candle.close < level - bufferAbs;
+  const distancePct = Math.abs(candle.close - level) / level * 100;
+
+  if (entry.side == null) {
+    // Първо наблюдение за тази монета+ниво - само baseline, без събитие.
+    entry.side = confirmedAbove ? 'above' : 'below';
+    entry.lastLevel = level;
+    return { fired: false };
+  }
+
+  if (!entry.armed) {
+    const levelShifted = entry.lastLevel != null && Math.abs(level - entry.lastLevel) / entry.lastLevel * 100 >= 1;
+    const movedAway = distancePct >= VAHVAL_REARM_DISTANCE_PCT;
+    const cooledDown = entry.lastEventAt != null && (Date.now() - entry.lastEventAt) >= VAHVAL_REARM_COOLDOWN_MIN * 60000;
+    if (levelShifted || movedAway || cooledDown) entry.armed = true;
+  }
+
+  let fired = false, eventType = null;
+  if (entry.side === 'below') {
+    if (confirmedAbove) {
+      if (entry.armed) { fired = true; eventType = 'reclaim'; entry.armed = false; entry.lastEventAt = Date.now(); }
+      entry.side = 'above';
+    } else if (candle.high >= level && entry.armed) {
+      fired = true; eventType = 'rejection'; entry.armed = false; entry.lastEventAt = Date.now();
+    }
+  } else if (confirmedBelow) {
+    entry.side = 'below'; // тих "give-back" - не е едно от 4-те събития, само reset на side
+  }
+  entry.lastLevel = level;
+
+  return fired ? { fired: true, eventType, level, distancePct } : { fired: false };
+}
+
+const VAHVAL_LABELS = {
+  'vah:reclaim': '📈 VAH RECLAIM',
+  'vah:rejection': '📉 VAH REJECTION',
+  'val:reclaim': '📈 VAL RECLAIM',
+  'val:rejection': '📉 VAL REJECTION',
+};
+
 // ═══ IDEA 04 - "VALUE MIGRATION" ═══════════════════════════════════════════════
 // Сравнява POC на ВЧЕРАШНИЯ (затворен) дневен профил с POC на ДНЕШНИЯ (все още
 // незавършен) дневен профил, построени от 1ч свещи - миграция на POC нагоре/
@@ -2769,6 +2847,16 @@ async function scanSymbolSignals(env, symbol) {
   const auctionFired = auctionCanFire(state, auctionKey, auctionDirection);
   if (auctionFired) markAuctionFired(state, auctionKey, auctionDirection);
 
+  // AUTO VAH/VAL STRUCTURE DETECTOR (виж calcVahValStructureEvent по-горе) -
+  // изцяло независим от TARGET/AUCTION - реизползва вече изтеглената c15Closed
+  // (структурен таймфрейм, лесно сменяем) и вече изчисления vpValueArea -
+  // БЕЗ никакви допълнителни мрежови заявки.
+  if (!state.vahStruct) state.vahStruct = {};
+  if (!state.valStruct) state.valStruct = {};
+  const structCandle = c15Closed.length ? c15Closed[c15Closed.length - 1] : null;
+  const vahEvent = calcVahValStructureEvent(state.vahStruct, structCandle, vpValueArea ? vpValueArea.vah : null);
+  const valEvent = calcVahValStructureEvent(state.valStruct, structCandle, vpValueArea ? vpValueArea.val : null);
+
   // IDEA 04 - "VALUE MIGRATION" (виж calcValueMigrationScore по-горе) -
   // изцяло отделно известие, огледално на TRAP/AUCTION. Строи се от c1h (ЖИВИ
   // свещи, включително недовършената текуща - "днес" нарочно е незавършеният
@@ -2830,6 +2918,7 @@ async function scanSymbolSignals(env, symbol) {
     migrationPct: migrationScore.migrationPct, migrationTodayPoc: migrationScore.todayPoc, migrationYesterdayPoc: migrationScore.yesterdayPoc,
     liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore,
     liqGravityDistancePct: liqGravityScore.distancePct, liqGravityClusterPrice: liqGravityScore.clusterPrice, liqGravityClusterUsd: liqGravityScore.clusterUsd,
+    vahEvent, valEvent,
   };
 }
 
@@ -2846,7 +2935,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -2975,6 +3064,27 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
           `⚠️ Хипотеза за тестване (историческа ликвидационна зона) - НЕ Е entry сигнал`,
         ];
         await sendWhatsApp(env, liqGravityLines.join('\n'));
+      }
+      // AUTO VAH/VAL STRUCTURE DETECTOR (виж calcVahValStructureEvent по-горе) -
+      // изцяло отделни известия, независими от TARGET (не се гейтват едно
+      // друго). Ако TARGET има активен tier за същата монета, показваме го
+      // информативно - конвергенцията (напр. TARGET SHORT + VAH REJECTION) е
+      // точно комбинацията, която си заслужава наблюдение (виж дискусията).
+      const symbolNoUsdt = pos.symbol.replace('USDT', '');
+      const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+      for (const [ev, levelName] of [[vahEvent, 'VAH'], [valEvent, 'VAL']]) {
+        if (!ev.fired) continue;
+        const labelKey = `${levelName.toLowerCase()}:${ev.eventType}`;
+        const lines = [
+          `${VAHVAL_LABELS[labelKey]} ${symbolNoUsdt}`,
+          `${levelName} ниво: ${formatPrice(ev.level)} USD · Разстояние при close: ${ev.distancePct.toFixed(2)}%`,
+          `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
+        ];
+        if (targetTier !== 'none') {
+          lines.push(`🎯 TARGET: ${targetDirection === 'long' ? 'LONG' : 'SHORT'} ${targetTier.toUpperCase()} (за същата монета)`);
+        }
+        lines.push(`⚠️ Структурно събитие - НЕ Е entry сигнал сам по себе си`);
+        await sendWhatsApp(env, lines.join('\n'));
       }
       // PHASE CYCLE ENGINE - изцяло отделно известие от горното, независимо
       // от MIN_NOTIFY_SCORE/newFired на класическия LONG/SHORT поток. Праща се
