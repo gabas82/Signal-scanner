@@ -4066,7 +4066,131 @@ async function updateDiscoverySnapshotState(env, watchlist = WATCHLIST) {
     await env.ALERT_STATE.put('discoverysnapshot', JSON.stringify({ at: now, bySymbol: currBySymbol }));
     await env.ALERT_STATE.put('discoverybaseline', JSON.stringify(newBaselines));
     await env.ALERT_STATE.put('discoveryscores', JSON.stringify(newScores));
+
+    // Pool-ъпдейтът тръгва СЛЕД като score-овете вече са трайно записани по-горе
+    // (дори ако тук долу гръмне нещо, score-овете за тоя tick не се губят) - и
+    // само когато реално е имало нов radar tick (не на всеки 5-мин CORE tick),
+    // за да не брои weakTicks/TTL по-често от истинския ~15-мин radar interval.
+    await updateDiscoveryPool(env, newScores, now);
   } catch (e) { console.error(`DISCOVERY RADAR snapshot update error: ${e.message}`); }
+}
+
+// ---- DISCOVERY RADAR (Stage D) - pool ranking/eviction ---------------------
+// Управлява DISCOVERY_POOL (макс. 6 монети): ranking по Activity Score (не
+// "първите намерени"), TTL + weak-score eviction, и твърда защита - монета с
+// активно ENTRY ENGINE състояние (SETUP или ARMED, виж sigstate:{symbol}) НЕ
+// може да отпадне нито от TTL, нито от слаб score, нито от ranking
+// displacement. FULL ANALYSIS (Stage E) все още не съществува, затова пуловите
+// кандидати днес никога реално нямат setup/armed - защитата вече е коректна и
+// тествана със синтетично sigstate, но е "тиха" в продукция до Stage E.
+const DISCOVERY_POOL_MAX_SIZE = 6;
+const DISCOVERY_POOL_TTL_MS = 48 * 3600000; // 48ч - начална точка (виж чата), не финална
+const DISCOVERY_WEAK_SCORE_THRESHOLD = 1; // Activity Score под това ниво се брои "слаб" tick
+const DISCOVERY_WEAK_TICK_LIMIT = 4; // толкова ПОРЕДНИ слаби тика (~1ч при 15-мин radar interval) -> eviction
+
+// Твърдата защита - "заключена" монета (активен SETUP или ARMED) никога не
+// отпада, независимо от TTL/score/ranking. sigstate е точно това, което
+// loadSymbolState(env, symbol) връща (виж по-горе) - state.setup/state.armed
+// са обекти при активно състояние, null иначе.
+function isDiscoveryPoolMemberLocked(sigstate) {
+  return !!(sigstate && (sigstate.setup || sigstate.armed));
+}
+
+// Чиста orchestrator функция - взима текущия pool + тазтиковите score-ове +
+// кои symbol-и в pool-а са заключени, връща новия pool + списък изгонени (с
+// причина). Три отделни, независими начина за напускане на pool-а:
+//   - 'ttl_expired'  - изтекъл TTL (само НЕзаключени)
+//   - 'weak_score'   - DISCOVERY_WEAK_TICK_LIMIT поредни слаби тика (само НЕзаключени)
+//   - 'displaced'    - нов/друг кандидат с по-висок Activity Score е заел
+//                      мястото му при ranking-а (само НЕзаключени, и само за
+//                      кандидати, които РЕАЛНО вече са били в pool-а - нов
+//                      кандидат, който просто не е бил избран тоя tick, не се
+//                      брои за "изгонен", защото никога не е влизал)
+// Заключените членове ВИНАГИ пазят слота си - остатъчният капацитет
+// (maxSize - брой заключени) се конкурира само измежду НЕзаключените
+// оцелели + новите кандидати, ранкирани по Activity Score низходящо.
+function computeDiscoveryPoolUpdate({ currentPool, scoresBySymbol, lockedSymbols, now, config }) {
+  const isLocked = (symbol) => !!(lockedSymbols && lockedSymbols.has(symbol));
+
+  const ttlSurvivors = [];
+  const ttlOrWeakExited = [];
+  for (const member of currentPool) {
+    const scoreEntry = scoresBySymbol[member.symbol];
+    if (isLocked(member.symbol)) {
+      ttlSurvivors.push({
+        ...member, locked: true,
+        lastScore: scoreEntry ? scoreEntry.score : member.lastScore,
+        lastDirection: scoreEntry ? scoreEntry.direction : member.lastDirection,
+        lastConfidence: scoreEntry ? scoreEntry.confidence : member.lastConfidence,
+      });
+      continue;
+    }
+    const isWeakTick = !scoreEntry || scoreEntry.score < config.weakScoreThreshold;
+    const refreshed = {
+      ...member, locked: false,
+      weakTicks: isWeakTick ? (member.weakTicks || 0) + 1 : 0,
+      lastScore: scoreEntry ? scoreEntry.score : member.lastScore,
+      lastDirection: scoreEntry ? scoreEntry.direction : member.lastDirection,
+      lastConfidence: scoreEntry ? scoreEntry.confidence : member.lastConfidence,
+    };
+    if (now - member.enteredAt >= config.ttlMs) { ttlOrWeakExited.push({ ...refreshed, exitReason: 'ttl_expired' }); continue; }
+    if (refreshed.weakTicks >= config.weakTickLimit) { ttlOrWeakExited.push({ ...refreshed, exitReason: 'weak_score' }); continue; }
+    ttlSurvivors.push(refreshed);
+  }
+
+  const lockedMembers = ttlSurvivors.filter((m) => m.locked);
+  const unlockedSurvivors = ttlSurvivors.filter((m) => !m.locked);
+  const survivorSymbols = new Set(ttlSurvivors.map((m) => m.symbol));
+  // Символ, изгонен ТОЧНО тоя tick (TTL/weak-score), НЕ бива веднага да се
+  // третира като "нов кандидат" само защото пак присъства в scoresBySymbol -
+  // иначе TTL/weak-score изгонването реално никога не се случва, докато
+  // score-ът му е достатъчно добър за ranking-а.
+  const justExitedSymbols = new Set(ttlOrWeakExited.map((m) => m.symbol));
+  const newCandidates = Object.keys(scoresBySymbol)
+    .filter((symbol) => !survivorSymbols.has(symbol) && !isLocked(symbol) && !justExitedSymbols.has(symbol))
+    .map((symbol) => ({
+      symbol, enteredAt: now, weakTicks: 0, locked: false,
+      lastScore: scoresBySymbol[symbol].score, lastDirection: scoresBySymbol[symbol].direction,
+      lastConfidence: scoresBySymbol[symbol].confidence,
+    }));
+
+  const openSlots = Math.max(0, config.maxSize - lockedMembers.length);
+  const ranked = [...unlockedSurvivors, ...newCandidates]
+    .sort((a, b) => (b.lastScore ?? -Infinity) - (a.lastScore ?? -Infinity));
+  const kept = ranked.slice(0, openSlots);
+  const displaced = ranked.slice(openSlots)
+    .filter((m) => unlockedSurvivors.includes(m))
+    .map((m) => ({ ...m, exitReason: 'displaced' }));
+
+  return { newPool: [...lockedMembers, ...kept], exited: [...ttlOrWeakExited, ...displaced] };
+}
+
+// Wiring: чете/пише discoverypool в KV, чете sigstate само за текущите (макс.
+// 6) pool членове, за да прецени locked статуса им - собствен try/catch, за
+// да не завлече вече записаните score-ове по-горе, ако тук нещо гръмне.
+async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now()) {
+  if (!env.ALERT_STATE) return;
+  try {
+    const rawPool = await env.ALERT_STATE.get('discoverypool');
+    const currentPool = rawPool ? JSON.parse(rawPool) : [];
+
+    const lockedSymbols = new Set();
+    for (const member of currentPool) {
+      const sigstate = await loadSymbolState(env, member.symbol);
+      if (isDiscoveryPoolMemberLocked(sigstate)) lockedSymbols.add(member.symbol);
+    }
+
+    const { newPool, exited } = computeDiscoveryPoolUpdate({
+      currentPool, scoresBySymbol, lockedSymbols, now,
+      config: {
+        maxSize: DISCOVERY_POOL_MAX_SIZE, ttlMs: DISCOVERY_POOL_TTL_MS,
+        weakScoreThreshold: DISCOVERY_WEAK_SCORE_THRESHOLD, weakTickLimit: DISCOVERY_WEAK_TICK_LIMIT,
+      },
+    });
+
+    await env.ALERT_STATE.put('discoverypool', JSON.stringify(newPool));
+    if (exited.length) console.log(`DISCOVERY RADAR pool exits: ${exited.map((e) => `${e.symbol}(${e.exitReason})`).join(', ')}`);
+  } catch (e) { console.error(`DISCOVERY RADAR pool update error: ${e.message}`); }
 }
 
 export {
