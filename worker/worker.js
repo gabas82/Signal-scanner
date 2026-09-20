@@ -1885,19 +1885,63 @@ function calcFlowBoost({ direction, flowWarmingDirection, flowWarmingTier, trapD
     (trapTier !== 'none' && trapDirection === direction);
 }
 
-// Обединява всичко - връща { status: 'none'|'missed'|'entry', ... }. ENTRY
-// SCORE 2 (STRUCTURE+TRIGGER база, гарантирани щом статусът е 'entry') + до 3
-// boost точки (15м confirmation, FLOW, HTF context) - същата рамка като
-// SETUP score-а, за консистентност между етапите.
+// Обединява всичко - връща { status: 'none'|'veto'|'missed'|'entry', ... }.
+// 'veto' е ДИАГНОСТИЧНО отделен от 'none' (виж TELEMETRY по-долу) - самото
+// поведение е идентично на преди (не пали ENTRY, не консумира ARMED), само
+// етикетът е по-конкретен за наблюдение. ENTRY SCORE 2 (STRUCTURE+TRIGGER
+// база, гарантирани щом статусът е 'entry') + до 3 boost точки (15м
+// confirmation, FLOW, HTF context) - същата рамка като SETUP score-а.
 function calcEntryTrigger({ direction, candle5m, atr5m, candle15m, atr15m, structRef, flowVeto, flowBoost, htfAligned }) {
   if (!isTriggerCandle(candle5m, direction, atr5m)) return { status: 'none' };
-  if (flowVeto) return { status: 'none' };
+  if (flowVeto) return { status: 'veto', triggerClose: candle5m.close, structRef };
   if (isTooExtended(candle5m.close, structRef, atr5m)) {
     return { status: 'missed', triggerClose: candle5m.close, structRef };
   }
   const confirmation15m = !contradicts15m(candle15m, direction, atr15m);
   const score = 2 + (confirmation15m ? 1 : 0) + (flowBoost ? 1 : 0) + (htfAligned ? 1 : 0);
   return { status: 'entry', score, confirmation15m, flowBoost, htfAligned, triggerClose: candle5m.close, structRef };
+}
+
+// ═══ ENTRY ENGINE - TELEMETRY (диагностика, НЕ променя ENTRY логиката) ═════════
+// Записва структурирани данни за всяко ENTRY CONFIRMED/MISSED/VETO събитие,
+// плюс outcome след фиксиран прозорец (+15м) - изцяло observability слой, не
+// участва в score/gate решенията по-горе. Собствен KV namespace (telemetry:),
+// не се чете обратно от ENTRY логиката.
+const TELEMETRY_OUTCOME_WINDOW_MIN = 15;
+
+function calcFlowState(flowVeto, flowBoost) {
+  if (flowVeto) return 'opposing';
+  if (flowBoost) return 'supportive';
+  return 'neutral';
+}
+
+function buildTelemetryRecord({
+  symbol, direction, decision, setupScore, setupBreakdown, armedAt, structRef,
+  triggerClose, atr5m, triggerRange, confirmation15m, flowState,
+  trapTier, trapDirection, flowWarmingTier, flowWarmingDirection, entryScore,
+}) {
+  const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
+  return {
+    symbol, direction, decision, at: Date.now(),
+    setupScore, setupBreakdown, armedAt,
+    structRef, triggerClose, atr5m,
+    triggerRangeAtrRatio: (atr5m > 0 && triggerRange != null) ? triggerRange / atr5m : null,
+    chaseDistance,
+    chaseDistanceAtrRatio: (atr5m > 0 && chaseDistance != null) ? chaseDistance / atr5m : null,
+    confirmation15m: confirmation15m ?? null, flowState,
+    trapTier: trapTier ?? 'none', trapDirection: trapDirection ?? null,
+    flowWarmingTier: flowWarmingTier ?? 'none', flowWarmingDirection: flowWarmingDirection ?? null,
+    entryScore: entryScore ?? null,
+    outcome15m: null, // попълва се по-късно от finalizePendingOutcomes/wiring-а в scanSymbolSignals
+  };
+}
+
+// Outcome спрямо ПОСОКАТА: положителен % = цената се е движила В очакваната
+// посока (SHORT -> надолу е "добър" outcome), огледално за LONG.
+function calcOutcomePct(direction, entryPrice, laterPrice) {
+  if (entryPrice == null || laterPrice == null || !(entryPrice > 0)) return null;
+  const rawPct = (laterPrice - entryPrice) / entryPrice * 100;
+  return direction === 'short' ? -rawPct : rawPct;
 }
 
 // ═══ IDEA 04 - "VALUE MIGRATION" ═══════════════════════════════════════════════
@@ -3164,17 +3208,66 @@ async function scanSymbolSignals(env, symbol) {
     const flowVeto = calcFlowVeto({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
     const flowBoost = calcFlowBoost({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
     const htfAligned = entryDirection === 'long' ? (trend4h.bull || emaFilter.bull) : (trend4h.bear || emaFilter.bear);
+    const lastClosed5mCandle = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
     entryResult = calcEntryTrigger({
       direction: entryDirection,
-      candle5m: c5Closed.length ? c5Closed[c5Closed.length - 1] : null, atr5m,
+      candle5m: lastClosed5mCandle, atr5m,
       candle15m: c15Closed.length ? c15Closed[c15Closed.length - 1] : null, atr15m,
       structRef, flowVeto, flowBoost, htfAligned,
     });
+    // TELEMETRY - записва се за entry/missed/veto (виж buildTelemetryRecord
+    // по-горе), НЕЗАВИСИМО от гейт логиката по-долу - чисто observability.
+    if (entryResult.status === 'entry' || entryResult.status === 'missed' || entryResult.status === 'veto') {
+      const decision = entryResult.status === 'entry' ? 'confirmed' : entryResult.status;
+      const record = buildTelemetryRecord({
+        symbol, direction: entryDirection, decision,
+        setupScore: setupState.score, setupBreakdown: setupState.breakdown,
+        armedAt: state.armed.at,
+        structRef: entryResult.structRef ?? structRef,
+        triggerClose: entryResult.triggerClose, atr5m,
+        triggerRange: lastClosed5mCandle ? (lastClosed5mCandle.high - lastClosed5mCandle.low) : null,
+        confirmation15m: entryResult.confirmation15m,
+        flowState: calcFlowState(flowVeto, flowBoost),
+        trapTier, trapDirection, flowWarmingTier, flowWarmingDirection,
+        entryScore: entryResult.score,
+      });
+      if (env.ALERT_STATE) {
+        const telemetryKey = `telemetry:${symbol}:${record.at}`;
+        await env.ALERT_STATE.put(telemetryKey, JSON.stringify(record));
+        if (decision === 'confirmed' || decision === 'missed') {
+          if (!state.pendingOutcomes) state.pendingOutcomes = [];
+          state.pendingOutcomes.push({
+            key: telemetryKey, dueAt: record.at + TELEMETRY_OUTCOME_WINDOW_MIN * 60000,
+            entryPrice: record.triggerClose, direction: entryDirection,
+          });
+        }
+      }
+    }
     if (entryResult.status === 'entry' || entryResult.status === 'missed') {
       entryResult.direction = entryDirection;
       entryResult.priceAtArm = state.armed.priceAtArm; // само за контекст в известието
       state.armed = null; // епизодът приключва (ENTRY или MISSED) - ново SETUP->ARMED е нужно за следващ опит
     }
+  }
+
+  // TELEMETRY - довършва "чакащите" outcome записи (+15м прозорец) за ТАЗИ
+  // монета, реюзвайки вече изчислената `price` от тази обиколка - БЕЗ никакви
+  // допълнителни мрежови заявки. Изцяло observability, не влияе на ENTRY.
+  if (state.pendingOutcomes && state.pendingOutcomes.length && env.ALERT_STATE) {
+    const stillPending = [];
+    for (const p of state.pendingOutcomes) {
+      if (Date.now() >= p.dueAt && price != null) {
+        const raw = await env.ALERT_STATE.get(p.key);
+        if (raw) {
+          const rec = JSON.parse(raw);
+          rec.outcome15m = calcOutcomePct(p.direction, p.entryPrice, price);
+          await env.ALERT_STATE.put(p.key, JSON.stringify(rec));
+        }
+      } else {
+        stillPending.push(p);
+      }
+    }
+    state.pendingOutcomes = stillPending;
   }
 
   await saveSymbolState(env, symbol, state);
