@@ -44,6 +44,17 @@ const WATCHLIST = [
 
 const DCA_ALERT_COOLDOWN_MS = 24 * 3600000; // не повтаря едно и също DCA ниво по-често от 24ч
 
+// Ръчно зададени ценови зони за наблюдение - "RECLAIM/REJECTION" известие,
+// когато 15м свещ или затвори НАД зоната (reclaim - бичи сигнал, зоната е
+// "превзета" отгоре), или цената я тества (докосва high >= levelLow), но
+// свещта пак затваря ПОД нея (rejection - мечи сигнал, зоната отблъсква).
+// За разлика от WATCHLIST (следи ВСИЧКИ пазарни сигнали автоматично за всяка
+// монета), тук ти сам решаваш кое ниво те интересува В МОМЕНТА - добавяш/
+// махаш редове тук при нужда (label е само за четимост в известието).
+const PRICE_LEVELS_WATCHLIST = [
+  { symbol: 'ALGOUSDT', levelLow: 0.1038, levelHigh: 0.1042, label: 'ключова зона' },
+];
+
 // ---- DCA логика - byte-identical копие от signal-logic.js -----------------
 // (calcDCALevels и директните му зависимости; Worker-ът е single-file dashboard
 // проект, затова не internal import-ва signal-logic.js директно - ако promptнеш
@@ -3154,7 +3165,47 @@ async function checkDcaLevels(env, watchlist = WATCHLIST) {
   }
 }
 
-export { calcDCALevels, checkDcaLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals, checkMacroSqueeze };
+// Класифицира реакция на ЕДНА (последната затворена) 15м свещ спрямо
+// зададена ръчна зона [levelLow, levelHigh] - виж бележката при
+// PRICE_LEVELS_WATCHLIST по-горе за пълния контекст на 'reclaim'/'rejection'.
+function calcLevelReaction(candle, levelLow, levelHigh) {
+  if (!candle || levelLow == null || levelHigh == null) return 'none';
+  if (candle.close > levelHigh) return 'reclaim';
+  if (candle.high >= levelLow && candle.close < levelLow) return 'rejection';
+  return 'none';
+}
+
+// ---- Ръчни ценови нива следене (извиква се от scheduled()) -----------------
+// Worker-only (огледално на checkDcaLevels по-горе - собствен KV namespace
+// `pricelevel:`, НЕ споделя `sigstate:` с scanSymbolSignals, за да няма race
+// condition между двете паралелни ctx.waitUntil извиквания в scheduled()).
+async function checkPriceLevels(env, watchlist = PRICE_LEVELS_WATCHLIST) {
+  for (const lvl of watchlist) {
+    try {
+      const k15 = await fetchKlinesWorker(env, lvl.symbol, '15m', 3);
+      const c15 = klinesToCandles(k15);
+      const c15Closed = c15.slice(0, -1);
+      if (!c15Closed.length) continue;
+      const lastClosed = c15Closed[c15Closed.length - 1];
+      const reaction = calcLevelReaction(lastClosed, lvl.levelLow, lvl.levelHigh);
+      if (reaction === 'none') continue;
+      const kvKey = `pricelevel:${lvl.symbol}:${lvl.levelLow}`;
+      const composite = `${reaction}:${lastClosed.openTime}`;
+      const last = env.ALERT_STATE ? await env.ALERT_STATE.get(kvKey) : null;
+      if (last === composite) continue; // вече известено за тази точно свещ+реакция
+      const symbolNoUsdt = lvl.symbol.replace('USDT', '');
+      const label = lvl.label || 'зона';
+      const zoneStr = `${formatPrice(lvl.levelLow)}–${formatPrice(lvl.levelHigh)} USD`;
+      const lines = reaction === 'reclaim'
+        ? [`🟩 RECLAIM ${symbolNoUsdt}`, `15м свещ затвори НАД ${label} (${zoneStr})`, `Close: ${formatPrice(lastClosed.close)} USD`]
+        : [`🟥 REJECTION ${symbolNoUsdt}`, `Цената тества ${label} (${zoneStr}), но 15м свещ затвори обратно под нея`, `Close: ${formatPrice(lastClosed.close)} USD`];
+      await sendWhatsApp(env, lines.join('\n'));
+      if (env.ALERT_STATE) await env.ALERT_STATE.put(kvKey, composite);
+    } catch (e) { console.error(`Price level check error for ${lvl.symbol}: ${e.message}`); }
+  }
+}
+
+export { calcDCALevels, checkDcaLevels, checkPriceLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals, checkMacroSqueeze };
 
 export default {
   async fetch(request, env) {
@@ -3308,6 +3359,6 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env)]));
+    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env), checkPriceLevels(env)]));
   }
 };
