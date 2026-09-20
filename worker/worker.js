@@ -1747,6 +1747,98 @@ function markSetupFired(state, direction, score) {
   state.setup = { direction, score, at: Date.now() };
 }
 
+// ═══ ENTRY ENGINE - ЕТАП 2: "ARMED" ══════════════════════════════════════════════
+// Чисто structure/price-action - БЕЗ momentum/CVD/OI (те остават за ENTRY
+// TRIGGER, Етап 3). Non-repainting N-bar fractal swing detection на 5м:
+// свещ `i` се потвърждава като swing high/low едва когато `i+N` вече е
+// затворена - "сега" винаги гледа назад, никога напред (виж
+// updateSwingStructure по-долу). ARMED gate е sticky - веднъж достигнат,
+// остава активен докато SETUP не се деактивира/смени посока, или изтече
+// ARMED_EXPIRY_HOURS (виж wiring-а в scanSymbolSignals).
+const SWING_FRACTAL_N = 2; // свещи от всяка страна, нужни за потвърждение на pivot
+const SWING_MIN_AMPLITUDE_PCT = 0.3; // минимална амплитуда - филтрира плоски/незначителни pivot-и
+const STRUCTURE_BREAK_BUFFER_PCT = 0.15; // confirmed close буфер (WICK != SIGNAL, огледално на VAHVAL_CONFIRM_BUFFER_PCT)
+const ARMED_EXPIRY_HOURS = 6; // ARMED изтича, ако ENTRY TRIGGER не дойде до толкова часа - първоначална преценка
+
+function isSwingHigh(candles, i, n) {
+  const h = candles[i].high;
+  for (let k = i - n; k <= i + n; k++) { if (k !== i && candles[k].high >= h) return false; }
+  return true;
+}
+function isSwingLow(candles, i, n) {
+  const l = candles[i].low;
+  for (let k = i - n; k <= i + n; k++) { if (k !== i && candles[k].low <= l) return false; }
+  return true;
+}
+function swingAmplitudePct(candles, i, n, isHigh) {
+  if (isHigh) {
+    let minLow = Infinity;
+    for (let k = i - n; k <= i + n; k++) { if (k !== i) minLow = Math.min(minLow, candles[k].low); }
+    return (candles[i].high - minLow) / candles[i].high * 100;
+  }
+  let maxHigh = -Infinity;
+  for (let k = i - n; k <= i + n; k++) { if (k !== i) maxHigh = Math.max(maxHigh, candles[k].high); }
+  return (maxHigh - candles[i].low) / candles[i].low * 100;
+}
+
+// Обработва ВСИЧКИ новопотвърдими pivot кандидати от последната обработена
+// свещ насам (state.swingStruct.lastCheckedTime) - всеки кандидат се
+// обработва ТОЧНО ВЕДНЪЖ между тиковете, никога повторно. Мутира `entry`
+// directly (огледално на reloadWindow/vahStruct другаде в този файл).
+function updateSwingStructure(entry, candles) {
+  const n = SWING_FRACTAL_N;
+  if (!Array.isArray(candles) || candles.length < 2 * n + 1) return;
+  const maxCheckableIndex = candles.length - 1 - n;
+  let startIndex = n;
+  if (entry.lastCheckedTime != null) {
+    const foundIdx = candles.findIndex(c => c.openTime === entry.lastCheckedTime);
+    if (foundIdx !== -1) startIndex = foundIdx + 1;
+  }
+  for (let i = startIndex; i <= maxCheckableIndex; i++) {
+    if (i - n < 0) continue;
+    if (isSwingHigh(candles, i, n) && swingAmplitudePct(candles, i, n, true) >= SWING_MIN_AMPLITUDE_PCT) {
+      entry.prevSwingHigh = entry.lastSwingHigh;
+      entry.lastSwingHigh = { price: candles[i].high, time: candles[i].openTime };
+    }
+    if (isSwingLow(candles, i, n) && swingAmplitudePct(candles, i, n, false) >= SWING_MIN_AMPLITUDE_PCT) {
+      entry.prevSwingLow = entry.lastSwingLow;
+      entry.lastSwingLow = { price: candles[i].low, time: candles[i].openTime };
+    }
+    entry.lastCheckedTime = candles[i].openTime;
+  }
+}
+
+function calcLowerHigh(entry) {
+  return !!(entry.lastSwingHigh && entry.prevSwingHigh && entry.lastSwingHigh.price < entry.prevSwingHigh.price);
+}
+function calcHigherLow(entry) {
+  return !!(entry.lastSwingLow && entry.prevSwingLow && entry.lastSwingLow.price > entry.prevSwingLow.price);
+}
+// "Loss of structure" (SHORT) / "reclaim" (LONG) - CONFIRMED 5м close отвъд
+// последния потвърден swing low/high + буфер - wick сам по себе си е само
+// sweep/информация, не structure break (виж дискусията).
+function calcStructureLossDown(entry, lastClosedCandle) {
+  if (!entry.lastSwingLow || !lastClosedCandle) return false;
+  return lastClosedCandle.close < entry.lastSwingLow.price * (1 - STRUCTURE_BREAK_BUFFER_PCT / 100);
+}
+function calcStructureReclaimUp(entry, lastClosedCandle) {
+  if (!entry.lastSwingHigh || !lastClosedCandle) return false;
+  return lastClosedCandle.close > entry.lastSwingHigh.price * (1 + STRUCTURE_BREAK_BUFFER_PCT / 100);
+}
+
+// ARMED gate - чисто структурен: SETUP посока + (lowerHigh/higherLow ИЛИ
+// structure loss/reclaim). Връща 'long'/'short', ако условието е изпълнено
+// точно СЕГА (wiring-ът решава дали да армира/остане sticky - виж по-долу).
+function calcArmedTrigger(setupDirection, swingEntry, lastClosedCandle) {
+  if (setupDirection === 'short') {
+    return (calcLowerHigh(swingEntry) || calcStructureLossDown(swingEntry, lastClosedCandle)) ? 'short' : null;
+  }
+  if (setupDirection === 'long') {
+    return (calcHigherLow(swingEntry) || calcStructureReclaimUp(swingEntry, lastClosedCandle)) ? 'long' : null;
+  }
+  return null;
+}
+
 // ═══ IDEA 04 - "VALUE MIGRATION" ═══════════════════════════════════════════════
 // Сравнява POC на ВЧЕРАШНИЯ (затворен) дневен профил с POC на ДНЕШНИЯ (все още
 // незавършен) дневен профил, построени от 1ч свещи - миграция на POC нагоре/
@@ -2964,6 +3056,34 @@ async function scanSymbolSignals(env, symbol) {
   if (setupFired) markSetupFired(state, setupState.direction, setupState.score);
   if (!setupState.direction) state.setup = null; // деактивирано - следваща активация ще пали НАНОВО
 
+  // ENTRY ENGINE - ЕТАП 2: "ARMED" (виж calcArmedTrigger по-горе) - чисто
+  // structure/price-action, БЕЗ momentum/CVD/OI (за Етап 3). Реюзва вече
+  // изтеглената c5Closed - БЕЗ нови мрежови заявки. ARMED е sticky - веднъж
+  // достигнат, остава активен докато SETUP не се деактивира/смени посока
+  // (проверката по-долу), или изтече ARMED_EXPIRY_HOURS.
+  if (!state.swingStruct) state.swingStruct = {};
+  updateSwingStructure(state.swingStruct, c5Closed);
+  if (!setupState.direction || (state.armed && state.armed.direction !== setupState.direction)) {
+    state.armed = null; // SETUP деактивиран или смени посока -> RESET към IDLE
+  }
+  if (state.armed && (Date.now() - state.armed.at) >= ARMED_EXPIRY_HOURS * 3600000) {
+    state.armed = null; // expiry - твърде стар ARMED без дошъл ENTRY TRIGGER
+  }
+  let armedFired = false;
+  if (setupState.direction && !state.armed) {
+    const lastClosed5m = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+    const armedDirection = calcArmedTrigger(setupState.direction, state.swingStruct, lastClosed5m);
+    if (armedDirection) {
+      state.armed = { direction: armedDirection, at: Date.now() };
+      armedFired = true;
+    }
+  }
+  const armedDirection = state.armed ? state.armed.direction : null;
+  const armedLowerHigh = calcLowerHigh(state.swingStruct);
+  const armedHigherLow = calcHigherLow(state.swingStruct);
+  const armedStructureLossDown = calcStructureLossDown(state.swingStruct, c5Closed.length ? c5Closed[c5Closed.length - 1] : null);
+  const armedStructureReclaimUp = calcStructureReclaimUp(state.swingStruct, c5Closed.length ? c5Closed[c5Closed.length - 1] : null);
+
   await saveSymbolState(env, symbol, state);
 
   return {
@@ -2994,6 +3114,7 @@ async function scanSymbolSignals(env, symbol) {
     liqGravityDistancePct: liqGravityScore.distancePct, liqGravityClusterPrice: liqGravityScore.clusterPrice, liqGravityClusterUsd: liqGravityScore.clusterUsd,
     vahEvent, valEvent,
     setupFired, setupDirection: setupState.direction, setupScore: setupState.score, setupBreakdown: setupState.breakdown,
+    armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp,
   };
 }
 
@@ -3010,7 +3131,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -3179,6 +3300,26 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
           `⚠️ Все още НЕ Е entry - следи за развитие (Етап 2: ARMED)`,
         ];
         await sendWhatsApp(env, setupLines.join('\n'));
+      }
+      // ENTRY ENGINE - ЕТАП 2: "ARMED" (виж calcArmedTrigger по-горе) - чисто
+      // структурно, sticky (не трепка при всяка промяна на swing точките).
+      // Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3).
+      if (armedFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const reasons = [];
+        if (armedDirection === 'short') {
+          if (armedLowerHigh) reasons.push('Lower High потвърден');
+          if (armedStructureLossDown) reasons.push('Structure loss (5м close под swing low)');
+        } else {
+          if (armedHigherLow) reasons.push('Higher Low потвърден');
+          if (armedStructureReclaimUp) reasons.push('Structure reclaim (5м close над swing high)');
+        }
+        const armedLines = [
+          `⚡ ARMED ${armedDirection === 'long' ? 'LONG' : 'SHORT'} ${symbolNoUsdt}`,
+          reasons.join(' + '),
+          `⚠️ Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3)`,
+        ];
+        await sendWhatsApp(env, armedLines.join('\n'));
       }
       // PHASE CYCLE ENGINE - изцяло отделно известие от горното, независимо
       // от MIN_NOTIFY_SCORE/newFired на класическия LONG/SHORT поток. Праща се
