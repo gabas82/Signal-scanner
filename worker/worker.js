@@ -1839,6 +1839,67 @@ function calcArmedTrigger(setupDirection, swingEntry, lastClosedCandle) {
   return null;
 }
 
+// ═══ ENTRY ENGINE - ЕТАП 3: "ENTRY TRIGGER" ══════════════════════════════════════
+// Последният преход: ARMED -> 🔥 ENTRY CONFIRMED (или ⚠️ MISSED). 5м = execution
+// (самата trigger свещ), 15м = само non-contradiction филтър (не самостоятелен
+// trigger), 1ч/4ч = контекст (score boost, не hard gate) - виж дискусията.
+const TRIGGER_MIN_RANGE_ATR_MULTIPLE = 0.5; // trigger/15м свещта трябва да е поне толкова × ATR range - филтрира doji/шум
+const CHASE_MAX_ATR_MULTIPLE = 1.5; // ако trigger close е по-далеч от структурната референция с толкова × ATR -> MISSED
+
+// Trigger свещ: CONFIRMED close в посоката (не wick) + истинско тяло спрямо
+// ATR (не doji-шум).
+function isTriggerCandle(candle, direction, atr) {
+  if (!candle || !(atr > 0)) return false;
+  if (candle.high - candle.low < atr * TRIGGER_MIN_RANGE_ATR_MULTIPLE) return false;
+  return direction === 'short' ? candle.close < candle.open : candle.close > candle.open;
+}
+// 15м "противоречи" = силна свещ (истинско тяло спрямо 15м ATR) в ОБРАТНАТА
+// посока - не изисква собствен trigger, само не бива да е активно против нас.
+function contradicts15m(candle15, direction, atr15) {
+  if (!candle15 || !(atr15 > 0)) return false;
+  if (candle15.high - candle15.low < atr15 * TRIGGER_MIN_RANGE_ATR_MULTIPLE) return false;
+  return direction === 'short' ? candle15.close > candle15.open : candle15.close < candle15.open;
+}
+// CHASE PROTECTION - структурната референция (currentSwingReference) вече по
+// конструкция НЕ гони цената по време на силен едностранен импулс (fractal-ът
+// изисква истинска пауза от 2 свещи от двете страни, за да потвърди нов swing
+// - виж дискусията) - remove risk от overfit чрез фиксирана % дистанция,
+// вместо това ATR-relative (адаптира се към волатилността на всяка монета).
+function isTooExtended(triggerClose, structRef, atr) {
+  if (structRef == null || !(atr > 0)) return false;
+  return Math.abs(triggerClose - structRef) > atr * CHASE_MAX_ATR_MULTIPLE;
+}
+
+// FLOW - асиметрична логика (потвърдена с потребителя): supportive -> +1
+// score; neutral (нито един от двата детектора активен) -> не влияе; opposing
+// (TRAP/FLOW WARMING с hard factor в ОБРАТНАТА посока) -> temporary VETO -
+// НЕ чупи ARMED, просто не пали ENTRY този тик (изчаква следващ тик/trigger).
+// Реюзва вече калибрираните TRAP/FLOW WARMING прагове - без нови "магически"
+// OI%/CVD% граници.
+function calcFlowVeto({ direction, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier }) {
+  return (flowWarmingTier !== 'none' && flowWarmingDirection !== direction) ||
+    (trapTier !== 'none' && trapDirection !== direction);
+}
+function calcFlowBoost({ direction, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier }) {
+  return (flowWarmingTier !== 'none' && flowWarmingDirection === direction) ||
+    (trapTier !== 'none' && trapDirection === direction);
+}
+
+// Обединява всичко - връща { status: 'none'|'missed'|'entry', ... }. ENTRY
+// SCORE 2 (STRUCTURE+TRIGGER база, гарантирани щом статусът е 'entry') + до 3
+// boost точки (15м confirmation, FLOW, HTF context) - същата рамка като
+// SETUP score-а, за консистентност между етапите.
+function calcEntryTrigger({ direction, candle5m, atr5m, candle15m, atr15m, structRef, flowVeto, flowBoost, htfAligned }) {
+  if (!isTriggerCandle(candle5m, direction, atr5m)) return { status: 'none' };
+  if (flowVeto) return { status: 'none' };
+  if (isTooExtended(candle5m.close, structRef, atr5m)) {
+    return { status: 'missed', triggerClose: candle5m.close, structRef };
+  }
+  const confirmation15m = !contradicts15m(candle15m, direction, atr15m);
+  const score = 2 + (confirmation15m ? 1 : 0) + (flowBoost ? 1 : 0) + (htfAligned ? 1 : 0);
+  return { status: 'entry', score, confirmation15m, flowBoost, htfAligned, triggerClose: candle5m.close, structRef };
+}
+
 // ═══ IDEA 04 - "VALUE MIGRATION" ═══════════════════════════════════════════════
 // Сравнява POC на ВЧЕРАШНИЯ (затворен) дневен профил с POC на ДНЕШНИЯ (все още
 // незавършен) дневен профил, построени от 1ч свещи - миграция на POC нагоре/
@@ -3074,7 +3135,10 @@ async function scanSymbolSignals(env, symbol) {
     const lastClosed5m = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
     const armedDirection = calcArmedTrigger(setupState.direction, state.swingStruct, lastClosed5m);
     if (armedDirection) {
-      state.armed = { direction: armedDirection, at: Date.now() };
+      // priceAtArm е ЧИСТО информационен (за контекст в известията) - НЕ
+      // участва в chase protection (виж calcEntryTrigger/isTooExtended по-горе
+      // и дискусията защо currentSwingReference е правилната референция).
+      state.armed = { direction: armedDirection, at: Date.now(), priceAtArm: price };
       armedFired = true;
     }
   }
@@ -3083,6 +3147,35 @@ async function scanSymbolSignals(env, symbol) {
   const armedHigherLow = calcHigherLow(state.swingStruct);
   const armedStructureLossDown = calcStructureLossDown(state.swingStruct, c5Closed.length ? c5Closed[c5Closed.length - 1] : null);
   const armedStructureReclaimUp = calcStructureReclaimUp(state.swingStruct, c5Closed.length ? c5Closed[c5Closed.length - 1] : null);
+
+  // ENTRY ENGINE - ЕТАП 3: "ENTRY TRIGGER" (виж calcEntryTrigger по-горе) -
+  // изчислява се САМО докато ARMED е активен. Реюзва вече изтеглените c5Closed/
+  // c15Closed + вече изчислените FLOW WARMING/TRAP/trend4h/emaFilter - БЕЗ нови
+  // мрежови заявки. ENTRY/MISSED консумират ARMED (сядат в state.armed=null) -
+  // едностранно събитие на епизод, огледално на самия state machine дизайн.
+  let entryResult = { status: 'none' };
+  if (state.armed) {
+    const entryDirection = state.armed.direction;
+    const atr5m = calcATR(c5Closed, 14);
+    const atr15m = calcATR(c15Closed, 14);
+    const structRef = entryDirection === 'short'
+      ? (state.swingStruct.lastSwingLow ? state.swingStruct.lastSwingLow.price : null)
+      : (state.swingStruct.lastSwingHigh ? state.swingStruct.lastSwingHigh.price : null);
+    const flowVeto = calcFlowVeto({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
+    const flowBoost = calcFlowBoost({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
+    const htfAligned = entryDirection === 'long' ? (trend4h.bull || emaFilter.bull) : (trend4h.bear || emaFilter.bear);
+    entryResult = calcEntryTrigger({
+      direction: entryDirection,
+      candle5m: c5Closed.length ? c5Closed[c5Closed.length - 1] : null, atr5m,
+      candle15m: c15Closed.length ? c15Closed[c15Closed.length - 1] : null, atr15m,
+      structRef, flowVeto, flowBoost, htfAligned,
+    });
+    if (entryResult.status === 'entry' || entryResult.status === 'missed') {
+      entryResult.direction = entryDirection;
+      entryResult.priceAtArm = state.armed.priceAtArm; // само за контекст в известието
+      state.armed = null; // епизодът приключва (ENTRY или MISSED) - ново SETUP->ARMED е нужно за следващ опит
+    }
+  }
 
   await saveSymbolState(env, symbol, state);
 
@@ -3115,6 +3208,7 @@ async function scanSymbolSignals(env, symbol) {
     vahEvent, valEvent,
     setupFired, setupDirection: setupState.direction, setupScore: setupState.score, setupBreakdown: setupState.breakdown,
     armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp,
+    entryResult,
   };
 }
 
@@ -3131,7 +3225,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -3320,6 +3414,38 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
           `⚠️ Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3)`,
         ];
         await sendWhatsApp(env, armedLines.join('\n'));
+      }
+      // ENTRY ENGINE - ЕТАП 3: "ENTRY TRIGGER" (виж calcEntryTrigger по-горе) -
+      // финалният преход: 🔥 ENTRY CONFIRMED ("ТОВА Е ВХОД") или ⚠️ ENTRY
+      // MISSED (посоката е вярна, но цената вече е избягала твърде далеч от
+      // структурата - WAIT RETEST, бъдещ Етап 4).
+      if (entryResult.status === 'entry' || entryResult.status === 'missed') {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const dirLabel = entryResult.direction === 'long' ? 'LONG' : 'SHORT';
+        if (entryResult.status === 'entry') {
+          const entryLines = [
+            `🔥 ENTRY CONFIRMED ${symbolNoUsdt}`,
+            dirLabel,
+            `ENTRY: ${formatPrice(entryResult.triggerClose)} USD`,
+            `STRUCTURE: ARMED (${entryResult.direction === 'short' ? 'lower high / structure loss' : 'higher low / structure reclaim'}) ✓`,
+            `5м TRIGGER: ${dirLabel} ✓`,
+            `15м CONFIRMATION: ${entryResult.confirmation15m ? '✓' : '—'}`,
+            `FLOW: ${entryResult.flowBoost ? '✓ потвърждава' : '—'}`,
+            `HTF CONTEXT: ${entryResult.htfAligned ? '✓ съвпада' : '—'}`,
+            `ENTRY SCORE: ${entryResult.score}/5`,
+            `⚠️ Не гони цената отвъд ${formatPrice(entryResult.structRef)} USD`,
+          ];
+          await sendWhatsApp(env, entryLines.join('\n'));
+        } else {
+          const missedLines = [
+            `⚠️ ENTRY MISSED ${symbolNoUsdt}`,
+            dirLabel,
+            `Цената вече е твърде отдалечена от структурата (${formatPrice(entryResult.structRef)} USD)`,
+            `Trigger close: ${formatPrice(entryResult.triggerClose)} USD`,
+            `WAIT RETEST`,
+          ];
+          await sendWhatsApp(env, missedLines.join('\n'));
+        }
       }
       // PHASE CYCLE ENGINE - изцяло отделно известие от горното, независимо
       // от MIN_NOTIFY_SCORE/newFired на класическия LONG/SHORT поток. Праща се
