@@ -1674,6 +1674,10 @@ function calcVahValStructureEvent(entry, candle, level) {
     entry.side = 'below'; // тих "give-back" - не е едно от 4-те събития, само reset на side
   }
   entry.lastLevel = level;
+  // Пази последния РЕАЛЕН eventType (не се трие при give-back/тихи тикове) -
+  // ползва се от SETUP слоя (ENTRY ENGINE, виж по-долу) за да знае "текущата
+  // структурна позиция" на нивото, не само моментния tick, в който е паднало.
+  if (fired) entry.lastEventType = eventType;
 
   return fired ? { fired: true, eventType, level, distancePct } : { fired: false };
 }
@@ -1684,6 +1688,64 @@ const VAHVAL_LABELS = {
   'val:reclaim': '📈 VAL RECLAIM',
   'val:rejection': '📉 VAL REJECTION',
 };
+
+// ═══ ENTRY ENGINE - ЕТАП 1: "SETUP" ═════════════════════════════════════════════
+// Пълна поредица: 🎯 TARGET ("има цел") -> 👀 SETUP ("наблюдавай") -> ⚡ ARMED
+// ("подготвя се") -> 🔥 ENTRY CONFIRMED ("ТОВА Е ВХОД") -> exit management.
+// SETUP е ПЪРВИЯТ слой - НЕ Е entry, само "тази монета вече заслужава внимание
+// в LONG/SHORT посока". База (задължителна): TARGET (tier != none) + VAH/VAL
+// structure alignment в СЪЩАТА посока (viж vahvalEventDirection по-долу) -
+// двете заедно са ДОСТАТЪЧНИ за SETUP. TRAP/AUCTION QUALITY/VALUE MIGRATION
+// са ДОПЪЛНИТЕЛНИ quality/score фактори, НЕ hard gate - липсата им не отменя
+// SETUP (потвърдено изрично с потребителя - не искаме over-gate на този слой,
+// истинското филтриране идва в по-късните етапи ARMED/ENTRY TRIGGER).
+function vahvalEventDirection(eventType) {
+  if (eventType === 'reclaim') return 'long';
+  if (eventType === 'rejection') return 'short';
+  return null;
+}
+
+// Връща { direction, score, breakdown } - direction е null, ако базата
+// (TARGET + VAH/VAL alignment) не е изпълнена (= няма SETUP). score е 2-5:
+// 2 винаги (базата), +1 за всеки допълнителен фактор в СЪЩАТА посока.
+function calcSetupState({
+  targetDirection, targetTier, vahLastEventType, valLastEventType,
+  trapDirection, trapTier, auctionDirection, auctionTier, migrationDirection, migrationTier,
+}) {
+  if (targetTier === 'none' || !targetDirection) return { direction: null, score: 0, breakdown: {} };
+  const vahDir = vahvalEventDirection(vahLastEventType);
+  const valDir = vahvalEventDirection(valLastEventType);
+  if (vahDir !== targetDirection && valDir !== targetDirection) return { direction: null, score: 0, breakdown: {} };
+
+  const direction = targetDirection;
+  const breakdown = {
+    trap: trapTier !== 'none' && trapDirection === direction,
+    auction: auctionTier !== 'none' && auctionDirection === direction,
+    migration: migrationTier !== 'none' && migrationDirection === direction,
+  };
+  let score = 2; // TARGET + VAH/VAL база
+  if (breakdown.trap) score++;
+  if (breakdown.auction) score++;
+  if (breakdown.migration) score++;
+  return { direction, score, breakdown };
+}
+
+// Anti-spam: НЕ е score/tier дребно колебание (виж canFireWithHysteresis по-
+// горе) - SETUP е по-скоро БИНАРНО "включено/изключено" събитие. Затова
+// firing логиката е нарочно по-проста: пали САМО при нова активация (от
+// изключено -> включено) или при смяна на посоката - НЕ при промяна на
+// quality score-а, докато посоката остава същата (score-ът е чисто
+// информационен, виж бележката при calcSetupState). Когато SETUP стане
+// неактивен, state.setup изрично се изчиства - следваща активация в СЪЩАТА
+// посока по-късно ще пали НАНОВО (за разлика от canFireWithHysteresis, където
+// същия key никога не пали пак - тук искаме точно обратното).
+function setupCanFire(state, direction) {
+  if (!direction) return false;
+  return !state.setup || state.setup.direction !== direction;
+}
+function markSetupFired(state, direction, score) {
+  state.setup = { direction, score, at: Date.now() };
+}
 
 // ═══ IDEA 04 - "VALUE MIGRATION" ═══════════════════════════════════════════════
 // Сравнява POC на ВЧЕРАШНИЯ (затворен) дневен профил с POC на ДНЕШНИЯ (все още
@@ -2890,6 +2952,18 @@ async function scanSymbolSignals(env, symbol) {
   const liqGravityFired = liqGravityCanFire(state, liqGravityKey, liqGravityDirection);
   if (liqGravityFired) markLiqGravityFired(state, liqGravityKey, liqGravityDirection);
 
+  // ENTRY ENGINE - ЕТАП 1: "SETUP" (виж calcSetupState по-горе) - реюзва вече
+  // изчислените TARGET/VAH/VAL/TRAP/AUCTION/MIGRATION резултати по-горе, БЕЗ
+  // никакви допълнителни мрежови заявки.
+  const setupState = calcSetupState({
+    targetDirection: targetScore.direction, targetTier,
+    vahLastEventType: state.vahStruct.lastEventType, valLastEventType: state.valStruct.lastEventType,
+    trapDirection, trapTier, auctionDirection, auctionTier, migrationDirection, migrationTier,
+  });
+  const setupFired = setupCanFire(state, setupState.direction);
+  if (setupFired) markSetupFired(state, setupState.direction, setupState.score);
+  if (!setupState.direction) state.setup = null; // деактивирано - следваща активация ще пали НАНОВО
+
   await saveSymbolState(env, symbol, state);
 
   return {
@@ -2919,6 +2993,7 @@ async function scanSymbolSignals(env, symbol) {
     liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore,
     liqGravityDistancePct: liqGravityScore.distancePct, liqGravityClusterPrice: liqGravityScore.clusterPrice, liqGravityClusterUsd: liqGravityScore.clusterUsd,
     vahEvent, valEvent,
+    setupFired, setupDirection: setupState.direction, setupScore: setupState.score, setupBreakdown: setupState.breakdown,
   };
 }
 
@@ -2935,7 +3010,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
   let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -3085,6 +3160,25 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
         }
         lines.push(`⚠️ Структурно събитие - НЕ Е entry сигнал сам по себе си`);
         await sendWhatsApp(env, lines.join('\n'));
+      }
+      // ENTRY ENGINE - ЕТАП 1: "SETUP" (виж calcSetupState по-горе) - ПЪРВИЯТ
+      // слой от последователността TARGET -> SETUP -> ARMED -> ENTRY
+      // CONFIRMED. Все още НЕ Е entry - означава само "тази монета вече
+      // заслужава внимание". Пали САМО при нова активация/смяна на посоката
+      // (виж setupCanFire), не при промяна на quality score-а.
+      if (setupFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const b = setupBreakdown;
+        const setupLines = [
+          `👀 SETUP ${setupDirection === 'long' ? 'LONG' : 'SHORT'} ${symbolNoUsdt}`,
+          `Base: TARGET + VAH/VAL ${setupDirection === 'long' ? 'reclaim' : 'rejection'} ✓`,
+          `TRAP: ${b.trap ? '✓' : '—'}`,
+          `AUCTION QUALITY: ${b.auction ? '✓' : '—'}`,
+          `VALUE MIGRATION: ${b.migration ? '✓' : '—'}`,
+          `SETUP QUALITY: ${setupScore}/5`,
+          `⚠️ Все още НЕ Е entry - следи за развитие (Етап 2: ARMED)`,
+        ];
+        await sendWhatsApp(env, setupLines.join('\n'));
       }
       // PHASE CYCLE ENGINE - изцяло отделно известие от горното, независимо
       // от MIN_NOTIFY_SCORE/newFired на класическия LONG/SHORT поток. Праща се
