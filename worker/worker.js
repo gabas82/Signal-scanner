@@ -3356,14 +3356,21 @@ async function scanSymbolSignals(env, symbol) {
 // ---- Пазарни сигнали следене (извиква се от scheduled()) -------------------
 // За разлика от checkDcaLevels(), сканира ВСИЧКИ записи от WATCHLIST -
 // entryPrice/side не са нужни тук (следим монетата, не конкретна позиция).
-async function checkMarketSignals(env, watchlist = WATCHLIST) {
+// btcFlowContextOverride (DISCOVERY RADAR - Stage E) - опционален, добавен
+// БЕЗ да пипа стария call site (checkMarketSignals(env) от CORE си остава
+// байт-идентичен по поведение). Позволява на DISCOVERY-driven извикването
+// (различен watchlist, БЕЗ BTCUSDT в него - виж updateDiscoveryPromotion) да
+// преизползва ПОСЛЕДНИЯ реален BTC контекст от CORE-ния run (виж
+// persistBtcFlowContext по-долу), вместо да пада на neutral default само
+// защото BTCUSDT никога не е позиция 0 в pool-а.
+async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOverride = null) {
   // IDEA 07 - "RELATIVE FLOW" (виж calcRelativeFlow по-горе) - BTC е ВИНАГИ
   // watchlist[0] (виж WATCHLIST по-горе), а for-of цикълът е строго
   // последователен (await вътре), затова BTC гарантирано се обработва ПЪРВИ и
   // резултатът му може да се преизползва за всички следващи монети в СЪЩИЯ
   // тик - нула допълнителни заявки. Default стойността (без hard factor)
   // важи само за самата BTC итерация, преди да е записан собственият ѝ резултат.
-  let btcFlowContext = { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
+  let btcFlowContext = btcFlowContextOverride || { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
       const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult } = await scanSymbolSignals(env, pos.symbol);
@@ -3372,6 +3379,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST) {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
           oiDelta15m: sparkOiDelta15m, volRatio: sparkVolRatio,
         };
+        if (env.ALERT_STATE) await env.ALERT_STATE.put('btcflowcontext', JSON.stringify(btcFlowContext));
       }
       // MIN_NOTIFY_SCORE - самотен слаб сигнал вече не праща цяло известие,
       // само защото нещо е "активно" (виж бележката при MIN_NOTIFY_SCORE).
@@ -4193,9 +4201,44 @@ async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now()) {
   } catch (e) { console.error(`DISCOVERY RADAR pool update error: ${e.message}`); }
 }
 
+// ---- DISCOVERY RADAR (Stage E) - FULL ANALYSIS wiring ----------------------
+// Пуска СЪЩАТА, напълно непроменена checkMarketSignals/scanSymbolSignals
+// верига (TARGET/TRAP/AUCTION/MIGRATION/VAH-VAL/CYCLE/SPARK/ENTRY ENGINE) за
+// текущите DISCOVERY_POOL членове - нулев нов логически риск, само различен
+// watchlist подаден. За разлика от updateDiscoverySnapshotState/
+// updateDiscoveryPool (гейтнати на ~15 мин), тук се пуска на ВСЕКИ CORE cron
+// tick (5 мин) - членството в pool-а се решава рядко (Stage D), но веднъж
+// избрана, монетата се следи със СЪЩАТА честота като CORE WATCHLIST, за да не
+// изостава ENTRY ENGINE прецизността ѝ (5м trigger candle, 15м confirmation).
+// Приема, че pool-ът МОЖЕ да е до ~5 мин остарял спрямо последния Stage D
+// ъпдейт (двете вървят паралелно в Promise.all, не последователно) - дребно,
+// самокоригиращо се разминаване на следващия tick, приемливо на фона на
+// вече съществуващата ~5-мин "davност" на BTC контекста по-долу.
+async function runDiscoveryFullAnalysis(env, watchlist = WATCHLIST) {
+  try {
+    if (!env.ALERT_STATE) return;
+    const rawPool = await env.ALERT_STATE.get('discoverypool');
+    const pool = rawPool ? JSON.parse(rawPool) : [];
+    if (!pool.length) return;
+    // Explicit dedup guard (defense-in-depth) - filterDiscoveryUniverse (Stage
+    // C) вече изключва CORE символите при влизане в pool-а, но тук пак
+    // филтрираме - за да не разчитаме СИГУРНОСТТА "един symbol никога не се
+    // анализира два пъти в един цикъл" единствено на коректността на друг,
+    // по-раншен stage. Дори ако CORE WATCHLIST/pool-ът се разминат по някаква
+    // бъдеща причина, тоя ред гарантира нулево дублиране тук и сега.
+    const coreSymbols = new Set(watchlist.map((w) => w.symbol));
+    const dedupedPool = pool.filter((m) => !coreSymbols.has(m.symbol));
+    if (!dedupedPool.length) return;
+    const rawBtc = await env.ALERT_STATE.get('btcflowcontext');
+    const btcFlowContext = rawBtc ? JSON.parse(rawBtc) : null; // null -> checkMarketSignals пада на neutral default (виж по-горе)
+    const poolWatchlist = dedupedPool.map((m) => ({ symbol: m.symbol }));
+    await checkMarketSignals(env, poolWatchlist, btcFlowContext);
+  } catch (e) { console.error(`DISCOVERY RADAR full analysis error: ${e.message}`); }
+}
+
 export {
   calcDCALevels, checkDcaLevels, checkPriceLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals, checkMacroSqueeze,
-  updateDiscoverySnapshotState,
+  updateDiscoverySnapshotState, runDiscoveryFullAnalysis,
 };
 
 export default {
@@ -4407,6 +4450,6 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env), checkPriceLevels(env), updateDiscoverySnapshotState(env)]));
+    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env), checkPriceLevels(env), updateDiscoverySnapshotState(env), runDiscoveryFullAnalysis(env)]));
   }
 };
