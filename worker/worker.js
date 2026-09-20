@@ -1944,6 +1944,42 @@ function calcOutcomePct(direction, entryPrice, laterPrice) {
   return direction === 'short' ? -rawPct : rawPct;
 }
 
+// Агрегира вече заредени/филтрирани telemetry записи (чисто in-memory, БЕЗ
+// KV достъп тук - виж /telemetry ендпойнта в fetch() handler-а по-долу) -
+// брой по decision/symbol/direction, среден ENTRY SCORE, среден
+// chaseDistance/ATR, outcome статистика (win rate = дял записи с
+// положителен outcome15m).
+function buildTelemetrySummary(records) {
+  const summary = {
+    totalConfirmed: 0, totalMissed: 0, totalVeto: 0,
+    bySymbol: {},
+    byDirection: { long: { confirmed: 0, missed: 0, veto: 0 }, short: { confirmed: 0, missed: 0, veto: 0 } },
+    avgEntryScore: null, avgChaseDistanceAtrRatio: null,
+    outcome: { count: 0, avgOutcomePct: null, winRatePct: null },
+  };
+  let scoreSum = 0, scoreCount = 0, chaseSum = 0, chaseCount = 0, outcomeSum = 0, outcomeCount = 0, outcomeWins = 0;
+  for (const r of records) {
+    const bucket = r.decision === 'confirmed' ? 'totalConfirmed' : r.decision === 'missed' ? 'totalMissed' : r.decision === 'veto' ? 'totalVeto' : null;
+    if (bucket) summary[bucket]++;
+    if (!summary.bySymbol[r.symbol]) summary.bySymbol[r.symbol] = { confirmed: 0, missed: 0, veto: 0 };
+    if (r.decision === 'confirmed' || r.decision === 'missed' || r.decision === 'veto') summary.bySymbol[r.symbol][r.decision]++;
+    if ((r.direction === 'long' || r.direction === 'short') && (r.decision === 'confirmed' || r.decision === 'missed' || r.decision === 'veto')) {
+      summary.byDirection[r.direction][r.decision]++;
+    }
+    if (r.decision === 'confirmed' && r.entryScore != null) { scoreSum += r.entryScore; scoreCount++; }
+    if (r.chaseDistanceAtrRatio != null) { chaseSum += r.chaseDistanceAtrRatio; chaseCount++; }
+    if (r.outcome15m != null) { outcomeSum += r.outcome15m; outcomeCount++; if (r.outcome15m > 0) outcomeWins++; }
+  }
+  if (scoreCount) summary.avgEntryScore = scoreSum / scoreCount;
+  if (chaseCount) summary.avgChaseDistanceAtrRatio = chaseSum / chaseCount;
+  if (outcomeCount) {
+    summary.outcome.count = outcomeCount;
+    summary.outcome.avgOutcomePct = outcomeSum / outcomeCount;
+    summary.outcome.winRatePct = (outcomeWins / outcomeCount) * 100;
+  }
+  return summary;
+}
+
 // ═══ IDEA 04 - "VALUE MIGRATION" ═══════════════════════════════════════════════
 // Сравнява POC на ВЧЕРАШНИЯ (затворен) дневен профил с POC на ДНЕШНИЯ (все още
 // незавършен) дневен профил, построени от 1ч свещи - миграция на POC нагоре/
@@ -3888,6 +3924,63 @@ export default {
         + `Дата: ${payload.time || "?"}`;
       const cmResult = await sendWhatsApp(env, text);
       return new Response(JSON.stringify({ ok: true, callmebot: cmResult }), { headers: { "Content-Type": "application/json" } });
+    }
+
+    // ENTRY ENGINE TELEMETRY - read-only debug ендпойнт (виж buildTelemetrySummary
+    // по-горе). Fail-closed token auth (TELEMETRY_TOKEN secret), огледално на
+    // /tv-alert по-горе. Чисто READ - никакво управление/промяна на прагове,
+    // само извличане на вече натрупаните telemetry: KV записи за анализ.
+    if (path === "/telemetry" && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ALERT_STATE) {
+        return new Response(JSON.stringify({ error: "ALERT_STATE not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const symbolFilter = url.searchParams.get("symbol");
+      const decisionFilter = url.searchParams.get("decision"); // confirmed|missed|veto
+      const directionFilter = url.searchParams.get("direction"); // long|short
+      const since = url.searchParams.get("since") ? Number(url.searchParams.get("since")) : null;
+      const until = url.searchParams.get("until") ? Number(url.searchParams.get("until")) : null;
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 500);
+      const MAX_KEYS_SCANNED = 2000; // безопасен таван - предпазва от прекалено скъпа заявка
+
+      const prefix = symbolFilter ? `telemetry:${symbolFilter}:` : "telemetry:";
+      let allKeys = [];
+      let cursor;
+      do {
+        const listResult = await env.ALERT_STATE.list({ prefix, cursor, limit: 1000 });
+        allKeys.push(...listResult.keys);
+        cursor = listResult.list_complete ? undefined : listResult.cursor;
+      } while (cursor && allKeys.length < MAX_KEYS_SCANNED);
+      const truncated = allKeys.length > MAX_KEYS_SCANNED;
+      allKeys = allKeys.slice(0, MAX_KEYS_SCANNED);
+
+      const records = [];
+      for (const k of allKeys) {
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        if (decisionFilter && rec.decision !== decisionFilter) continue;
+        if (directionFilter && rec.direction !== directionFilter) continue;
+        if (since != null && rec.at < since) continue;
+        if (until != null && rec.at > until) continue;
+        records.push(rec);
+      }
+      records.sort((a, b) => b.at - a.at); // най-новите първи
+
+      return new Response(JSON.stringify({
+        count: records.length, truncated,
+        records: records.slice(0, limit),
+        summary: buildTelemetrySummary(records),
+      }), { headers: { "Content-Type": "application/json" } });
     }
 
     // Whitelist за CoinGlass прокси-то: без него ВСЕКИ path, който не съвпадне
