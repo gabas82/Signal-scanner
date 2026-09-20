@@ -4203,8 +4203,32 @@ async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now()) {
     });
 
     await env.ALERT_STATE.put('discoverypool', JSON.stringify(newPool));
-    if (exited.length) console.log(`DISCOVERY RADAR pool exits: ${exited.map((e) => `${e.symbol}(${e.exitReason})`).join(', ')}`);
+    if (exited.length) {
+      console.log(`DISCOVERY RADAR pool exits: ${exited.map((e) => `${e.symbol}(${e.exitReason})`).join(', ')}`);
+      await markDiscoveryEpisodesExited(env, exited, now);
+    }
   } catch (e) { console.error(`DISCOVERY RADAR pool update error: ${e.message}`); }
+}
+
+// Пренася Stage D-то вече изчислено exited[] (ttl_expired/weak_score/
+// displaced) в съответните discoveryepisode: записи - НЕ пипа
+// computeDiscoveryPoolUpdate/ranking-а по никакъв начин, само чете резултата
+// му. Именуването се мапва към точно трите стойности от заявката
+// (ttl_expired -> "ttl", останалите непроменени). Собствен try/catch на
+// символ - счупен episode запис не бива да развали останалите.
+const DISCOVERY_EXIT_REASON_MAP = { ttl_expired: 'ttl', weak_score: 'weak_score', displaced: 'displaced' };
+async function markDiscoveryEpisodesExited(env, exitedMembers, now) {
+  for (const m of exitedMembers) {
+    try {
+      const episodeKey = `discoveryepisode:${m.symbol}:${m.enteredAt}`;
+      const raw = await env.ALERT_STATE.get(episodeKey);
+      if (!raw) continue; // episode-ът още не е бил създаден (FULL ANALYSIS не е стигнал до тая монета) - няма какво да маркираме
+      const episode = JSON.parse(raw);
+      const mappedReason = DISCOVERY_EXIT_REASON_MAP[m.exitReason] || m.exitReason;
+      const updated = applyDiscoveryEpisodeExit(episode, mappedReason, now);
+      if (updated !== episode) await env.ALERT_STATE.put(episodeKey, JSON.stringify(updated));
+    } catch (e) { console.error(`DISCOVERY RADAR episode exit marking error for ${m.symbol}: ${e.message}`); }
+  }
 }
 
 // ---- DISCOVERY RADAR (Stage E) - FULL ANALYSIS wiring ----------------------
@@ -4331,6 +4355,28 @@ function applyDiscoveryEpisodeOutcome(episode, freshOutcome15m) {
   return { ...episode, entry: { ...episode.entry, outcome15m: freshOutcome15m }, status: 'complete' };
 }
 
+// Маркира КОГА и ЗАЩО символът реално е напуснал DISCOVERY_POOL (Stage D
+// eviction) - чисто описателно поле, ОРТОГОНАЛНО на setup/armed/entry
+// прогреса (виж classifyDiscoveryEpisodePoolStatus по-долу за точно как се
+// разделят "напусна БЕЗ прогрес" от "прогресира, ПОСЛЕ напусна"). Еднократно
+// - не презаписва вече маркиран exit. НЕ променя ranking/eviction логиката
+// на Stage D по никакъв начин - само чете вече изчисления resultat оттам.
+function applyDiscoveryEpisodeExit(episode, exitReason, now) {
+  if (episode.exitedAt != null) return episode;
+  return { ...episode, exitedAt: now, exitReason };
+}
+
+// Разделя episode-ите на точно трите категории от заявката:
+//   - 'progressed'          - стигнал поне SETUP (независимо дали после е
+//                              напуснал pool-а - прогресът НЕ се отменя от exit)
+//   - 'exited_before_setup'  - напуснал pool-а БЕЗ никога да стигне SETUP
+//   - 'active'               - все още в pool-а, все още има шанс
+function classifyDiscoveryEpisodePoolStatus(episode) {
+  if (episode.setup || episode.armed || episode.entry) return 'progressed';
+  if (episode.exitedAt != null) return 'exited_before_setup';
+  return 'active';
+}
+
 // Построява НАЧАЛНИЯ episode запис от pool member-а (Stage D discoveryPrice/
 // discoveryScore/discoveryDirection/discoveryConfidence - immutable снимка
 // от момента на влизане в pool-а).
@@ -4400,6 +4446,12 @@ function buildDiscoveryEpisodeSummary(episodes) {
   const summary = {
     total: episodes.length,
     byStatus: { discovery: 0, setup: 0, armed: 0, entry_pending_outcome: 0, complete: 0 },
+    // Отговаря директно на хипотезата от заявката - "active" все още има
+    // шанс, "exited_before_setup" е напуснал pool-а БЕЗ прогрес (виж
+    // classifyDiscoveryEpisodePoolStatus по-горе), "progressed" стигнал е
+    // поне SETUP (прогресът НЕ се отменя от по-късен pool exit).
+    byPoolStatus: { active: 0, exited_before_setup: 0, progressed: 0 },
+    byExitReason: { ttl: 0, weak_score: 0, displaced: 0 }, // само измежду exited_before_setup
     bySymbol: {},
     avgLeadTimeSetupMin: null, avgLeadTimeArmedMin: null, avgLeadTimeEntryMin: null,
     avgPctMoveToSetup: null, avgPctMoveToArmed: null, avgPctMoveToEntry: null,
@@ -4409,6 +4461,9 @@ function buildDiscoveryEpisodeSummary(episodes) {
   const acc = { leadSetup: [], leadArmed: [], leadEntry: [], pctSetup: [], pctArmed: [], pctEntry: [], atrEntry: [], outcomes: [] };
   for (const ep of episodes) {
     if (summary.byStatus[ep.status] != null) summary.byStatus[ep.status]++;
+    const poolStatus = classifyDiscoveryEpisodePoolStatus(ep);
+    summary.byPoolStatus[poolStatus]++;
+    if (poolStatus === 'exited_before_setup' && summary.byExitReason[ep.exitReason] != null) summary.byExitReason[ep.exitReason]++;
     summary.bySymbol[ep.symbol] = (summary.bySymbol[ep.symbol] || 0) + 1;
     const d = ep.derived || {};
     if (d.leadTimeSetupMin != null) acc.leadSetup.push(d.leadTimeSetupMin);
