@@ -3842,6 +3842,146 @@ async function checkPriceLevels(env, watchlist = PRICE_LEVELS_WATCHLIST) {
   }
 }
 
+// ---- DISCOVERY RADAR (Stage B) - чисти scoring функции ---------------------
+// Архитектура (обсъдена в чата, не тук): отделен, ВРЕМЕНЕН pre-filter слой
+// преди CORE WATCHLIST - сканира целия пазар евтино (relay bulk /ticker24hr,
+// виж Stage A), намира до 6 кандидата с необичайна/ускоряваща се активност,
+// и само за тях пуска пълния (скъп) анализ (scanSymbolSignals/checkMarketSignals
+// - непроменени). CORE WATCHLIST, ENTRY ENGINE и всички съществуващи прагове
+// НЕ се пипат тук. Тая секция е Stage B: САМО чисти функции, БЕЗ wiring в
+// scheduled() - снемане на bulk данни, KV persistence и cron интеграция идват
+// в следващи Stages (C+).
+//
+// Договорка за реда на извикване (виж пълния конвейер в Stage C):
+//   1. metrics     = calcDiscoverySnapshotMetrics(prevSnapshot, currSnapshot)
+//   2. activity    = calcDiscoveryActivityScore(metrics, oldBaseline)   <- oldBaseline е ПРЕДИ тоя tick
+//   3. direction   = calcDiscoveryDirection(metrics)
+//   4. confidence  = calcDiscoveryConfidence(metrics, oldBaseline, direction)
+//   5. newBaseline = updateDiscoveryBaseline(oldBaseline, metrics, direction) <- пази се за следващия tick
+//
+// v1 умишлено НЕ ползва funding/premiumIndex (виж чата - orязан scope) и
+// умишлено няма "финални" калибрирани прагове - константите по-долу са
+// начална точка за калибрация след реална telemetry, не постоянни стойности.
+const DISCOVERY_BASELINE_EMA_ALPHA = 0.3; // тежест на новия tick в rolling средната на монетата
+const DISCOVERY_MIN_BASELINE_TICKS = 3; // под толкова тикове baseline-ът се счита за "все още узряващ"
+const DISCOVERY_ACTIVITY_MAX_SCORE = 5;
+
+// Сурови delta метрики между ДВА последователни bulk /ticker24hr snapshot-а
+// за ЕДНА монета. Нищо стателно, нищо мрежово - чисто аритметика. curr.high/
+// curr.low са rolling 24ч стойности (не "интервален" high/low), затова
+// newHigh/newLow тук значат "точно в тоя snapshot е зададен НОВ 24ч екстремум"
+// - директен, чист сигнал за "накъде точно сега", без нужда от допълнителни
+// заявки за истински интервален range.
+function calcDiscoverySnapshotMetrics(prev, curr) {
+  if (!prev || !curr) return null;
+  const volumeDelta = curr.quoteVolume - prev.quoteVolume;
+  const countDelta = curr.count - prev.count;
+  const priceDeltaPct = prev.price > 0 ? ((curr.price - prev.price) / prev.price) * 100 : 0;
+  const rangePct = curr.price > 0 ? ((curr.high - curr.low) / curr.price) * 100 : 0;
+  const newHigh = curr.high > prev.high;
+  const newLow = curr.low < prev.low;
+  return { volumeDelta, countDelta, priceDeltaPct, rangePct, newHigh, newLow };
+}
+
+// Пази rolling (EMA) собствена база на монетата - volumeRatio/countRatio се
+// смятат СПРЯМО СОБСТВЕНАТА история на монетата, никога спрямо други монети
+// (малка монета никога не може честно да се сравнява по абсолютен обем с
+// BTC). Извиква се СЛЕД score/direction/confidence за тоя tick (виж
+// договорката по-горе) - връща НОВИЯ baseline за следващия tick, не мутира
+// подадения.
+function updateDiscoveryBaseline(baseline, metrics, direction) {
+  const b = baseline || {
+    ticks: 0, avgVolumeDelta: 0, avgCountDelta: 0, avgRangePct: 0,
+    lastVolumeDelta: null, lastRangePct: null, prevRangePct: null, lastDirection: null,
+  };
+  if (!metrics) return b;
+  const volumeDeltaClamped = Math.max(0, metrics.volumeDelta);
+  const countDeltaClamped = Math.max(0, metrics.countDelta);
+  const alpha = b.ticks === 0 ? 1 : DISCOVERY_BASELINE_EMA_ALPHA; // първи tick - директно сядане, не EMA
+  return {
+    ticks: b.ticks + 1,
+    avgVolumeDelta: b.avgVolumeDelta + alpha * (volumeDeltaClamped - b.avgVolumeDelta),
+    avgCountDelta: b.avgCountDelta + alpha * (countDeltaClamped - b.avgCountDelta),
+    avgRangePct: b.avgRangePct + alpha * (metrics.rangePct - b.avgRangePct),
+    lastVolumeDelta: volumeDeltaClamped,
+    prevRangePct: b.lastRangePct,
+    lastRangePct: metrics.rangePct,
+    lastDirection: direction,
+  };
+}
+
+// DISCOVERY ACTIVITY SCORE - "колко необичайна/ускоряваща се е активността",
+// НЕ посока. volumeRatio/countRatio = тоя tick спрямо СОБСТВЕНАТА rolling
+// средна (null, ако baseline-ът още няма история). acceleration = тоя tick
+// delta-та е по-голяма от ПРЕДИШНАТА delta (втора производна - истинско
+// ускорение, не просто "голямо е"). compressionExpansion = диапазонът се е
+// свивал (baseline.prevRangePct -> baseline.lastRangePct) и СЕГА се разширява
+// (baseline.lastRangePct -> metrics.rangePct) - класическата "coiled spring"
+// сигнатура.
+function calcDiscoveryActivityScore(metrics, baseline) {
+  if (!metrics) {
+    return {
+      score: 0, acceleration: false, compressionExpansion: false,
+      wasCompressing: false, nowExpanding: false, volumeRatio: null, countRatio: null,
+    };
+  }
+  const hasBaseline = !!(baseline && baseline.ticks > 0);
+  const volumeRatio = hasBaseline && baseline.avgVolumeDelta > 0
+    ? Math.max(0, metrics.volumeDelta) / baseline.avgVolumeDelta : null;
+  const countRatio = hasBaseline && baseline.avgCountDelta > 0
+    ? Math.max(0, metrics.countDelta) / baseline.avgCountDelta : null;
+  const acceleration = !!(hasBaseline && baseline.lastVolumeDelta != null && baseline.lastVolumeDelta > 0
+    && metrics.volumeDelta > baseline.lastVolumeDelta);
+  // Разбити на отделни полета (не само крайния compressionExpansion boolean) -
+  // telemetry-то трябва да пази СУРОВИТЕ trigger metrics, за да можем после да
+  // разберем ЗАЩО дадена монета е получила дадения score, не само колко е бил.
+  const wasCompressing = !!(hasBaseline && baseline.lastRangePct != null && baseline.prevRangePct != null
+    && baseline.lastRangePct < baseline.prevRangePct);
+  const nowExpanding = !!(hasBaseline && baseline.lastRangePct != null && metrics.rangePct > baseline.lastRangePct);
+  const compressionExpansion = wasCompressing && nowExpanding;
+
+  let score = 0;
+  if (volumeRatio != null) score += Math.min(2, volumeRatio);
+  if (countRatio != null) score += Math.min(1, countRatio * 0.5);
+  if (acceleration) score += 1;
+  if (compressionExpansion) score += 1;
+  score = Math.min(DISCOVERY_ACTIVITY_MAX_SCORE, score);
+
+  return { score, acceleration, compressionExpansion, wasCompressing, nowExpanding, volumeRatio, countRatio };
+}
+
+// DISCOVERY DIRECTION - LONG/SHORT/NEUTRAL. Умишлено НЕ от priceChangePercent
+// сам по себе си - изисква посоката на цената в СЪЩИЯ прозорец да СЪВПАДА с
+// коя страна на диапазона се е разширила (нов high при качване, нов low при
+// падане). Ако не съвпадат (или няма ясен нов екстремум) -> NEUTRAL, валидна
+// класификация сама по себе си (BUILD-UP без ясна посока още).
+function calcDiscoveryDirection(metrics) {
+  if (!metrics) return 'neutral';
+  const priceUp = metrics.priceDeltaPct > 0;
+  const priceDown = metrics.priceDeltaPct < 0;
+  if (priceUp && metrics.newHigh && !metrics.newLow) return 'long';
+  if (priceDown && metrics.newLow && !metrics.newHigh) return 'short';
+  return 'neutral';
+}
+
+// DISCOVERY CONFIDENCE (0-1) - колко убедителна е класификацията, НЕЗАВИСИМО
+// от Activity Score. v1 умишлено БЕЗ funding модификатор (виж чата - orязан
+// scope, funding идва по-късно като допълнение). Фактори: (а) достатъчно
+// история за да имаме доверие в baseline-а, (б) посоката е ясна (не neutral),
+// (в) наказание, ако посоката точно СЕГА се е обърнала спрямо предишния
+// snapshot (флип-флоп = ниско доверие дори при висок Activity).
+function calcDiscoveryConfidence(metrics, baseline, direction) {
+  if (!metrics) return 0;
+  let confidence = 0;
+  const hasEnoughHistory = !!(baseline && baseline.ticks >= DISCOVERY_MIN_BASELINE_TICKS);
+  if (hasEnoughHistory) confidence += 0.4;
+  if (direction !== 'neutral') confidence += 0.3;
+  const priorDirection = baseline ? baseline.lastDirection : null;
+  const flipped = !!(priorDirection && direction !== 'neutral' && priorDirection !== 'neutral' && priorDirection !== direction);
+  if (flipped) confidence -= 0.3;
+  return Math.max(0, Math.min(1, confidence));
+}
+
 export { calcDCALevels, checkDcaLevels, checkPriceLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals, checkMacroSqueeze };
 
 export default {
