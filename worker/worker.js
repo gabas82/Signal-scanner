@@ -1961,6 +1961,35 @@ function calcOutcomePct(direction, entryPrice, laterPrice) {
 // брой по decision/symbol/direction, среден ENTRY SCORE, среден
 // chaseDistance/ATR, outcome статистика (win rate = дял записи с
 // положителен outcome15m).
+// Помощен агрегатор за "decision бройки + outcome статистика" по произволен
+// ключ (entryScore/confirmation15m/flowState) - огледално на основната outcome
+// логика в buildTelemetrySummary, само parametrized по bucket key, за да не се
+// дублира изчислението на win rate/avgOutcomePct на 3 места.
+function makeOutcomeBucket() {
+  return { confirmed: 0, missed: 0, veto: 0, outcome: { count: 0, avgOutcomePct: null, winRatePct: null }, _sum: 0, _count: 0, _wins: 0 };
+}
+function addToOutcomeBucket(bucket, r) {
+  if (r.decision === 'confirmed' || r.decision === 'missed' || r.decision === 'veto') bucket[r.decision]++;
+  if (r.outcome15m != null) {
+    bucket._sum += r.outcome15m; bucket._count++;
+    if (r.outcome15m > 0) bucket._wins++;
+  }
+}
+function finalizeOutcomeBucket(bucket) {
+  if (bucket._count) {
+    bucket.outcome.count = bucket._count;
+    bucket.outcome.avgOutcomePct = bucket._sum / bucket._count;
+    bucket.outcome.winRatePct = (bucket._wins / bucket._count) * 100;
+  }
+  delete bucket._sum; delete bucket._count; delete bucket._wins;
+  return bucket;
+}
+
+// Diagnostic-only разширение (виж discussion за 100% SHORT bias/-0.071% avg
+// outcome) - breakdown по entryScore/confirmation15m/flowState, за да
+// локализираме ОТКЪДЕ идва bias-ът, БЕЗ да пипаме ENTRY ENGINE механиката.
+// Чисто observability, наблюдение над вече записаните полета - никакви нови
+// KV четения тук (виж /telemetry ендпойнта, records вече е зареден там).
 function buildTelemetrySummary(records) {
   const summary = {
     totalConfirmed: 0, totalMissed: 0, totalVeto: 0,
@@ -1968,6 +1997,9 @@ function buildTelemetrySummary(records) {
     byDirection: { long: { confirmed: 0, missed: 0, veto: 0 }, short: { confirmed: 0, missed: 0, veto: 0 } },
     avgEntryScore: null, avgChaseDistanceAtrRatio: null,
     outcome: { count: 0, avgOutcomePct: null, winRatePct: null },
+    byEntryScore: {},
+    byConfirmation15m: { true: makeOutcomeBucket(), false: makeOutcomeBucket() },
+    byFlowState: {},
   };
   let scoreSum = 0, scoreCount = 0, chaseSum = 0, chaseCount = 0, outcomeSum = 0, outcomeCount = 0, outcomeWins = 0;
   for (const r of records) {
@@ -1981,6 +2013,18 @@ function buildTelemetrySummary(records) {
     if (r.decision === 'confirmed' && r.entryScore != null) { scoreSum += r.entryScore; scoreCount++; }
     if (r.chaseDistanceAtrRatio != null) { chaseSum += r.chaseDistanceAtrRatio; chaseCount++; }
     if (r.outcome15m != null) { outcomeSum += r.outcome15m; outcomeCount++; if (r.outcome15m > 0) outcomeWins++; }
+
+    if (r.entryScore != null) {
+      if (!summary.byEntryScore[r.entryScore]) summary.byEntryScore[r.entryScore] = makeOutcomeBucket();
+      addToOutcomeBucket(summary.byEntryScore[r.entryScore], r);
+    }
+    if (r.confirmation15m === true || r.confirmation15m === false) {
+      addToOutcomeBucket(summary.byConfirmation15m[String(r.confirmation15m)], r);
+    }
+    if (r.flowState) {
+      if (!summary.byFlowState[r.flowState]) summary.byFlowState[r.flowState] = makeOutcomeBucket();
+      addToOutcomeBucket(summary.byFlowState[r.flowState], r);
+    }
   }
   if (scoreCount) summary.avgEntryScore = scoreSum / scoreCount;
   if (chaseCount) summary.avgChaseDistanceAtrRatio = chaseSum / chaseCount;
@@ -1989,7 +2033,32 @@ function buildTelemetrySummary(records) {
     summary.outcome.avgOutcomePct = outcomeSum / outcomeCount;
     summary.outcome.winRatePct = (outcomeWins / outcomeCount) * 100;
   }
+  for (const key of Object.keys(summary.byEntryScore)) finalizeOutcomeBucket(summary.byEntryScore[key]);
+  finalizeOutcomeBucket(summary.byConfirmation15m.true);
+  finalizeOutcomeBucket(summary.byConfirmation15m.false);
+  for (const key of Object.keys(summary.byFlowState)) finalizeOutcomeBucket(summary.byFlowState[key]);
   return summary;
+}
+
+// ENTRY ENGINE STAGE DIRECTION COUNTS - diagnostic-only брояч на LONG/SHORT
+// разпределението на SETUP/ARMED (не само терминалния ENTRY, виж
+// buildTelemetryRecord по-горе) - единствения начин да разберем дали SHORT
+// bias-ът е upstream (липсва LONG още при SETUP) или се филтрира едва на
+// ENTRY TRIGGER (Stage 3) гейта. Чист pure reducer - KV wiring-ът е в
+// scanSymbolSignals (виж "STAGE DIRECTION COUNTS" коментара там), best-effort
+// и напълно изолиран от CORE (никога не хвърля нагоре).
+function incrementStageDirectionCount(counts, stage, direction) {
+  const base = (counts && typeof counts === 'object') ? counts : {};
+  const prevSetup = (base.setup && typeof base.setup === 'object') ? base.setup : {};
+  const prevArmed = (base.armed && typeof base.armed === 'object') ? base.armed : {};
+  const next = {
+    setup: { long: prevSetup.long || 0, short: prevSetup.short || 0 },
+    armed: { long: prevArmed.long || 0, short: prevArmed.short || 0 },
+  };
+  if ((stage === 'setup' || stage === 'armed') && (direction === 'long' || direction === 'short')) {
+    next[stage][direction]++;
+  }
+  return next;
 }
 
 // ═══ IDEA 04 - "VALUE MIGRATION" ═══════════════════════════════════════════════
@@ -3209,6 +3278,18 @@ async function scanSymbolSignals(env, symbol) {
   if (setupFired) markSetupFired(state, setupState.direction, setupState.score, price);
   if (!setupState.direction) state.setup = null; // деактивирано - следваща активация ще пали НАНОВО
 
+  // STAGE DIRECTION COUNTS (diagnostic-only, виж incrementStageDirectionCount
+  // по-горе) - best-effort read-modify-write на ЕДИН споделен KV brojач,
+  // изолиран в try/catch - failure тук НИКОГА не бива да чупи SETUP/ARMED/
+  // ENTRY логиката по-долу.
+  if (setupFired && env.ALERT_STATE) {
+    try {
+      const raw = await env.ALERT_STATE.get('entryenginestagecounts');
+      const counts = incrementStageDirectionCount(raw ? JSON.parse(raw) : null, 'setup', setupState.direction);
+      await env.ALERT_STATE.put('entryenginestagecounts', JSON.stringify(counts));
+    } catch (e) { /* observability only - никога не бива да чупи CORE */ }
+  }
+
   // ENTRY ENGINE - ЕТАП 2: "ARMED" (виж calcArmedTrigger по-горе) - чисто
   // structure/price-action, БЕЗ momentum/CVD/OI (за Етап 3). Реюзва вече
   // изтеглената c5Closed - БЕЗ нови мрежови заявки. ARMED е sticky - веднъж
@@ -3232,6 +3313,14 @@ async function scanSymbolSignals(env, symbol) {
       // и дискусията защо currentSwingReference е правилната референция).
       state.armed = { direction: armedDirection, at: Date.now(), priceAtArm: price };
       armedFired = true;
+      // STAGE DIRECTION COUNTS (diagnostic-only) - виж коментара при SETUP по-горе.
+      if (env.ALERT_STATE) {
+        try {
+          const raw = await env.ALERT_STATE.get('entryenginestagecounts');
+          const counts = incrementStageDirectionCount(raw ? JSON.parse(raw) : null, 'armed', armedDirection);
+          await env.ALERT_STATE.put('entryenginestagecounts', JSON.stringify(counts));
+        } catch (e) { /* observability only - никога не бива да чупи CORE */ }
+      }
     }
   }
   const armedDirection = state.armed ? state.armed.direction : null;
@@ -4721,10 +4810,21 @@ export default {
       }
       records.sort((a, b) => b.at - a.at); // най-новите първи
 
+      // STAGE DIRECTION COUNTS (diagnostic-only, виж incrementStageDirectionCount
+      // по-горе) - LONG/SHORT разпределение ОЩЕ при SETUP/ARMED, не само при
+      // терминалния ENTRY (records по-горе) - локализира дали SHORT bias-ът е
+      // upstream или идва едва от Stage 3 (ENTRY TRIGGER) гейта.
+      let stageDirectionCounts = { setup: { long: 0, short: 0 }, armed: { long: 0, short: 0 } };
+      try {
+        const rawCounts = await env.ALERT_STATE.get('entryenginestagecounts');
+        if (rawCounts) stageDirectionCounts = JSON.parse(rawCounts);
+      } catch (e) { /* observability only */ }
+
       return new Response(JSON.stringify({
         count: records.length, truncated,
         records: records.slice(0, limit),
         summary: buildTelemetrySummary(records),
+        stageDirectionCounts,
       }), { headers: { "Content-Type": "application/json" } });
     }
 

@@ -127,7 +127,7 @@ Dashboard → orange-grass-d809 → **Settings → Triggers → Cron Triggers �
 - `since` / `until` — Unix ms timestamp граница
 - `limit` — макс. брой върнати записи (default 100, таван 500)
 
-Отговорът съдържа `records` (масив, най-новите първи) и `summary` (общ брой по decision/symbol/direction, среден ENTRY SCORE, среден chaseDistance/ATR, outcome статистика за наличните +15м хоризонти).
+Отговорът съдържа `records` (масив, най-новите първи), `summary` (общ брой по decision/symbol/direction, среден ENTRY SCORE, среден chaseDistance/ATR, outcome статистика за наличните +15м хоризонти, плюс diagnostic-only breakdown-и `byEntryScore`/`byConfirmation15m`/`byFlowState` — брой confirmed/missed/veto и outcome avg%/winRate% за всяка стойност, за локализиране на bias/loss причини без промяна на праговете) и `stageDirectionCounts` (diagnostic-only LONG/SHORT брояч ОЩЕ при SETUP/ARMED, не само при терминалния ENTRY — вижда се дали дадена посока липсва upstream от самото SETUP, или се филтрира едва на Stage 3/ENTRY TRIGGER гейта; best-effort KV брояч, изолиран от CORE логиката).
 
 Примери:
 ```
