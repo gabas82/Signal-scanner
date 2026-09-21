@@ -4439,6 +4439,37 @@ async function updateDiscoveryEpisodes(env, pool) {
   }
 }
 
+// Lifetime (мин) на ЕДИН episode, изчислен само за вече напуснали pool-а
+// (exitedAt зададен) - чисто описателна метрика, никаква логика не я чете
+// обратно.
+function calcDiscoveryEpisodeLifetimeMin(episode) {
+  if (episode.exitedAt == null || episode.enteredAt == null) return null;
+  return (episode.exitedAt - episode.enteredAt) / 60000;
+}
+
+// Стандартна линейна интерполация - sortedValues ТРЯБВА да е вече сортиран
+// възходящо. Връща null за празен масив.
+function calcPercentile(sortedValues, p) {
+  if (!sortedValues.length) return null;
+  const idx = (p / 100) * (sortedValues.length - 1);
+  const lower = Math.floor(idx), upper = Math.ceil(idx);
+  if (lower === upper) return sortedValues[lower];
+  return sortedValues[lower] + (sortedValues[upper] - sortedValues[lower]) * (idx - lower);
+}
+
+// avg/median/p25/p75 на масив от lifetimeMin стойности - null полета при
+// празен вход (без throw).
+function calcLifetimeStats(lifetimes) {
+  if (!lifetimes.length) return { avgLifetimeMin: null, medianLifetimeMin: null, p25LifetimeMin: null, p75LifetimeMin: null };
+  const sorted = [...lifetimes].sort((a, b) => a - b);
+  return {
+    avgLifetimeMin: lifetimes.reduce((a, b) => a + b, 0) / lifetimes.length,
+    medianLifetimeMin: calcPercentile(sorted, 50),
+    p25LifetimeMin: calcPercentile(sorted, 25),
+    p75LifetimeMin: calcPercentile(sorted, 75),
+  };
+}
+
 // Агрегира вече заредени/филтрирани discoveryepisode: записи (чисто
 // in-memory, БЕЗ KV достъп тук - виж /discovery-episodes ендпойнта по-долу),
 // огледално на buildTelemetrySummary по-горе.
@@ -4457,13 +4488,32 @@ function buildDiscoveryEpisodeSummary(episodes) {
     avgPctMoveToSetup: null, avgPctMoveToArmed: null, avgPctMoveToEntry: null,
     avgAtrMoveToEntry: null,
     outcome: { count: 0, avgOutcomePct: null, winRatePct: null },
+    // Колко реално време (мин) е получил един DISCOVERY кандидат, преди да
+    // напусне pool-а БЕЗ да стигне SETUP - само измежду exited_before_setup
+    // (не и "прогресирал, после напуснал" - за тях въпросът "получи ли
+    // достатъчно време" вече е неактуален, стигнал е SETUP). Чисто
+    // observability - НЕ участва в ranking/eviction/thresholds.
+    lifetime: {
+      avgLifetimeMin: null, medianLifetimeMin: null, p25LifetimeMin: null, p75LifetimeMin: null,
+      byExitReason: { ttl: null, weak_score: null, displaced: null },
+    },
   };
-  const acc = { leadSetup: [], leadArmed: [], leadEntry: [], pctSetup: [], pctArmed: [], pctEntry: [], atrEntry: [], outcomes: [] };
+  const acc = {
+    leadSetup: [], leadArmed: [], leadEntry: [], pctSetup: [], pctArmed: [], pctEntry: [], atrEntry: [], outcomes: [],
+    lifetimesAll: [], lifetimesByReason: { ttl: [], weak_score: [], displaced: [] },
+  };
   for (const ep of episodes) {
     if (summary.byStatus[ep.status] != null) summary.byStatus[ep.status]++;
     const poolStatus = classifyDiscoveryEpisodePoolStatus(ep);
     summary.byPoolStatus[poolStatus]++;
-    if (poolStatus === 'exited_before_setup' && summary.byExitReason[ep.exitReason] != null) summary.byExitReason[ep.exitReason]++;
+    if (poolStatus === 'exited_before_setup') {
+      if (summary.byExitReason[ep.exitReason] != null) summary.byExitReason[ep.exitReason]++;
+      const lifetimeMin = calcDiscoveryEpisodeLifetimeMin(ep);
+      if (lifetimeMin != null) {
+        acc.lifetimesAll.push(lifetimeMin);
+        if (acc.lifetimesByReason[ep.exitReason]) acc.lifetimesByReason[ep.exitReason].push(lifetimeMin);
+      }
+    }
     summary.bySymbol[ep.symbol] = (summary.bySymbol[ep.symbol] || 0) + 1;
     const d = ep.derived || {};
     if (d.leadTimeSetupMin != null) acc.leadSetup.push(d.leadTimeSetupMin);
@@ -4486,6 +4536,14 @@ function buildDiscoveryEpisodeSummary(episodes) {
   summary.outcome.count = acc.outcomes.length;
   summary.outcome.avgOutcomePct = avg(acc.outcomes);
   summary.outcome.winRatePct = acc.outcomes.length ? (acc.outcomes.filter((o) => o > 0).length / acc.outcomes.length) * 100 : null;
+  summary.lifetime = {
+    ...calcLifetimeStats(acc.lifetimesAll),
+    byExitReason: {
+      ttl: calcLifetimeStats(acc.lifetimesByReason.ttl),
+      weak_score: calcLifetimeStats(acc.lifetimesByReason.weak_score),
+      displaced: calcLifetimeStats(acc.lifetimesByReason.displaced),
+    },
+  };
   return summary;
 }
 
