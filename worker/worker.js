@@ -1971,10 +1971,48 @@ function calcEntryTrigger({ direction, candle5m, atr5m, candle15m, atr15m, struc
 
 // ═══ ENTRY ENGINE - TELEMETRY (диагностика, НЕ променя ENTRY логиката) ═════════
 // Записва структурирани данни за всяко ENTRY CONFIRMED/MISSED/VETO събитие,
-// плюс outcome след фиксиран прозорец (+15м) - изцяло observability слой, не
-// участва в score/gate решенията по-горе. Собствен KV namespace (telemetry:),
-// не се чете обратно от ENTRY логиката.
-const TELEMETRY_OUTCOME_WINDOW_MIN = 15;
+// плюс outcome на НЯКОЛКО хоризонта (+5м/+15м/+30м/+60м, виж
+// buildPendingOutcomeHorizons/resolvePendingOutcomeHorizons по-долу) - изцяло
+// observability слой, не участва в score/gate решенията по-горе. Собствен KV
+// namespace (telemetry:), не се чете обратно от ENTRY логиката.
+//
+// Диагностичен въпрос: двата SETUP режима (MEAN REVERSION/TREND CONTINUATION)
+// може да имат различен "правилен" outcome прозорец - +15м може да пасва на
+// единия, но да е твърде рано/късно за другия. Всичките 4 хоризонта се смятат
+// от ЕДНА и съща вече изтеглена `price` (виж wiring-а в scanSymbolSignals) -
+// БЕЗ никакви нови мрежови заявки, само по-нататъшно изчакване на съществуващия
+// tick цикъл.
+const OUTCOME_HORIZONS_MIN = [5, 15, 30, 60];
+
+// Изгражда "чакащите" хоризонти за един нов telemetry запис - чист pure
+// helper, извикван веднъж при confirmed/missed решение (виж wiring-а).
+function buildPendingOutcomeHorizons(recordAt) {
+  const horizons = {};
+  for (const m of OUTCOME_HORIZONS_MIN) horizons[`m${m}`] = { dueAt: recordAt + m * 60000, resolved: false };
+  return horizons;
+}
+
+// Резолвира ГОТОВИТЕ (due) хоризонти на ЕДИН pending outcome запис спрямо
+// текущата вече изтеглена `price` - връща { updates, allResolved }. Мутира
+// pending.horizons[...].resolved на място (огледално на updateSwingStructure/
+// markSetupFired другаде в този файл - установен прецедент за state мутация).
+// `now` е explicit параметър (default Date.now()) единствено за да остане
+// тестваема - реалният call site не подава нищо различно от текущото време.
+function resolvePendingOutcomeHorizons(pending, price, now = Date.now()) {
+  const updates = {};
+  let allResolved = true;
+  for (const field of Object.keys(pending.horizons)) {
+    const h = pending.horizons[field];
+    if (h.resolved) continue;
+    if (now >= h.dueAt && price != null) {
+      updates[`outcome${field.slice(1)}m`] = calcOutcomePct(pending.direction, pending.entryPrice, price);
+      h.resolved = true;
+    } else {
+      allResolved = false;
+    }
+  }
+  return { updates, allResolved };
+}
 
 function calcFlowState(flowVeto, flowBoost) {
   if (flowVeto) return 'opposing';
@@ -1986,7 +2024,7 @@ function buildTelemetryRecord({
   symbol, direction, decision, setupScore, setupBreakdown, armedAt, structRef,
   triggerClose, atr5m, triggerRange, confirmation15m, flowState,
   trapTier, trapDirection, flowWarmingTier, flowWarmingDirection, entryScore,
-  setupMode,
+  setupMode, htfAligned,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
   return {
@@ -2005,7 +2043,13 @@ function buildTelemetryRecord({
     // Задължително подадено от call site-а (не се предполага default), за да не
     // се скрие случайно неправилна стойност.
     setupMode,
-    outcome15m: null, // попълва се по-късно от finalizePendingOutcomes/wiring-а в scanSymbolSignals
+    // HTF CONTEXT (Stage 3 trend4h/emaFilter alignment) - само за entryResult.
+    // status==='entry' calcEntryTrigger връща htfAligned; за missed/veto няма
+    // (никога не се изчислява confirmation15m score-а дотам) - оставаме null,
+    // не се предполага false, за да различаваме "не се е стигнало до проверка"
+    // от "проверено и НЕ съвпада".
+    htfAligned: htfAligned ?? null,
+    outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, // попълват се по-късно от resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals
   };
 }
 
@@ -2051,6 +2095,73 @@ function finalizeOutcomeBucket(bucket) {
 // локализираме ОТКЪДЕ идва bias-ът, БЕЗ да пипаме ENTRY ENGINE механиката.
 // Чисто observability, наблюдение над вече записаните полета - никакви нови
 // KV четения тук (виж /telemetry ендпойнта, records вече е зареден там).
+// Общ pure builder за "breakdown по произволен ключ" (виж byEntryScore/
+// byFlowState по-горе - вече установен образец) - keyFn(record) връща bucket
+// ключ (string) или null/undefined за "пропусни записа". allowedKeys предварително
+// инициализира тези бъкети дори при 0 записи (за да не липсват от JSON
+// отговора), но keyFn може да върне и НЕсписъчен (динамичен) ключ - напр.
+// setupScore стойностите.
+function buildKeyedOutcomeBreakdown(records, keyFn, allowedKeys = []) {
+  const out = {};
+  for (const k of allowedKeys) out[k] = makeOutcomeBucket();
+  for (const r of records) {
+    const k = keyFn(r);
+    if (k == null) continue;
+    if (!out[k]) out[k] = makeOutcomeBucket();
+    addToOutcomeBucket(out[k], r);
+  }
+  for (const k of Object.keys(out)) finalizeOutcomeBucket(out[k]);
+  return out;
+}
+function directionKey(r) { return (r.direction === 'long' || r.direction === 'short') ? r.direction : null; }
+function setupScoreKey(r) { return r.setupScore != null ? String(r.setupScore) : null; }
+function confirmation15mKey(r) { return (r.confirmation15m === true || r.confirmation15m === false) ? String(r.confirmation15m) : null; }
+// 'none' покрива и исторически записи отпреди добавянето на htfAligned полето
+// (винаги undefined за тях) - "не сме проверили", различно от "проверено и не съвпада".
+function htfAlignedKey(r) { return r.htfAligned === true ? 'aligned' : r.htfAligned === false ? 'notAligned' : 'none'; }
+function setupModeKey(r) { return (r.setupMode === 'mean_reversion' || r.setupMode === 'trend_continuation') ? r.setupMode : null; }
+// CHASE_MAX_ATR_MULTIPLE (вече съществуващ Stage 3 chase-protection праг) се
+// реюзва тук САМО като описателна bucket граница - диагностика, не нов gate.
+function chaseDistanceBucketKey(r) {
+  const ratio = r.chaseDistanceAtrRatio;
+  if (ratio == null) return null;
+  if (ratio < 0.5) return 'lt0_5';
+  if (ratio < 1.0) return 'from0_5to1';
+  if (ratio < CHASE_MAX_ATR_MULTIPLE) return 'from1to1_5';
+  return 'gte1_5';
+}
+// Диагностичен въпрос: "confirmation15m=false бие true - навсякъде ли, или
+// само при конкретна комбинация?" - добавя 4-те разреза directly ВЪТРЕ в
+// вече изчисления true/false бъкет (мутира на място).
+function attachConfirmation15mCrossBreakdowns(bucket, records) {
+  bucket.bySetupMode = buildKeyedOutcomeBreakdown(records, setupModeKey, ['mean_reversion', 'trend_continuation']);
+  bucket.byDirection = buildKeyedOutcomeBreakdown(records, directionKey, ['long', 'short']);
+  bucket.bySetupScore = buildKeyedOutcomeBreakdown(records, setupScoreKey);
+  bucket.byHtfAligned = buildKeyedOutcomeBreakdown(records, htfAlignedKey, ['aligned', 'notAligned', 'none']);
+  return bucket;
+}
+// Диагностичен breakdown СПЕЦИФИЧНО за TREND CONTINUATION (и огледално MEAN
+// REVERSION, за симетрия) - direction/quality/confirmation15m/HTF/chase-distance,
+// всичко вече записано в telemetry записите, БЕЗ нов fetch.
+function attachSetupModeCrossBreakdowns(bucket, records) {
+  bucket.byDirection = buildKeyedOutcomeBreakdown(records, directionKey, ['long', 'short']);
+  bucket.bySetupScore = buildKeyedOutcomeBreakdown(records, setupScoreKey);
+  bucket.byConfirmation15m = buildKeyedOutcomeBreakdown(records, confirmation15mKey, ['true', 'false']);
+  bucket.byHtfAligned = buildKeyedOutcomeBreakdown(records, htfAlignedKey, ['aligned', 'notAligned', 'none']);
+  bucket.byChaseDistanceBucket = buildKeyedOutcomeBreakdown(records, chaseDistanceBucketKey, ['lt0_5', 'from0_5to1', 'from1to1_5', 'gte1_5']);
+  return bucket;
+}
+// avg/win-rate за произволно outcome поле (outcome5m/15m/30m/60m) - реюзвано
+// за outcomeByHorizon по-долу, за да не дублираме 4 пъти същото броене.
+function buildOutcomeStatsForField(records, field) {
+  let sum = 0, count = 0, wins = 0;
+  for (const r of records) {
+    const v = r[field];
+    if (v != null) { sum += v; count++; if (v > 0) wins++; }
+  }
+  return { count, avgOutcomePct: count ? sum / count : null, winRatePct: count ? (wins / count) * 100 : null };
+}
+
 function buildTelemetrySummary(records) {
   const summary = {
     totalConfirmed: 0, totalMissed: 0, totalVeto: 0,
@@ -2104,6 +2215,34 @@ function buildTelemetrySummary(records) {
   for (const key of Object.keys(summary.byFlowState)) finalizeOutcomeBucket(summary.byFlowState[key]);
   finalizeOutcomeBucket(summary.bySetupMode.mean_reversion);
   finalizeOutcomeBucket(summary.bySetupMode.trend_continuation);
+
+  // Diagnostic cross-breakdowns (виж заявката: "откъде идва confirmation15m
+  // аномалията" + "TREND CONTINUATION breakdown") - изцяло върху вече
+  // изчислените в паметта `records`, БЕЗ нови KV четения.
+  const true15Records = records.filter((r) => r.confirmation15m === true);
+  const false15Records = records.filter((r) => r.confirmation15m === false);
+  attachConfirmation15mCrossBreakdowns(summary.byConfirmation15m.true, true15Records);
+  attachConfirmation15mCrossBreakdowns(summary.byConfirmation15m.false, false15Records);
+
+  const meanReversionRecords = records.filter((r) => r.setupMode === 'mean_reversion');
+  const trendContinuationRecords = records.filter((r) => r.setupMode === 'trend_continuation');
+  attachSetupModeCrossBreakdowns(summary.bySetupMode.mean_reversion, meanReversionRecords);
+  attachSetupModeCrossBreakdowns(summary.bySetupMode.trend_continuation, trendContinuationRecords);
+
+  // Multi-horizon outcome (виж заявката: "+15м може да пасва на единия режим,
+  // не и на другия") - reuse-ва вече записаните outcome5m/15m/30m/60m полета,
+  // без нов fetch.
+  summary.outcomeByHorizon = {};
+  for (const m of OUTCOME_HORIZONS_MIN) {
+    const field = `outcome${m}m`;
+    summary.outcomeByHorizon[`m${m}`] = {
+      overall: buildOutcomeStatsForField(records, field),
+      bySetupMode: {
+        mean_reversion: buildOutcomeStatsForField(meanReversionRecords, field),
+        trend_continuation: buildOutcomeStatsForField(trendContinuationRecords, field),
+      },
+    };
+  }
   return summary;
 }
 
@@ -3434,7 +3573,7 @@ async function scanSymbolSignals(env, symbol) {
         flowState: calcFlowState(flowVeto, flowBoost),
         trapTier, trapDirection, flowWarmingTier, flowWarmingDirection,
         entryScore: entryResult.score,
-        setupMode: 'mean_reversion',
+        setupMode: 'mean_reversion', htfAligned: entryResult.htfAligned,
       });
       if (env.ALERT_STATE) {
         // setupMode-суфикс в KV ключа - предпазва от презаписване, ако
@@ -3446,7 +3585,7 @@ async function scanSymbolSignals(env, symbol) {
         if (decision === 'confirmed' || decision === 'missed') {
           if (!state.pendingOutcomes) state.pendingOutcomes = [];
           state.pendingOutcomes.push({
-            key: telemetryKey, dueAt: record.at + TELEMETRY_OUTCOME_WINDOW_MIN * 60000,
+            key: telemetryKey, horizons: buildPendingOutcomeHorizons(record.at),
             entryPrice: record.triggerClose, direction: entryDirection,
           });
         }
@@ -3523,7 +3662,7 @@ async function scanSymbolSignals(env, symbol) {
         flowState: calcFlowState(flowVeto, flowBoost),
         trapTier, trapDirection, flowWarmingTier, flowWarmingDirection,
         entryScore: trendEntryResult.score,
-        setupMode: 'trend_continuation',
+        setupMode: 'trend_continuation', htfAligned: trendEntryResult.htfAligned,
       });
       if (env.ALERT_STATE) {
         const telemetryKey = `telemetry:${symbol}:${record.at}:${record.setupMode}`;
@@ -3531,7 +3670,7 @@ async function scanSymbolSignals(env, symbol) {
         if (decision === 'confirmed' || decision === 'missed') {
           if (!state.pendingOutcomes) state.pendingOutcomes = [];
           state.pendingOutcomes.push({
-            key: telemetryKey, dueAt: record.at + TELEMETRY_OUTCOME_WINDOW_MIN * 60000,
+            key: telemetryKey, horizons: buildPendingOutcomeHorizons(record.at),
             entryPrice: record.triggerClose, direction: entryDirection,
           });
         }
@@ -3544,22 +3683,23 @@ async function scanSymbolSignals(env, symbol) {
     }
   }
 
-  // TELEMETRY - довършва "чакащите" outcome записи (+15м прозорец) за ТАЗИ
-  // монета, реюзвайки вече изчислената `price` от тази обиколка - БЕЗ никакви
+  // TELEMETRY - довършва "чакащите" outcome записи (+5м/+15м/+30м/+60м
+  // хоризонти, виж resolvePendingOutcomeHorizons по-горе) за ТАЗИ монета,
+  // реюзвайки вече изчислената `price` от тази обиколка - БЕЗ никакви
   // допълнителни мрежови заявки. Изцяло observability, не влияе на ENTRY.
   if (state.pendingOutcomes && state.pendingOutcomes.length && env.ALERT_STATE) {
     const stillPending = [];
     for (const p of state.pendingOutcomes) {
-      if (Date.now() >= p.dueAt && price != null) {
+      const { updates, allResolved } = resolvePendingOutcomeHorizons(p, price);
+      if (Object.keys(updates).length) {
         const raw = await env.ALERT_STATE.get(p.key);
         if (raw) {
           const rec = JSON.parse(raw);
-          rec.outcome15m = calcOutcomePct(p.direction, p.entryPrice, price);
+          Object.assign(rec, updates);
           await env.ALERT_STATE.put(p.key, JSON.stringify(rec));
         }
-      } else {
-        stillPending.push(p);
       }
+      if (!allResolved) stillPending.push(p);
     }
     state.pendingOutcomes = stillPending;
   }
@@ -4628,7 +4768,7 @@ function applyDiscoveryEpisodeArmed(episode, sigstate) {
 // ATR-нормализирана метрика (умишлено, виж заявката).
 function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord) {
   if (episode.entry || !entryTelemetryRecord) return episode;
-  const { at, decision, triggerClose: entryPrice, entryScore, atr5m, chaseDistanceAtrRatio, outcome15m } = entryTelemetryRecord;
+  const { at, decision, triggerClose: entryPrice, entryScore, atr5m, chaseDistanceAtrRatio, outcome15m, setupMode } = entryTelemetryRecord;
   const leadTimeEntryMin = (at - episode.discovery.at) / 60000;
   const pctMoveToEntry = (entryPrice != null && episode.discovery.price > 0)
     ? ((entryPrice - episode.discovery.price) / episode.discovery.price) * 100 : null;
@@ -4640,6 +4780,10 @@ function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord) {
       at, price: entryPrice, decision, entryScore: entryScore ?? null,
       atr5m: atr5m ?? null, chaseDistanceAtrRatio: chaseDistanceAtrRatio ?? null,
       outcome15m: outcome15m ?? null,
+      // Пазим setupMode, за да можем по-късно да пресъздадем ТОЧНИЯ KV ключ
+      // (telemetry:{symbol}:{at}:{setupMode}, виж updateDiscoveryEpisodes по-долу)
+      // - иначе outcome refresh-ът никога няма да намери записа.
+      setupMode: setupMode ?? null,
     },
     derived: { ...episode.derived, leadTimeEntryMin, pctMoveToEntry, atrMoveToEntry },
     // 'missed'/'veto' нямат смислен outcome за измерване (нищо не е отворено) -
@@ -4731,8 +4875,14 @@ async function updateDiscoveryEpisodes(env, pool) {
       if (!episode.entry) {
         const entryRecord = await findFirstEntryTelemetryRecord(env, member.symbol, episode.discovery.at);
         episode = applyDiscoveryEpisodeEntry(episode, entryRecord);
-      } else if (episode.status === 'entry_pending_outcome') {
-        const rawTelemetry = await env.ALERT_STATE.get(`telemetry:${member.symbol}:${episode.entry.at}`);
+      } else if (episode.status === 'entry_pending_outcome' && episode.entry.setupMode) {
+        // Bug fix: telemetry KV ключът вече включва setupMode суфикс (виж
+        // PR #98) - без него този GET винаги връщаше null и outcome-ът никога
+        // не се опресняваше за episode-и, чийто entry е бил записан след тази
+        // промяна. Стари episode-и без записан entry.setupMode (отпреди фикса)
+        // остават permanently pending - приемливо, самоограничаващо се (виж
+        // прецедента с "phantom active" episode-и от миграции по-рано).
+        const rawTelemetry = await env.ALERT_STATE.get(`telemetry:${member.symbol}:${episode.entry.at}:${episode.entry.setupMode}`);
         const freshRecord = rawTelemetry ? JSON.parse(rawTelemetry) : null;
         episode = applyDiscoveryEpisodeOutcome(episode, freshRecord ? freshRecord.outcome15m : null);
       }
@@ -4770,6 +4920,26 @@ function calcLifetimeStats(lifetimes) {
     medianLifetimeMin: calcPercentile(sorted, 50),
     p25LifetimeMin: calcPercentile(sorted, 25),
     p75LifetimeMin: calcPercentile(sorted, 75),
+  };
+}
+
+// Средни Stage B discovery-time метрики (activityScore/confidence) +
+// direction разпределение за подадена група episode-и - реюзвано за
+// progressedVsDisplaced по-долу.
+function summarizeDiscoveryGroup(episodes) {
+  let activityScoreSum = 0, activityScoreCount = 0, confidenceSum = 0, confidenceCount = 0;
+  const byDirection = { long: 0, short: 0, neutral: 0 };
+  for (const ep of episodes) {
+    const disc = ep.discovery || {};
+    if (disc.activityScore != null) { activityScoreSum += disc.activityScore; activityScoreCount++; }
+    if (disc.confidence != null) { confidenceSum += disc.confidence; confidenceCount++; }
+    if (byDirection[disc.direction] != null) byDirection[disc.direction]++;
+  }
+  return {
+    count: episodes.length,
+    avgActivityScore: activityScoreCount ? activityScoreSum / activityScoreCount : null,
+    avgConfidence: confidenceCount ? confidenceSum / confidenceCount : null,
+    byDirection,
   };
 }
 
@@ -4845,6 +5015,24 @@ function buildDiscoveryEpisodeSummary(episodes) {
       ttl: calcLifetimeStats(acc.lifetimesByReason.ttl),
       weak_score: calcLifetimeStats(acc.lifetimesByReason.weak_score),
       displaced: calcLifetimeStats(acc.lifetimesByReason.displaced),
+    },
+  };
+
+  // Диагностично сравнение "какво отличава progressed кандидатите от масата
+  // displaced" (виж заявката) - по Stage B discovery-time метрики
+  // (activityScore/direction/confidence, immutable снимка от buildDiscoveryEpisode)
+  // + собствения timing profil на всяка група. НЕ участва в ranking/eviction -
+  // чисто наблюдение върху вече записаните episode данни.
+  const progressedEpisodes = episodes.filter((ep) => classifyDiscoveryEpisodePoolStatus(ep) === 'progressed');
+  const displacedEpisodes = episodes.filter((ep) => classifyDiscoveryEpisodePoolStatus(ep) === 'exited_before_setup' && ep.exitReason === 'displaced');
+  summary.progressedVsDisplaced = {
+    progressed: {
+      ...summarizeDiscoveryGroup(progressedEpisodes),
+      avgLeadTimeSetupMin: avg(progressedEpisodes.map((ep) => (ep.derived || {}).leadTimeSetupMin).filter((v) => v != null)),
+    },
+    displaced: {
+      ...summarizeDiscoveryGroup(displacedEpisodes),
+      avgLifetimeMin: avg(displacedEpisodes.map((ep) => calcDiscoveryEpisodeLifetimeMin(ep)).filter((v) => v != null)),
     },
   };
   return summary;
