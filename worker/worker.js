@@ -1682,8 +1682,18 @@ function calcVahValStructureEvent(entry, candle, level) {
     } else if (candle.high >= level && entry.armed) {
       fired = true; eventType = 'rejection'; entry.armed = false; entry.lastEventAt = Date.now();
     }
-  } else if (confirmedBelow) {
-    entry.side = 'below'; // тих "give-back" - не е едно от 4-те събития, само reset на side
+  } else {
+    // Огледално на клона по-горе (bug fix - преди тук НИКОГА не палеше събитие,
+    // дори armed, само тих "give-back" reset на side): confirmedBelow с armed
+    // -> BREAKDOWN (потвърден пробив надолу, SHORT), огледално на reclaim;
+    // low докосва нивото без потвърждение -> BOUNCE (неуспешна атака отгоре,
+    // LONG), огледално на rejection.
+    if (confirmedBelow) {
+      if (entry.armed) { fired = true; eventType = 'breakdown'; entry.armed = false; entry.lastEventAt = Date.now(); }
+      entry.side = 'below';
+    } else if (candle.low <= level && entry.armed) {
+      fired = true; eventType = 'bounce'; entry.armed = false; entry.lastEventAt = Date.now();
+    }
   }
   entry.lastLevel = level;
   // Пази последния РЕАЛЕН eventType (не се трие при give-back/тихи тикове) -
@@ -1697,8 +1707,12 @@ function calcVahValStructureEvent(entry, candle, level) {
 const VAHVAL_LABELS = {
   'vah:reclaim': '📈 VAH RECLAIM',
   'vah:rejection': '📉 VAH REJECTION',
+  'vah:breakdown': '📉 VAH BREAKDOWN',
+  'vah:bounce': '📈 VAH BOUNCE',
   'val:reclaim': '📈 VAL RECLAIM',
   'val:rejection': '📉 VAL REJECTION',
+  'val:breakdown': '📉 VAL BREAKDOWN',
+  'val:bounce': '📈 VAL BOUNCE',
 };
 
 // ═══ ENTRY ENGINE - ЕТАП 1: "SETUP" ═════════════════════════════════════════════
@@ -1712,8 +1726,8 @@ const VAHVAL_LABELS = {
 // SETUP (потвърдено изрично с потребителя - не искаме over-gate на този слой,
 // истинското филтриране идва в по-късните етапи ARMED/ENTRY TRIGGER).
 function vahvalEventDirection(eventType) {
-  if (eventType === 'reclaim') return 'long';
-  if (eventType === 'rejection') return 'short';
+  if (eventType === 'reclaim' || eventType === 'bounce') return 'long';
+  if (eventType === 'rejection' || eventType === 'breakdown') return 'short';
   return null;
 }
 
