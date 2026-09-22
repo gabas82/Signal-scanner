@@ -5039,7 +5039,7 @@ export default {
         records: records.slice(0, limit),
         summary: buildTelemetrySummary(records),
         stageDirectionCounts,
-      }), { headers: { "Content-Type": "application/json" } });
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
     }
 
     // DISCOVERY RADAR - discoveryepisode: read-only debug ендпойнт (Stage F
@@ -5096,7 +5096,7 @@ export default {
         count: records.length, truncated,
         records: records.slice(0, limit),
         summary: buildDiscoveryEpisodeSummary(records),
-      }), { headers: { "Content-Type": "application/json" } });
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
     }
 
     // Whitelist за CoinGlass прокси-то: без него ВСЕКИ path, който не съвпадне
