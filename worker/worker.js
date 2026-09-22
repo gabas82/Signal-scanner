@@ -1773,6 +1773,47 @@ function markSetupFired(state, direction, score, price) {
   state.setup = { direction, score, at: Date.now(), price: price ?? null };
 }
 
+// ═══ TREND CONTINUATION SETUP (втори, независим SETUP режим) ═══════════════════
+// Огледално на calcSetupState по-горе (MEAN REVERSION), но с ОБърнати роли:
+// direction driver-ът тук е computeDirectionConfidence().direction/.confident
+// (вече съществуващата SIGNAL_WEIGHTS/ACTIVE SIGNAL MEMORY тегловна система,
+// вижда TREND CONTINUATION-ите РАНО - виж SUI 42-screen анализа) - TARGET
+// НЕ участва тук изобщо (остава чист mean-reversion detector, недокоснат).
+// TRAP/AUCTION/MIGRATION остават score-only quality фактори, точно както при
+// MEAN REVERSION - никаква нова логика за тях, само reuse.
+// Mandatory gate: confident (= вече съществуващите ratioOK ÷4 И enoughScore
+// ≥MIN_TP_SCORE) - НУЛА нови прагове, точно механизмът, който реално хвана
+// SUI LONG рано в производствените данни.
+function calcTrendContinuationSetupState({
+  direction, confident,
+  trapDirection, trapTier, auctionDirection, auctionTier, migrationDirection, migrationTier,
+}) {
+  if (!confident || !direction) return { direction: null, score: 0, breakdown: {} };
+  const breakdown = {
+    trap: trapTier !== 'none' && trapDirection === direction,
+    auction: auctionTier !== 'none' && auctionDirection === direction,
+    migration: migrationTier !== 'none' && migrationDirection === direction,
+  };
+  let score = 2; // confident direction majority база (огледално на TARGET+VAH/VAL база=2 при MEAN REVERSION)
+  if (breakdown.trap) score++;
+  if (breakdown.auction) score++;
+  if (breakdown.migration) score++;
+  return { direction, score, breakdown };
+}
+
+// Edge-triggered fire/mark - byte-for-byte огледално на setupCanFire/
+// markSetupFired по-горе, но върху ОТДЕЛЕН state.trendSetup слот - НЕ пипа
+// state.setup (MEAN REVERSION), за да могат двата режима да останат
+// едновременно активни в противоположни посоки (виж SUI конфликт кейса:
+// TARGET SHORT + TREND CONTINUATION LONG едновременно, часове наред).
+function trendSetupCanFire(state, direction) {
+  if (!direction) return false;
+  return !state.trendSetup || state.trendSetup.direction !== direction;
+}
+function markTrendSetupFired(state, direction, score, price) {
+  state.trendSetup = { direction, score, at: Date.now(), price: price ?? null };
+}
+
 // ═══ ENTRY ENGINE - ЕТАП 2: "ARMED" ══════════════════════════════════════════════
 // Чисто structure/price-action - БЕЗ momentum/CVD/OI (те остават за ENTRY
 // TRIGGER, Етап 3). Non-repainting N-bar fractal swing detection на 5м:
@@ -1945,6 +1986,7 @@ function buildTelemetryRecord({
   symbol, direction, decision, setupScore, setupBreakdown, armedAt, structRef,
   triggerClose, atr5m, triggerRange, confirmation15m, flowState,
   trapTier, trapDirection, flowWarmingTier, flowWarmingDirection, entryScore,
+  setupMode,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
   return {
@@ -1958,6 +2000,11 @@ function buildTelemetryRecord({
     trapTier: trapTier ?? 'none', trapDirection: trapDirection ?? null,
     flowWarmingTier: flowWarmingTier ?? 'none', flowWarmingDirection: flowWarmingDirection ?? null,
     entryScore: entryScore ?? null,
+    // MEAN REVERSION (TARGET+VAH/VAL) vs TREND CONTINUATION (confident direction
+    // majority) - виж calcSetupState/calcTrendContinuationSetupState по-горе.
+    // Задължително подадено от call site-а (не се предполага default), за да не
+    // се скрие случайно неправилна стойност.
+    setupMode,
     outcome15m: null, // попълва се по-късно от finalizePendingOutcomes/wiring-а в scanSymbolSignals
   };
 }
@@ -2014,6 +2061,7 @@ function buildTelemetrySummary(records) {
     byEntryScore: {},
     byConfirmation15m: { true: makeOutcomeBucket(), false: makeOutcomeBucket() },
     byFlowState: {},
+    bySetupMode: { mean_reversion: makeOutcomeBucket(), trend_continuation: makeOutcomeBucket() },
   };
   let scoreSum = 0, scoreCount = 0, chaseSum = 0, chaseCount = 0, outcomeSum = 0, outcomeCount = 0, outcomeWins = 0;
   for (const r of records) {
@@ -2039,6 +2087,9 @@ function buildTelemetrySummary(records) {
       if (!summary.byFlowState[r.flowState]) summary.byFlowState[r.flowState] = makeOutcomeBucket();
       addToOutcomeBucket(summary.byFlowState[r.flowState], r);
     }
+    if (r.setupMode === 'mean_reversion' || r.setupMode === 'trend_continuation') {
+      addToOutcomeBucket(summary.bySetupMode[r.setupMode], r);
+    }
   }
   if (scoreCount) summary.avgEntryScore = scoreSum / scoreCount;
   if (chaseCount) summary.avgChaseDistanceAtrRatio = chaseSum / chaseCount;
@@ -2051,6 +2102,8 @@ function buildTelemetrySummary(records) {
   finalizeOutcomeBucket(summary.byConfirmation15m.true);
   finalizeOutcomeBucket(summary.byConfirmation15m.false);
   for (const key of Object.keys(summary.byFlowState)) finalizeOutcomeBucket(summary.byFlowState[key]);
+  finalizeOutcomeBucket(summary.bySetupMode.mean_reversion);
+  finalizeOutcomeBucket(summary.bySetupMode.trend_continuation);
   return summary;
 }
 
@@ -3381,9 +3434,14 @@ async function scanSymbolSignals(env, symbol) {
         flowState: calcFlowState(flowVeto, flowBoost),
         trapTier, trapDirection, flowWarmingTier, flowWarmingDirection,
         entryScore: entryResult.score,
+        setupMode: 'mean_reversion',
       });
       if (env.ALERT_STATE) {
-        const telemetryKey = `telemetry:${symbol}:${record.at}`;
+        // setupMode-суфикс в KV ключа - предпазва от презаписване, ако
+        // MEAN REVERSION и TREND CONTINUATION произведат telemetry запис за
+        // СЪЩИЯ symbol в СЪЩАТА милисекунда (record.at) - виж паралелния
+        // TREND CONTINUATION блок по-долу.
+        const telemetryKey = `telemetry:${symbol}:${record.at}:${record.setupMode}`;
         await env.ALERT_STATE.put(telemetryKey, JSON.stringify(record));
         if (decision === 'confirmed' || decision === 'missed') {
           if (!state.pendingOutcomes) state.pendingOutcomes = [];
@@ -3398,6 +3456,91 @@ async function scanSymbolSignals(env, symbol) {
       entryResult.direction = entryDirection;
       entryResult.priceAtArm = state.armed.priceAtArm; // само за контекст в известието
       state.armed = null; // епизодът приключва (ENTRY или MISSED) - ново SETUP->ARMED е нужно за следващ опит
+    }
+  }
+
+  // ═══ TREND CONTINUATION SETUP/ARMED/ENTRY (виж calcTrendContinuationSetupState
+  // по-горе) - огледален wiring на MEAN REVERSION блока по-горе, върху ОТДЕЛНИ
+  // state слотове (state.trendSetup/state.trendArmed), с реюзвани СЪЩИТЕ
+  // calcArmedTrigger/calcEntryTrigger pure функции (без дублирана логика).
+  // Никога не пипа state.setup/state.armed/entryResult (MEAN REVERSION) -
+  // двата режима могат да са едновременно активни, дори в противоположни
+  // посоки (документиран SUI случай: TARGET SHORT + TREND CONTINUATION LONG
+  // едновременно, часове наред).
+  const trendSetupState = calcTrendContinuationSetupState({
+    direction: confidence.direction, confident: confidence.confident,
+    trapDirection, trapTier, auctionDirection, auctionTier, migrationDirection, migrationTier,
+  });
+  const trendSetupFired = trendSetupCanFire(state, trendSetupState.direction);
+  if (trendSetupFired) markTrendSetupFired(state, trendSetupState.direction, trendSetupState.score, price);
+  if (!trendSetupState.direction) state.trendSetup = null;
+
+  if (!trendSetupState.direction || (state.trendArmed && state.trendArmed.direction !== trendSetupState.direction)) {
+    state.trendArmed = null;
+  }
+  if (state.trendArmed && (Date.now() - state.trendArmed.at) >= ARMED_EXPIRY_HOURS * 3600000) {
+    state.trendArmed = null;
+  }
+  let trendArmedFired = false;
+  if (trendSetupState.direction && !state.trendArmed) {
+    const lastClosed5mForTrend = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+    const trendArmedDirectionCandidate = calcArmedTrigger(trendSetupState.direction, state.swingStruct, lastClosed5mForTrend);
+    if (trendArmedDirectionCandidate) {
+      state.trendArmed = { direction: trendArmedDirectionCandidate, at: Date.now(), priceAtArm: price };
+      trendArmedFired = true;
+    }
+  }
+  const trendArmedDirection = state.trendArmed ? state.trendArmed.direction : null;
+
+  let trendEntryResult = { status: 'none' };
+  if (state.trendArmed) {
+    const entryDirection = state.trendArmed.direction;
+    const atr5m = calcATR(c5Closed, 14);
+    const atr15m = calcATR(c15Closed, 14);
+    const structRef = entryDirection === 'short'
+      ? (state.swingStruct.lastSwingLow ? state.swingStruct.lastSwingLow.price : null)
+      : (state.swingStruct.lastSwingHigh ? state.swingStruct.lastSwingHigh.price : null);
+    const flowVeto = calcFlowVeto({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
+    const flowBoost = calcFlowBoost({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
+    const htfAligned = entryDirection === 'long' ? (trend4h.bull || emaFilter.bull) : (trend4h.bear || emaFilter.bear);
+    const lastClosed5mCandle = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+    trendEntryResult = calcEntryTrigger({
+      direction: entryDirection,
+      candle5m: lastClosed5mCandle, atr5m,
+      candle15m: c15Closed.length ? c15Closed[c15Closed.length - 1] : null, atr15m,
+      structRef, flowVeto, flowBoost, htfAligned,
+    });
+    if (trendEntryResult.status === 'entry' || trendEntryResult.status === 'missed' || trendEntryResult.status === 'veto') {
+      const decision = trendEntryResult.status === 'entry' ? 'confirmed' : trendEntryResult.status;
+      const record = buildTelemetryRecord({
+        symbol, direction: entryDirection, decision,
+        setupScore: trendSetupState.score, setupBreakdown: trendSetupState.breakdown,
+        armedAt: state.trendArmed.at,
+        structRef: trendEntryResult.structRef ?? structRef,
+        triggerClose: trendEntryResult.triggerClose, atr5m,
+        triggerRange: lastClosed5mCandle ? (lastClosed5mCandle.high - lastClosed5mCandle.low) : null,
+        confirmation15m: trendEntryResult.confirmation15m,
+        flowState: calcFlowState(flowVeto, flowBoost),
+        trapTier, trapDirection, flowWarmingTier, flowWarmingDirection,
+        entryScore: trendEntryResult.score,
+        setupMode: 'trend_continuation',
+      });
+      if (env.ALERT_STATE) {
+        const telemetryKey = `telemetry:${symbol}:${record.at}:${record.setupMode}`;
+        await env.ALERT_STATE.put(telemetryKey, JSON.stringify(record));
+        if (decision === 'confirmed' || decision === 'missed') {
+          if (!state.pendingOutcomes) state.pendingOutcomes = [];
+          state.pendingOutcomes.push({
+            key: telemetryKey, dueAt: record.at + TELEMETRY_OUTCOME_WINDOW_MIN * 60000,
+            entryPrice: record.triggerClose, direction: entryDirection,
+          });
+        }
+      }
+    }
+    if (trendEntryResult.status === 'entry' || trendEntryResult.status === 'missed') {
+      trendEntryResult.direction = entryDirection;
+      trendEntryResult.priceAtArm = state.trendArmed.priceAtArm; // само за контекст в известието
+      state.trendArmed = null; // само СВОЯ слот - state.armed (MEAN REVERSION) остава непокътнат
     }
   }
 
@@ -3453,6 +3596,9 @@ async function scanSymbolSignals(env, symbol) {
     setupFired, setupDirection: setupState.direction, setupScore: setupState.score, setupBreakdown: setupState.breakdown,
     armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp,
     entryResult,
+    trendSetupFired, trendSetupDirection: trendSetupState.direction, trendSetupScore: trendSetupState.score, trendSetupBreakdown: trendSetupState.breakdown,
+    trendArmedFired, trendArmedDirection,
+    trendEntryResult,
   };
 }
 
@@ -3476,7 +3622,7 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
   let btcFlowContext = btcFlowContextOverride || { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   for (const pos of watchlist) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult, trendSetupFired, trendSetupDirection, trendSetupScore, trendSetupBreakdown, trendArmedFired, trendArmedDirection, trendEntryResult } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -3694,6 +3840,60 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
             dirLabel,
             `Цената вече е твърде отдалечена от структурата (${formatPrice(entryResult.structRef)} USD)`,
             `Trigger close: ${formatPrice(entryResult.triggerClose)} USD`,
+            `WAIT RETEST`,
+          ];
+          await sendWhatsApp(env, missedLines.join('\n'));
+        }
+      }
+      // TREND CONTINUATION SETUP/ARMED/ENTRY - огледални известия на MEAN
+      // REVERSION блоковете по-горе, но управлявани от НАПЪЛНО отделни booleans
+      // (trendSetupFired/trendArmedFired/trendEntryResult) - структурно не могат
+      // да потиснат/overwrite-нат известие на противоположния mode, защото не
+      // споделят hysteresis/cooldown state с mean_reversion блоковете.
+      if (trendSetupFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const b = trendSetupBreakdown;
+        const trendSetupLines = [
+          `👀 SETUP ${trendSetupDirection === 'long' ? 'LONG' : 'SHORT'} ${symbolNoUsdt} (TREND CONTINUATION)`,
+          `Base: confident direction majority ✓`,
+          `TRAP: ${b.trap ? '✓' : '—'}`,
+          `AUCTION QUALITY: ${b.auction ? '✓' : '—'}`,
+          `VALUE MIGRATION: ${b.migration ? '✓' : '—'}`,
+          `SETUP QUALITY: ${trendSetupScore}/5`,
+          `⚠️ Все още НЕ Е entry - следи за развитие (Етап 2: ARMED)`,
+        ];
+        await sendWhatsApp(env, trendSetupLines.join('\n'));
+      }
+      if (trendArmedFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const trendArmedLines = [
+          `⚡ ARMED ${trendArmedDirection === 'long' ? 'LONG' : 'SHORT'} ${symbolNoUsdt} (TREND CONTINUATION)`,
+          `⚠️ Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3)`,
+        ];
+        await sendWhatsApp(env, trendArmedLines.join('\n'));
+      }
+      if (trendEntryResult.status === 'entry' || trendEntryResult.status === 'missed') {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const dirLabel = trendEntryResult.direction === 'long' ? 'LONG' : 'SHORT';
+        if (trendEntryResult.status === 'entry') {
+          const entryLines = [
+            `🔥 ENTRY CONFIRMED ${symbolNoUsdt} (TREND CONTINUATION)`,
+            dirLabel,
+            `ENTRY: ${formatPrice(trendEntryResult.triggerClose)} USD`,
+            `5м TRIGGER: ${dirLabel} ✓`,
+            `15м CONFIRMATION: ${trendEntryResult.confirmation15m ? '✓' : '—'}`,
+            `FLOW: ${trendEntryResult.flowBoost ? '✓ потвърждава' : '—'}`,
+            `HTF CONTEXT: ${trendEntryResult.htfAligned ? '✓ съвпада' : '—'}`,
+            `ENTRY SCORE: ${trendEntryResult.score}/5`,
+            `⚠️ Не гони цената отвъд ${formatPrice(trendEntryResult.structRef)} USD`,
+          ];
+          await sendWhatsApp(env, entryLines.join('\n'));
+        } else {
+          const missedLines = [
+            `⚠️ ENTRY MISSED ${symbolNoUsdt} (TREND CONTINUATION)`,
+            dirLabel,
+            `Цената вече е твърде отдалечена от структурата (${formatPrice(trendEntryResult.structRef)} USD)`,
+            `Trigger close: ${formatPrice(trendEntryResult.triggerClose)} USD`,
             `WAIT RETEST`,
           ];
           await sendWhatsApp(env, missedLines.join('\n'));
