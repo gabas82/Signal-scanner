@@ -1998,6 +1998,11 @@ function buildPendingOutcomeHorizons(recordAt) {
 // markSetupFired другаде в този файл - установен прецедент за state мутация).
 // `now` е explicit параметър (default Date.now()) единствено за да остане
 // тестваема - реалният call site не подава нищо различно от текущото време.
+// PR #103 - на всеки резолвнат хоризонт добавя и snapshot на running MFE/MAE
+// (виж updateExcursion по-долу, който трябва да се извика ПРЕДИ тази функция
+// на всеки tick) - "какъв е бил максималният favorable/adverse excursion ДО
+// момента на този хоризонт". При ПОСЛЕДНия резолвнат хоризонт (allResolved)
+// добавя и финалните timeToMfeMin/timeToMaeMin/maeBeforeMfePct/mfeBeforeMaePct.
 function resolvePendingOutcomeHorizons(pending, price, now = Date.now()) {
   const updates = {};
   let allResolved = true;
@@ -2005,11 +2010,24 @@ function resolvePendingOutcomeHorizons(pending, price, now = Date.now()) {
     const h = pending.horizons[field];
     if (h.resolved) continue;
     if (now >= h.dueAt && price != null) {
-      updates[`outcome${field.slice(1)}m`] = calcOutcomePct(pending.direction, pending.entryPrice, price);
+      const suffix = field.slice(1);
+      updates[`outcome${suffix}m`] = calcOutcomePct(pending.direction, pending.entryPrice, price);
+      updates[`mfe${suffix}m`] = pending.mfePct ?? null;
+      updates[`mae${suffix}m`] = pending.maePct ?? null;
+      if (pending.atr5m > 0) {
+        updates[`mfe${suffix}mAtr`] = pctExcursionToAtrRatio(pending.mfePct, pending.entryPrice, pending.atr5m);
+        updates[`mae${suffix}mAtr`] = pctExcursionToAtrRatio(pending.maePct, pending.entryPrice, pending.atr5m);
+      }
       h.resolved = true;
     } else {
       allResolved = false;
     }
+  }
+  if (allResolved) {
+    updates.timeToMfeMin = (pending.entryAt != null && pending.mfeAt != null) ? (pending.mfeAt - pending.entryAt) / 60000 : null;
+    updates.timeToMaeMin = (pending.entryAt != null && pending.maeAt != null) ? (pending.maeAt - pending.entryAt) / 60000 : null;
+    updates.maeBeforeMfePct = pending.maeBeforeMfePct ?? null;
+    updates.mfeBeforeMaePct = pending.mfeBeforeMaePct ?? null;
   }
   return { updates, allResolved };
 }
@@ -2050,6 +2068,13 @@ function buildTelemetryRecord({
     // от "проверено и НЕ съвпада".
     htfAligned: htfAligned ?? null,
     outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, // попълват се по-късно от resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals
+    // PR #103 PATH DIAGNOSTICS (MFE/MAE) - попълват се по-късно от
+    // updateExcursion/resolvePendingOutcomeHorizons, огледално на outcome{X}m.
+    mfe5m: null, mae5m: null, mfe5mAtr: null, mae5mAtr: null,
+    mfe15m: null, mae15m: null, mfe15mAtr: null, mae15mAtr: null,
+    mfe30m: null, mae30m: null, mfe30mAtr: null, mae30mAtr: null,
+    mfe60m: null, mae60m: null, mfe60mAtr: null, mae60mAtr: null,
+    timeToMfeMin: null, timeToMaeMin: null, maeBeforeMfePct: null, mfeBeforeMaePct: null,
   };
 }
 
@@ -2059,6 +2084,47 @@ function calcOutcomePct(direction, entryPrice, laterPrice) {
   if (entryPrice == null || laterPrice == null || !(entryPrice > 0)) return null;
   const rawPct = (laterPrice - entryPrice) / entryPrice * 100;
   return direction === 'short' ? -rawPct : rawPct;
+}
+
+// PR #103 - PATH DIAGNOSTICS (MFE/MAE, diagnostic-only). Конвертира % excursion
+// в ATR-нормализирано разстояние - реюзвано за mfe/mae{X}mAtr снапшотите.
+function pctExcursionToAtrRatio(pct, entryPrice, atr) {
+  if (pct == null || entryPrice == null || !(atr > 0)) return null;
+  const priceDelta = Math.abs((pct / 100) * entryPrice);
+  return priceDelta / atr;
+}
+
+// Актуализира running MFE/MAE на ЕДИН pending outcome, използвайки вече
+// изтеглената последна затворена 5м свещ (candle.high/candle.low) - БЕЗ нова
+// мрежова заявка (виж wiring-а в scanSymbolSignals - reuse-ва c5Closed, което
+// вече е изтеглено за ATR/структура по-горе в същия tick). Direction-aware:
+// LONG използва candle.high за favorable/candle.low за adverse (обратно за
+// SHORT) - реюзва СЪЩАТА calcOutcomePct формула, само върху high/low вместо
+// единична price точка. Мутира pending на място (established прецедент - виж
+// resolvePendingOutcomeHorizons/updateSwingStructure другаде в тоя файл).
+// mfePct/maePct тръгват от 0 ("никакво движение все още"), НЕ от -Infinity -
+// ако цената никога не тръгне в дадена посока, съответната excursion остава 0,
+// не null. maeBeforeMfePct/mfeBeforeMaePct (RETRACE BEFORE MOVE, PR #103 т.3)
+// пазят СУРОВАТА стойност на "другата" excursion В МОМЕНТА на всеки нов
+// екстремум - без нов threshold, само наблюдение.
+function updateExcursion(pending, candle, now = Date.now()) {
+  if (!candle || candle.high == null || candle.low == null || pending.entryPrice == null) return;
+  if (pending.mfePct == null) pending.mfePct = 0;
+  if (pending.maePct == null) pending.maePct = 0;
+  const favorablePrice = pending.direction === 'short' ? candle.low : candle.high;
+  const adversePrice = pending.direction === 'short' ? candle.high : candle.low;
+  const favorablePct = calcOutcomePct(pending.direction, pending.entryPrice, favorablePrice);
+  const adversePct = calcOutcomePct(pending.direction, pending.entryPrice, adversePrice);
+  if (favorablePct != null && favorablePct > pending.mfePct) {
+    pending.mfePct = favorablePct;
+    pending.mfeAt = now;
+    pending.maeBeforeMfePct = pending.maePct;
+  }
+  if (adversePct != null && adversePct < pending.maePct) {
+    pending.maePct = adversePct;
+    pending.maeAt = now;
+    pending.mfeBeforeMaePct = pending.mfePct;
+  }
 }
 
 // Агрегира вече заредени/филтрирани telemetry записи (чисто in-memory, БЕЗ
@@ -2232,6 +2298,126 @@ function buildEntryScoreDecomposition(records) {
     bySetupMode: {
       mean_reversion: buildEntryScoreDecompositionGroup(mr),
       trend_continuation: buildEntryScoreDecompositionGroup(tc),
+    },
+  };
+}
+
+// ============================================================================
+// PR #103 - SIGNAL PATH / EXCURSION DIAGNOSTICS (MFE/MAE). Diagnostic-only -
+// вижда КАКВО се случва по пътя между ENTRY и всеки хоризонт (виж
+// updateExcursion/resolvePendingOutcomeHorizons по-горе за самото попълване
+// на mfe{X}m/mae{X}m/mfe{X}mAtr/mae{X}mAtr/timeToMfeMin/timeToMaeMin/
+// maeBeforeMfePct/mfeBeforeMaePct полетата). Никаква промяна на execution -
+// само нов разрез върху вече записаните пътища.
+// ============================================================================
+
+// count/avg/median на MFE и MAE (+ ATR-нормализирани версии, ако налични) за
+// ЕДИН хоризонт ("5"/"15"/"30"/"60") върху подадени records. Median реюзва
+// вече съществуващия calcPercentile (Discovery lifetime stats по-долу в
+// файла) - важен е, защото единични големи движения могат да изкривят average
+// (виж заявката т.5).
+function buildExcursionStatsForHorizon(records, horizonSuffix) {
+  const mfeValues = records.map((r) => r[`mfe${horizonSuffix}m`]).filter((v) => v != null);
+  const maeValues = records.map((r) => r[`mae${horizonSuffix}m`]).filter((v) => v != null);
+  const atrMfeValues = records.map((r) => r[`mfe${horizonSuffix}mAtr`]).filter((v) => v != null);
+  const atrMaeValues = records.map((r) => r[`mae${horizonSuffix}mAtr`]).filter((v) => v != null);
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  const median = (arr) => (arr.length ? calcPercentile([...arr].sort((a, b) => a - b), 50) : null);
+  return {
+    count: mfeValues.length,
+    avgMfePct: avg(mfeValues), medianMfePct: median(mfeValues),
+    avgMaePct: avg(maeValues), medianMaePct: median(maeValues),
+    avgMfeAtr: atrMfeValues.length ? avg(atrMfeValues) : null,
+    avgMaeAtr: atrMaeValues.length ? avg(atrMaeValues) : null,
+  };
+}
+// TIME TO MFE/MAE (PR #103 т.2) + RETRACE BEFORE MOVE (т.3) - единични стойности
+// на запис (не по хоризонт - "кога общо е достигнат крайният екстремум"),
+// затова е отделен сиблинг на m5/15/30/60, не част от тях.
+function buildExcursionTiming(records) {
+  const timeToMfe = records.map((r) => r.timeToMfeMin).filter((v) => v != null);
+  const timeToMae = records.map((r) => r.timeToMaeMin).filter((v) => v != null);
+  const maeBeforeMfe = records.map((r) => r.maeBeforeMfePct).filter((v) => v != null);
+  const mfeBeforeMae = records.map((r) => r.mfeBeforeMaePct).filter((v) => v != null);
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  return {
+    count: timeToMfe.length,
+    avgTimeToMfeMin: avg(timeToMfe), avgTimeToMaeMin: avg(timeToMae),
+    avgMaeBeforeMfePct: avg(maeBeforeMfe), avgMfeBeforeMaePct: avg(mfeBeforeMae),
+  };
+}
+// Едно пълно "excursion гнездо" (m5/15/30/60 + timing) - реюзвано навсякъде по-долу.
+function buildExcursionGroup(records) {
+  const out = { timing: buildExcursionTiming(records) };
+  for (const m of OUTCOME_HORIZONS_MIN) out[`m${m}`] = buildExcursionStatsForHorizon(records, String(m));
+  return out;
+}
+// Групира по keyFn(record), после смята excursion гнездо на всяка група -
+// огледално на buildFieldHorizonBreakdown, само върху MFE/MAE вместо outcome.
+function buildKeyedExcursionBreakdown(records, keyFn) {
+  const groups = {};
+  for (const r of records) {
+    const k = keyFn(r);
+    if (k == null) continue;
+    if (!groups[k]) groups[k] = [];
+    groups[k].push(r);
+  }
+  const out = {};
+  for (const k of Object.keys(groups)) out[k] = buildExcursionGroup(groups[k]);
+  return out;
+}
+// modeOverlap excursion разрез (tcOnly/mrOnly/both + both.bySameDirection/
+// byOppositeDirection) - реюзва вече съществуващите classifyModeOverlap/
+// buildModeOverlapPairs/directionRelationKey (PR #101/#102), БЕЗ да дублира
+// matching логиката.
+function buildExcursionModeOverlapBreakdown(records) {
+  const classifications = classifyModeOverlap(records);
+  const groups = { tcOnly: [], mrOnly: [], both: [] };
+  records.forEach((r, i) => {
+    const c = classifications[i];
+    if (c === 'both') groups.both.push(r);
+    else if (c === 'mr_only') groups.mrOnly.push(r);
+    else if (c === 'tc_only') groups.tcOnly.push(r);
+  });
+  const out = {
+    tcOnly: buildExcursionGroup(groups.tcOnly),
+    mrOnly: buildExcursionGroup(groups.mrOnly),
+    both: buildExcursionGroup(groups.both),
+  };
+  const pairs = buildModeOverlapPairs(records);
+  const sameIdx = new Set(), oppIdx = new Set();
+  for (const p of pairs) {
+    const rel = directionRelationKey(p);
+    if (rel === 'same_direction') { sameIdx.add(p.mrIdx); sameIdx.add(p.tcIdx); }
+    else if (rel === 'opposite_direction') { oppIdx.add(p.mrIdx); oppIdx.add(p.tcIdx); }
+  }
+  out.both.bySameDirection = buildExcursionGroup(records.filter((_, i) => sameIdx.has(i)));
+  out.both.byOppositeDirection = buildExcursionGroup(records.filter((_, i) => oppIdx.has(i)));
+  return out;
+}
+// SIGNAL PATH / EXCURSION DIAGNOSTICS (PR #103, diagnostic-only) - CONFIRMED и
+// MISSED (chase-protection counterfactual) СТРОГО отделени (виж заявката т.6 -
+// "без смесване с CONFIRMED"). За MISSED основният разрез е chaseDistanceAtrRatio
+// bucket-ите - целта НЕ е да докажем, че MISSED е трябвало да е ENTRY, а да
+// видим какво реално се случва СЛЕД отказа (продължава ли движението, връща
+// ли се, колко е adverse/favorable excursion, след колко време).
+function buildPathDiagnostics(records) {
+  const confirmed = records.filter((r) => r.decision === 'confirmed');
+  const missed = records.filter((r) => r.decision === 'missed');
+  return {
+    confirmed: {
+      overall: buildExcursionGroup(confirmed),
+      bySetupMode: buildKeyedExcursionBreakdown(confirmed, setupModeKey),
+      byDirection: buildKeyedExcursionBreakdown(confirmed, directionKey),
+      byEntryScore: buildKeyedExcursionBreakdown(confirmed, entryScoreKey),
+      bySetupBreakdown: buildKeyedExcursionBreakdown(confirmed, setupBreakdownComboKey),
+      byConfirmation15m: buildKeyedExcursionBreakdown(confirmed, confirmation15mKey),
+      byHtfAligned: buildKeyedExcursionBreakdown(confirmed, htfAlignedKey),
+      byModeOverlap: buildExcursionModeOverlapBreakdown(confirmed),
+    },
+    missed: {
+      overall: buildExcursionGroup(missed),
+      byChaseDistanceBucket: buildKeyedExcursionBreakdown(missed, chaseDistanceBucketKey),
     },
   };
 }
@@ -2498,6 +2684,11 @@ function buildTelemetrySummary(records) {
     mean_reversion: buildDoubleNestedBreakdown(meanReversionRecords, htfAlignedKey, ['aligned', 'notAligned', 'none'], confirmation15mKey, ['true', 'false']),
     trend_continuation: buildDoubleNestedBreakdown(trendContinuationRecords, htfAlignedKey, ['aligned', 'notAligned', 'none'], confirmation15mKey, ['true', 'false']),
   };
+
+  // PR #103 - SIGNAL PATH / EXCURSION DIAGNOSTICS (виж buildPathDiagnostics
+  // по-горе) - MFE/MAE path профил на CONFIRMED и MISSED, диагностика на
+  // причината зад m15/m60 inverse correlation-а от PR #102.
+  summary.pathDiagnostics = buildPathDiagnostics(records);
   return summary;
 }
 
@@ -3842,6 +4033,7 @@ async function scanSymbolSignals(env, symbol) {
           state.pendingOutcomes.push({
             key: telemetryKey, horizons: buildPendingOutcomeHorizons(record.at),
             entryPrice: record.triggerClose, direction: entryDirection,
+            entryAt: record.at, atr5m, // PR #103 PATH DIAGNOSTICS (MFE/MAE) - виж updateExcursion
           });
         }
       }
@@ -3927,6 +4119,7 @@ async function scanSymbolSignals(env, symbol) {
           state.pendingOutcomes.push({
             key: telemetryKey, horizons: buildPendingOutcomeHorizons(record.at),
             entryPrice: record.triggerClose, direction: entryDirection,
+            entryAt: record.at, atr5m, // PR #103 PATH DIAGNOSTICS (MFE/MAE) - виж updateExcursion
           });
         }
       }
@@ -3944,7 +4137,13 @@ async function scanSymbolSignals(env, symbol) {
   // допълнителни мрежови заявки. Изцяло observability, не влияе на ENTRY.
   if (state.pendingOutcomes && state.pendingOutcomes.length && env.ALERT_STATE) {
     const stillPending = [];
+    // PR #103 PATH DIAGNOSTICS (MFE/MAE) - последната вече изтеглена затворена
+    // 5м свещ на ТАЗИ монета/tick (БЕЗ нова мрежова заявка), за да актуализираме
+    // running MFE/MAE на всеки pending outcome ПРЕДИ да проверим кои хоризонти
+    // са due (виж updateExcursion по-горе).
+    const lastClosed5mForExcursion = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
     for (const p of state.pendingOutcomes) {
+      updateExcursion(p, lastClosed5mForExcursion);
       const { updates, allResolved } = resolvePendingOutcomeHorizons(p, price);
       if (Object.keys(updates).length) {
         const raw = await env.ALERT_STATE.get(p.key);
