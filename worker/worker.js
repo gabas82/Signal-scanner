@@ -2151,6 +2151,16 @@ function attachSetupModeCrossBreakdowns(bucket, records) {
   bucket.byChaseDistanceBucket = buildKeyedOutcomeBreakdown(records, chaseDistanceBucketKey, ['lt0_5', 'from0_5to1', 'from1to1_5', 'gte1_5']);
   return bucket;
 }
+// PR #101 т.4 - двойно вложен cross-breakdown (setupMode вече филтрирано от
+// call site-а по-долу) - outerKeyFn/innerKeyFn реюзват вече съществуващите
+// confirmation15mKey/htfAlignedKey. Диагностичен въпрос: "apparent
+// confirmation15m ефектът composition bias ли е от HTF (или обратно)?"
+function buildDoubleNestedBreakdown(records, outerKeyFn, outerKeys, innerKeyFn, innerKeys) {
+  const out = {};
+  for (const ok of outerKeys) out[ok] = buildKeyedOutcomeBreakdown(records.filter((r) => outerKeyFn(r) === ok), innerKeyFn, innerKeys);
+  return out;
+}
+
 // avg/win-rate за произволно outcome поле (outcome5m/15m/30m/60m) - реюзвано
 // за outcomeByHorizon по-долу, за да не дублираме 4 пъти същото броене.
 function buildOutcomeStatsForField(records, field) {
@@ -2160,6 +2170,87 @@ function buildOutcomeStatsForField(records, field) {
     if (v != null) { sum += v; count++; if (v > 0) wins++; }
   }
   return { count, avgOutcomePct: count ? sum / count : null, winRatePct: count ? (wins / count) * 100 : null };
+}
+
+// PR #101 - TC/MR OVERLAP CLASSIFICATION (diagnostic-only, виж заявката т.3).
+// MEAN REVERSION и TREND CONTINUATION са напълно независими state slots (виж
+// PR #98) - НЯМА tie-breaker/dedup в execution логиката. Но за статистиката
+// трябва да знаем дали два записа (различен setupMode, СЪЩИЯ symbol) отразяват
+// ДВА независими пазарни събития, или ЕДНО и СЪЩО (двата engine-a оценяват
+// СЪЩАТА 5м свещ на СЪЩИЯ cron tick - в такъв случай `at` timestamp-ите им са
+// на практика идентични, милисекунди разлика, не произволно близки).
+// MODE_OVERLAP_WINDOW_MS е WIDE достатъчно да хване тази "същ tick" близост,
+// но тесен достатъчно (много по-малък от 5-мин cron интервала) да не слее
+// два реално различни tick-а един в друг.
+const MODE_OVERLAP_WINDOW_MS = 60000;
+function classifyModeOverlap(records) {
+  const bySymbol = {};
+  records.forEach((r, i) => {
+    if (r.setupMode !== 'mean_reversion' && r.setupMode !== 'trend_continuation') return;
+    if (!bySymbol[r.symbol]) bySymbol[r.symbol] = [];
+    bySymbol[r.symbol].push(i);
+  });
+  const overlapIdx = new Set();
+  for (const symbol of Object.keys(bySymbol)) {
+    const idxs = bySymbol[symbol];
+    const mrIdxs = idxs.filter((i) => records[i].setupMode === 'mean_reversion');
+    const tcIdxs = idxs.filter((i) => records[i].setupMode === 'trend_continuation');
+    for (const mi of mrIdxs) {
+      for (const ti of tcIdxs) {
+        if (Math.abs(records[mi].at - records[ti].at) <= MODE_OVERLAP_WINDOW_MS) {
+          overlapIdx.add(mi); overlapIdx.add(ti);
+        }
+      }
+    }
+  }
+  return records.map((r, i) => {
+    if (r.setupMode !== 'mean_reversion' && r.setupMode !== 'trend_continuation') return null;
+    if (overlapIdx.has(i)) return 'both';
+    return r.setupMode === 'mean_reversion' ? 'mr_only' : 'tc_only';
+  });
+}
+// Обобщава modeOverlap класификацията в count/avgOutcomePct/winRatePct
+// (+ по m5/m15/m30/m60) за трите групи - изцяло върху вече изчислената
+// класификация по-горе, БЕЗ нов KV достъп.
+function buildModeOverlapSummary(records) {
+  const classifications = classifyModeOverlap(records);
+  const groups = { tcOnly: [], mrOnly: [], both: [] };
+  records.forEach((r, i) => {
+    const c = classifications[i];
+    if (c === 'both') groups.both.push(r);
+    else if (c === 'mr_only') groups.mrOnly.push(r);
+    else if (c === 'tc_only') groups.tcOnly.push(r);
+  });
+  const out = {};
+  for (const key of Object.keys(groups)) {
+    out[key] = buildOutcomeStatsForField(groups[key], 'outcome15m');
+    out[key].byHorizon = {};
+    for (const m of OUTCOME_HORIZONS_MIN) out[key].byHorizon[`m${m}`] = buildOutcomeStatsForField(groups[key], `outcome${m}m`);
+  }
+  return out;
+}
+
+// PR #101 т.5 - разширява една outcomeByHorizon.<mode> клетка с
+// byConfirmation15m/byHtfAligned/byEntryScore (count/avgOutcomePct/
+// winRatePct стойности, реюзвайки buildOutcomeStatsForField) - за да видим
+// КОГА (на кой хоризонт) се появява ефектът от даден фактор, не само ДАЛИ.
+function buildHorizonBreakdown(records, field) {
+  const entryScores = [...new Set(records.map((r) => r.entryScore).filter((v) => v != null))];
+  const byEntryScore = {};
+  for (const s of entryScores) byEntryScore[String(s)] = buildOutcomeStatsForField(records.filter((r) => r.entryScore === s), field);
+  return {
+    ...buildOutcomeStatsForField(records, field),
+    byConfirmation15m: {
+      true: buildOutcomeStatsForField(records.filter((r) => r.confirmation15m === true), field),
+      false: buildOutcomeStatsForField(records.filter((r) => r.confirmation15m === false), field),
+    },
+    byHtfAligned: {
+      aligned: buildOutcomeStatsForField(records.filter((r) => r.htfAligned === true), field),
+      notAligned: buildOutcomeStatsForField(records.filter((r) => r.htfAligned === false), field),
+      none: buildOutcomeStatsForField(records.filter((r) => r.htfAligned == null), field),
+    },
+    byEntryScore,
+  };
 }
 
 function buildTelemetrySummary(records) {
@@ -2231,18 +2322,36 @@ function buildTelemetrySummary(records) {
 
   // Multi-horizon outcome (виж заявката: "+15м може да пасва на единия режим,
   // не и на другия") - reuse-ва вече записаните outcome5m/15m/30m/60m полета,
-  // без нов fetch.
+  // без нов fetch. PR #101 т.5 - вложено разширение bySetupMode.<mode> с
+  // byConfirmation15m/byHtfAligned/byEntryScore, за да видим НЕ само дали
+  // фактор има ефект, а КОГА (на кой хоризонт) ефектът се появява.
   summary.outcomeByHorizon = {};
   for (const m of OUTCOME_HORIZONS_MIN) {
     const field = `outcome${m}m`;
     summary.outcomeByHorizon[`m${m}`] = {
       overall: buildOutcomeStatsForField(records, field),
       bySetupMode: {
-        mean_reversion: buildOutcomeStatsForField(meanReversionRecords, field),
-        trend_continuation: buildOutcomeStatsForField(trendContinuationRecords, field),
+        mean_reversion: buildHorizonBreakdown(meanReversionRecords, field),
+        trend_continuation: buildHorizonBreakdown(trendContinuationRecords, field),
       },
     };
   }
+
+  // PR #101 т.3 - TC/MR OVERLAP (виж classifyModeOverlap/buildModeOverlapSummary
+  // по-горе) - diagnostic-only, не пипа execution logic-ата.
+  summary.modeOverlap = buildModeOverlapSummary(records);
+
+  // PR #101 т.4 - setupMode -> confirmation15m -> HTF и обратно setupMode ->
+  // HTF -> confirmation15m (виж buildDoubleNestedBreakdown по-горе) - "apparent
+  // confirmation15m ефектът composition bias ли е от HTF, или обратно?"
+  summary.setupModeConfirmation15mByHtf = {
+    mean_reversion: buildDoubleNestedBreakdown(meanReversionRecords, confirmation15mKey, ['true', 'false'], htfAlignedKey, ['aligned', 'notAligned', 'none']),
+    trend_continuation: buildDoubleNestedBreakdown(trendContinuationRecords, confirmation15mKey, ['true', 'false'], htfAlignedKey, ['aligned', 'notAligned', 'none']),
+  };
+  summary.setupModeHtfByConfirmation15m = {
+    mean_reversion: buildDoubleNestedBreakdown(meanReversionRecords, htfAlignedKey, ['aligned', 'notAligned', 'none'], confirmation15mKey, ['true', 'false']),
+    trend_continuation: buildDoubleNestedBreakdown(trendContinuationRecords, htfAlignedKey, ['aligned', 'notAligned', 'none'], confirmation15mKey, ['true', 'false']),
+  };
   return summary;
 }
 
@@ -4732,7 +4841,12 @@ async function runDiscoveryFullAnalysis(env, watchlist = WATCHLIST) {
 //     го променяме
 
 // Първи (най-ранен) SETUP след DISCOVERY - еднократно, никога не се презаписва.
-function applyDiscoveryEpisodeSetup(episode, sigstate) {
+// liveActivityScore/liveConfidence (PR #101) - member.lastScore/lastConfidence
+// от discoverypool (Stage D), които вече се преизчисляват на ВСЕКИ tick за
+// ranking-а - НЕ е ново изчисление само за telemetry, само четем вече
+// съществуваща "жива" стойност в момента на SETUP-а (за разлика от
+// discovery.activityScore, който е immutable снимка от МОМЕНТА на влизане в pool-а).
+function applyDiscoveryEpisodeSetup(episode, sigstate, liveActivityScore, liveConfidence) {
   if (episode.setup || !sigstate || !sigstate.setup) return episode;
   const at = sigstate.setup.at;
   const setupPrice = sigstate.setup.price ?? null;
@@ -4741,7 +4855,11 @@ function applyDiscoveryEpisodeSetup(episode, sigstate) {
     ? ((setupPrice - episode.discovery.price) / episode.discovery.price) * 100 : null;
   return {
     ...episode, setup: { at, price: setupPrice },
-    derived: { ...episode.derived, leadTimeSetupMin, pctMoveToSetup },
+    derived: {
+      ...episode.derived, leadTimeSetupMin, pctMoveToSetup,
+      activityScoreAtSetup: liveActivityScore ?? null,
+      confidenceAtSetup: liveConfidence ?? null,
+    },
     status: 'setup',
   };
 }
@@ -4766,9 +4884,14 @@ function applyDiscoveryEpisodeArmed(episode, sigstate) {
 // atr5m е вече изчислен и записан в СЪЩЕСТВУВАЩИЯ telemetry запис - никакъв
 // нов fetch, точно за SETUP/ARMED нямаме готов ATR под ръка, затова там няма
 // ATR-нормализирана метрика (умишлено, виж заявката).
-function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord) {
+// liveActivityScore/liveConfidence (PR #101) - виж коментара при
+// applyDiscoveryEpisodeSetup по-горе, идентична логика тук за ENTRY момента.
+function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord, liveActivityScore, liveConfidence) {
   if (episode.entry || !entryTelemetryRecord) return episode;
-  const { at, decision, triggerClose: entryPrice, entryScore, atr5m, chaseDistanceAtrRatio, outcome15m, setupMode } = entryTelemetryRecord;
+  const {
+    at, decision, triggerClose: entryPrice, entryScore, atr5m, chaseDistanceAtrRatio,
+    outcome5m, outcome15m, outcome30m, outcome60m, setupMode,
+  } = entryTelemetryRecord;
   const leadTimeEntryMin = (at - episode.discovery.at) / 60000;
   const pctMoveToEntry = (entryPrice != null && episode.discovery.price > 0)
     ? ((entryPrice - episode.discovery.price) / episode.discovery.price) * 100 : null;
@@ -4779,27 +4902,50 @@ function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord) {
     entry: {
       at, price: entryPrice, decision, entryScore: entryScore ?? null,
       atr5m: atr5m ?? null, chaseDistanceAtrRatio: chaseDistanceAtrRatio ?? null,
-      outcome15m: outcome15m ?? null,
+      // Multi-horizon (PR #101, огледално на основната ENTRY telemetry) -
+      // всичките четирите тръгват null тук (outcome механизмът ги попълва по-
+      // късно, виж applyDiscoveryEpisodeOutcome по-долу), пазени ОТДЕЛНО по
+      // decision (confirmed срещу missed) чрез самото entry.decision поле -
+      // никога не се смесват в агрегацията (виж buildDiscoveryEpisodeSummary).
+      outcome5m: outcome5m ?? null, outcome15m: outcome15m ?? null,
+      outcome30m: outcome30m ?? null, outcome60m: outcome60m ?? null,
       // Пазим setupMode, за да можем по-късно да пресъздадем ТОЧНИЯ KV ключ
       // (telemetry:{symbol}:{at}:{setupMode}, виж updateDiscoveryEpisodes по-долу)
       // - иначе outcome refresh-ът никога няма да намери записа.
       setupMode: setupMode ?? null,
     },
-    derived: { ...episode.derived, leadTimeEntryMin, pctMoveToEntry, atrMoveToEntry },
-    // 'missed'/'veto' нямат смислен outcome за измерване (нищо не е отворено) -
-    // завършваме епизода веднага; 'confirmed' чака съществуващия +15м outcome механизъм.
-    status: decision === 'confirmed' ? 'entry_pending_outcome' : 'complete',
+    derived: {
+      ...episode.derived, leadTimeEntryMin, pctMoveToEntry, atrMoveToEntry,
+      activityScoreAtEntry: liveActivityScore ?? null,
+      confidenceAtEntry: liveConfidence ?? null,
+    },
+    // 'veto' няма смислен outcome за измерване (нищо не е отворено) - завършваме
+    // епизода веднага. 'confirmed' И 'missed' (PR #101 - missed е "counterfactual
+    // chase" наблюдение, вече проследено от resolvePendingOutcomeHorizons/wiring-а
+    // в scanSymbolSignals) чакат съществуващия multi-horizon outcome механизъм.
+    status: (decision === 'confirmed' || decision === 'missed') ? 'entry_pending_outcome' : 'complete',
   };
 }
 
-// Опреснява outcome15m от СЪЩИЯ вече записан entry telemetry запис, веднъж
-// щом съществуващият +15м outcome механизъм (finalizePendingOutcomes) го
-// попълни - чисто четене, никаква нова логика за самия outcome.
-function applyDiscoveryEpisodeOutcome(episode, freshOutcome15m) {
-  if (!episode.entry || episode.entry.decision !== 'confirmed' || episode.entry.outcome15m != null || freshOutcome15m == null) {
+// Опреснява outcome5m/15m/30m/60m от СЪЩИЯ вече записан entry telemetry
+// запис, веднъж щом съществуващият multi-horizon outcome механизъм
+// (resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals) ги попълни -
+// чисто четене, никаква нова логика за самите outcome стойности. Episode-ът
+// минава в 'complete' едва след като ВСИЧКИТЕ 4 хоризонта са резолвнати
+// (outcome60m последен) - до тогава остава 'entry_pending_outcome', за да
+// продължи updateDiscoveryEpisodes да го опреснява.
+function applyDiscoveryEpisodeOutcome(episode, freshRecord) {
+  if (!episode.entry || (episode.entry.decision !== 'confirmed' && episode.entry.decision !== 'missed') || !freshRecord) {
     return episode;
   }
-  return { ...episode, entry: { ...episode.entry, outcome15m: freshOutcome15m }, status: 'complete' };
+  const entry = { ...episode.entry };
+  let changed = false;
+  for (const field of ['outcome5m', 'outcome15m', 'outcome30m', 'outcome60m']) {
+    if (entry[field] == null && freshRecord[field] != null) { entry[field] = freshRecord[field]; changed = true; }
+  }
+  if (!changed) return episode;
+  const allResolved = entry.outcome5m != null && entry.outcome15m != null && entry.outcome30m != null && entry.outcome60m != null;
+  return { ...episode, entry, status: allResolved ? 'complete' : episode.status };
 }
 
 // Маркира КОГА и ЗАЩО символът реално е напуснал DISCOVERY_POOL (Stage D
@@ -4836,7 +4982,16 @@ function buildDiscoveryEpisode(poolMember) {
       activityScore: poolMember.discoveryScore ?? null, direction: poolMember.discoveryDirection ?? null,
       confidence: poolMember.discoveryConfidence ?? null,
     },
-    setup: null, armed: null, entry: null, derived: {},
+    setup: null, armed: null, entry: null,
+    // activityScoreAtDiscovery/confidenceAtDiscovery (PR #101) - чист alias на
+    // discovery.activityScore/confidence по-горе, държан и тук за да живеят
+    // ВСИЧКИТЕ "At*" evolution снимки (Discovery/Setup/Entry) в ЕДНО общо
+    // гнездо (derived) - прави delta изчисленията в buildDiscoveryEpisodeSummary
+    // еднообразни, без нужда да четем от две различни места.
+    derived: {
+      activityScoreAtDiscovery: poolMember.discoveryScore ?? null,
+      confidenceAtDiscovery: poolMember.discoveryConfidence ?? null,
+    },
     status: 'discovery',
   };
 }
@@ -4869,12 +5024,12 @@ async function updateDiscoveryEpisodes(env, pool) {
       if (episode.status === 'complete') continue;
 
       const sigstate = await loadSymbolState(env, member.symbol);
-      episode = applyDiscoveryEpisodeSetup(episode, sigstate);
+      episode = applyDiscoveryEpisodeSetup(episode, sigstate, member.lastScore, member.lastConfidence);
       episode = applyDiscoveryEpisodeArmed(episode, sigstate);
 
       if (!episode.entry) {
         const entryRecord = await findFirstEntryTelemetryRecord(env, member.symbol, episode.discovery.at);
-        episode = applyDiscoveryEpisodeEntry(episode, entryRecord);
+        episode = applyDiscoveryEpisodeEntry(episode, entryRecord, member.lastScore, member.lastConfidence);
       } else if (episode.status === 'entry_pending_outcome' && episode.entry.setupMode) {
         // Bug fix: telemetry KV ключът вече включва setupMode суфикс (виж
         // PR #98) - без него този GET винаги връщаше null и outcome-ът никога
@@ -4884,7 +5039,7 @@ async function updateDiscoveryEpisodes(env, pool) {
         // прецедента с "phantom active" episode-и от миграции по-рано).
         const rawTelemetry = await env.ALERT_STATE.get(`telemetry:${member.symbol}:${episode.entry.at}:${episode.entry.setupMode}`);
         const freshRecord = rawTelemetry ? JSON.parse(rawTelemetry) : null;
-        episode = applyDiscoveryEpisodeOutcome(episode, freshRecord ? freshRecord.outcome15m : null);
+        episode = applyDiscoveryEpisodeOutcome(episode, freshRecord);
       }
 
       await env.ALERT_STATE.put(episodeKey, JSON.stringify(episode));
@@ -4941,6 +5096,19 @@ function summarizeDiscoveryGroup(episodes) {
     avgConfidence: confidenceCount ? confidenceSum / confidenceCount : null,
     byDirection,
   };
+}
+
+// avg/win-rate за произволно entry.<field> измежду подадените episode-и -
+// огледално на buildOutcomeStatsForField (телеметрия по-горе), само че четено
+// от episode.entry вместо direct record полета - реюзвано за outcomeByHorizon
+// по-долу (PR #101).
+function buildDiscoveryOutcomeStatsForField(episodes, field) {
+  let sum = 0, count = 0, wins = 0;
+  for (const ep of episodes) {
+    const v = ep.entry ? ep.entry[field] : null;
+    if (v != null) { sum += v; count++; if (v > 0) wins++; }
+  }
+  return { count, avgOutcomePct: count ? sum / count : null, winRatePct: count ? (wins / count) * 100 : null };
 }
 
 // Агрегира вече заредени/филтрирани discoveryepisode: записи (чисто
@@ -5025,16 +5193,44 @@ function buildDiscoveryEpisodeSummary(episodes) {
   // чисто наблюдение върху вече записаните episode данни.
   const progressedEpisodes = episodes.filter((ep) => classifyDiscoveryEpisodePoolStatus(ep) === 'progressed');
   const displacedEpisodes = episodes.filter((ep) => classifyDiscoveryEpisodePoolStatus(ep) === 'exited_before_setup' && ep.exitReason === 'displaced');
+  // PR #101 - "не стартовият Activity Score, а ЕВОЛЮЦИЯТА му" (виж заявката):
+  // delta = стойността В МОМЕНТА на SETUP/ENTRY минус discovery-time снимката,
+  // само за episode-и, които реално са стигнали дотам (derived.activityScoreAtSetup/
+  // AtEntry идват от applyDiscoveryEpisodeSetup/Entry по-горе, вече "живи"
+  // member.lastScore/lastConfidence стойности от discoverypool - без ново изчисление).
+  const avgDelta = (eps, filterField, atField, baseField) => avg(
+    eps.filter((ep) => ep[filterField]).map((ep) => {
+      const d = ep.derived || {};
+      return (d[atField] != null && d[baseField] != null) ? d[atField] - d[baseField] : null;
+    }).filter((v) => v != null)
+  );
   summary.progressedVsDisplaced = {
     progressed: {
       ...summarizeDiscoveryGroup(progressedEpisodes),
       avgLeadTimeSetupMin: avg(progressedEpisodes.map((ep) => (ep.derived || {}).leadTimeSetupMin).filter((v) => v != null)),
+      avgDeltaActivityDiscoveryToSetup: avgDelta(progressedEpisodes, 'setup', 'activityScoreAtSetup', 'activityScoreAtDiscovery'),
+      avgDeltaConfidenceDiscoveryToSetup: avgDelta(progressedEpisodes, 'setup', 'confidenceAtSetup', 'confidenceAtDiscovery'),
+      avgDeltaActivityDiscoveryToEntry: avgDelta(progressedEpisodes, 'entry', 'activityScoreAtEntry', 'activityScoreAtDiscovery'),
+      avgDeltaConfidenceDiscoveryToEntry: avgDelta(progressedEpisodes, 'entry', 'confidenceAtEntry', 'confidenceAtDiscovery'),
     },
     displaced: {
       ...summarizeDiscoveryGroup(displacedEpisodes),
       avgLifetimeMin: avg(displacedEpisodes.map((ep) => calcDiscoveryEpisodeLifetimeMin(ep)).filter((v) => v != null)),
     },
   };
+
+  // Multi-horizon Discovery ENTRY outcome (PR #101, огледално на
+  // outcomeByHorizon в buildTelemetrySummary) - CONFIRMED и MISSED (counterfactual
+  // chase наблюдение) държани СТРОГО отделно, за да не се смесват в
+  // агрегацията (виж заявката т.1).
+  const confirmedEntryEpisodes = episodes.filter((ep) => ep.entry && ep.entry.decision === 'confirmed');
+  const missedEntryEpisodes = episodes.filter((ep) => ep.entry && ep.entry.decision === 'missed');
+  summary.outcomeByHorizon = { confirmed: {}, missed: {} };
+  for (const m of OUTCOME_HORIZONS_MIN) {
+    const field = `outcome${m}m`;
+    summary.outcomeByHorizon.confirmed[`m${m}`] = buildDiscoveryOutcomeStatsForField(confirmedEntryEpisodes, field);
+    summary.outcomeByHorizon.missed[`m${m}`] = buildDiscoveryOutcomeStatsForField(missedEntryEpisodes, field);
+  }
   return summary;
 }
 
