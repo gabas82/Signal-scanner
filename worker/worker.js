@@ -2120,6 +2120,22 @@ function confirmation15mKey(r) { return (r.confirmation15m === true || r.confirm
 // (винаги undefined за тях) - "не сме проверили", различно от "проверено и не съвпада".
 function htfAlignedKey(r) { return r.htfAligned === true ? 'aligned' : r.htfAligned === false ? 'notAligned' : 'none'; }
 function setupModeKey(r) { return (r.setupMode === 'mean_reversion' || r.setupMode === 'trend_continuation') ? r.setupMode : null; }
+// PR #102 т.1 - entryScore (ENTRY TRIGGER-ово качество) е ОТДЕЛНО поле от
+// setupScore (SETUP-ово качество) - вече съществуващият setupScoreKey не го
+// покрива. Липсващ entryScore (missed/veto нямат) -> null, пропуска се.
+function entryScoreKey(r) { return r.entryScore != null ? String(r.entryScore) : null; }
+// Естествено срещащи се TRAP/AUCTION/MIGRATION комбинации (виж заявката т.1) -
+// НЕ предварително изброени (за разлика от allowedKeys другаде) - само реално
+// съществуващите комбинации се появяват като ключове, останалите просто липсват.
+function setupBreakdownComboKey(r) {
+  const b = r.setupBreakdown;
+  if (!b || typeof b !== 'object') return null;
+  const parts = [];
+  if (b.trap) parts.push('trap');
+  if (b.auction) parts.push('auction');
+  if (b.migration) parts.push('migration');
+  return parts.length ? parts.join('+') : 'base_only';
+}
 // CHASE_MAX_ATR_MULTIPLE (вече съществуващ Stage 3 chase-protection праг) се
 // реюзва тук САМО като описателна bucket граница - диагностика, не нов gate.
 function chaseDistanceBucketKey(r) {
@@ -2172,6 +2188,54 @@ function buildOutcomeStatsForField(records, field) {
   return { count, avgOutcomePct: count ? sum / count : null, winRatePct: count ? (wins / count) * 100 : null };
 }
 
+// PR #102 т.1 - групира records по keyFn, после смята count/avgOutcomePct/
+// winRatePct на всеки хоризонт (m5/15/30/60) за всяка група - общ builder,
+// реюзван от всички измерения на ENTRY SCORE DECOMPOSITION по-долу.
+function buildFieldHorizonBreakdown(records, keyFn) {
+  const groups = {};
+  for (const r of records) {
+    const k = keyFn(r);
+    if (k == null) continue;
+    if (!groups[k]) groups[k] = [];
+    groups[k].push(r);
+  }
+  const out = {};
+  for (const k of Object.keys(groups)) {
+    out[k] = {};
+    for (const m of OUTCOME_HORIZONS_MIN) out[k][`m${m}`] = buildOutcomeStatsForField(groups[k], `outcome${m}m`);
+  }
+  return out;
+}
+// Едно "разрезно гнездо" (direction/entryScore/setupBreakdown/confirmation15m/
+// htfAligned), всяко по m5/15/30/60 - реюзвано и за "overall", и за bySetupMode
+// по-долу (виж заявката: "Ефектът еднакъв ли е при TC и MR?").
+function buildEntryScoreDecompositionGroup(records) {
+  return {
+    byDirection: buildFieldHorizonBreakdown(records, directionKey),
+    byEntryScore: buildFieldHorizonBreakdown(records, entryScoreKey),
+    bySetupBreakdown: buildFieldHorizonBreakdown(records, setupBreakdownComboKey),
+    byConfirmation15m: buildFieldHorizonBreakdown(records, confirmation15mKey),
+    byHtfAligned: buildFieldHorizonBreakdown(records, htfAlignedKey),
+  };
+}
+// ENTRY SCORE DECOMPOSITION (PR #102 т.1, diagnostic-only) - САМО confirmed
+// (виж заявката: "Разбий confirmed ENTRY резултатите"). "overall" дава общата
+// картина, "bySetupMode" я разделя на MEAN REVERSION/TREND CONTINUATION, за да
+// проверим дали наблюдаваната entryScore inverse correlation е еднаква и при
+// двата режима, или е специфична за единия.
+function buildEntryScoreDecomposition(records) {
+  const confirmed = records.filter((r) => r.decision === 'confirmed');
+  const mr = confirmed.filter((r) => r.setupMode === 'mean_reversion');
+  const tc = confirmed.filter((r) => r.setupMode === 'trend_continuation');
+  return {
+    overall: buildEntryScoreDecompositionGroup(confirmed),
+    bySetupMode: {
+      mean_reversion: buildEntryScoreDecompositionGroup(mr),
+      trend_continuation: buildEntryScoreDecompositionGroup(tc),
+    },
+  };
+}
+
 // PR #101 - TC/MR OVERLAP CLASSIFICATION (diagnostic-only, виж заявката т.3).
 // MEAN REVERSION и TREND CONTINUATION са напълно независими state slots (виж
 // PR #98) - НЯМА tie-breaker/dedup в execution логиката. Но за статистиката
@@ -2183,14 +2247,19 @@ function buildOutcomeStatsForField(records, field) {
 // но тесен достатъчно (много по-малък от 5-мин cron интервала) да не слее
 // два реално различни tick-а един в друг.
 const MODE_OVERLAP_WINDOW_MS = 60000;
-function classifyModeOverlap(records) {
+// Намира ВСИЧКИ MR/TC двойки в close time window (виж MODE_OVERLAP_WINDOW_MS
+// по-горе) - споделено между classifyModeOverlap (per-record класификация) и
+// buildModeOverlapDirectionDecomposition (PR #102, детайлна разбивка на BOTH).
+// Връща индексите (не само референции) - позволява classifyModeOverlap да
+// маркира точно тия записи в overlapIdx Set-а по-долу.
+function buildModeOverlapPairs(records) {
   const bySymbol = {};
   records.forEach((r, i) => {
     if (r.setupMode !== 'mean_reversion' && r.setupMode !== 'trend_continuation') return;
     if (!bySymbol[r.symbol]) bySymbol[r.symbol] = [];
     bySymbol[r.symbol].push(i);
   });
-  const overlapIdx = new Set();
+  const pairs = [];
   for (const symbol of Object.keys(bySymbol)) {
     const idxs = bySymbol[symbol];
     const mrIdxs = idxs.filter((i) => records[i].setupMode === 'mean_reversion');
@@ -2198,16 +2267,85 @@ function classifyModeOverlap(records) {
     for (const mi of mrIdxs) {
       for (const ti of tcIdxs) {
         if (Math.abs(records[mi].at - records[ti].at) <= MODE_OVERLAP_WINDOW_MS) {
-          overlapIdx.add(mi); overlapIdx.add(ti);
+          pairs.push({ mrIdx: mi, tcIdx: ti, mr: records[mi], tc: records[ti] });
         }
       }
     }
   }
+  return pairs;
+}
+function classifyModeOverlap(records) {
+  const pairs = buildModeOverlapPairs(records);
+  const overlapIdx = new Set();
+  for (const p of pairs) { overlapIdx.add(p.mrIdx); overlapIdx.add(p.tcIdx); }
   return records.map((r, i) => {
     if (r.setupMode !== 'mean_reversion' && r.setupMode !== 'trend_continuation') return null;
     if (overlapIdx.has(i)) return 'both';
     return r.setupMode === 'mean_reversion' ? 'mr_only' : 'tc_only';
   });
+}
+// PR #102 т.2 - разбивка на BOTH по directionRelation (same_direction/
+// opposite_direction) + TC score×MR score / HTF relation / confirmation15m
+// relation - диагностика ЗАЩО BOTH bucket-ът е толкова слаб. Diagnostic-only:
+// НЕ dedup, НЕ филтър, НЕ warning в известията, НЕ пипа TC/MR state machines.
+function directionRelationKey(pair) {
+  if (pair.mr.direction == null || pair.tc.direction == null) return null;
+  return pair.mr.direction === pair.tc.direction ? 'same_direction' : 'opposite_direction';
+}
+function htfRelationKey(pair) {
+  if (pair.tc.htfAligned == null || pair.mr.htfAligned == null) return 'unknown';
+  return pair.tc.htfAligned === pair.mr.htfAligned ? 'same' : 'different';
+}
+function confirmation15mRelationKey(pair) {
+  if (pair.tc.confirmation15m == null || pair.mr.confirmation15m == null) return 'unknown';
+  return pair.tc.confirmation15m === pair.mr.confirmation15m ? 'same' : 'different';
+}
+function scoreComboKey(pair) {
+  if (pair.tc.setupScore == null || pair.mr.setupScore == null) return null;
+  return `tc${pair.tc.setupScore}_mr${pair.mr.setupScore}`;
+}
+// Групира ПОДАДЕНИТЕ pairs по keyFn(pair) - за всяка група взима и двете
+// страни (mr И tc записа) на всяка двойка, после смята count/avgOutcomePct/
+// winRatePct на всеки хоризонт - огледално на buildFieldHorizonBreakdown
+// по-горе, само че ключът се извлича от ДВОЙКАТА, не от единичен record.
+function buildPairGroupBreakdown(pairs, records, keyFn) {
+  const groups = {};
+  for (const p of pairs) {
+    const k = keyFn(p);
+    if (k == null) continue;
+    if (!groups[k]) groups[k] = new Set();
+    groups[k].add(p.mrIdx); groups[k].add(p.tcIdx);
+  }
+  const out = {};
+  for (const k of Object.keys(groups)) {
+    const recs = records.filter((_, i) => groups[k].has(i));
+    out[k] = {};
+    for (const m of OUTCOME_HORIZONS_MIN) out[k][`m${m}`] = buildOutcomeStatsForField(recs, `outcome${m}m`);
+  }
+  return out;
+}
+function buildModeOverlapDirectionDecomposition(records) {
+  const pairs = buildModeOverlapPairs(records);
+  const relations = pairs.map(directionRelationKey);
+  return {
+    totalPairs: pairs.length,
+    sameDirectionPairs: relations.filter((r) => r === 'same_direction').length,
+    oppositeDirectionPairs: relations.filter((r) => r === 'opposite_direction').length,
+    byDirectionRelation: buildPairGroupBreakdown(pairs, records, directionRelationKey),
+    byScoreCombo: buildPairGroupBreakdown(pairs, records, scoreComboKey),
+    byHtfRelation: buildPairGroupBreakdown(pairs, records, htfRelationKey),
+    byConfirmation15mRelation: buildPairGroupBreakdown(pairs, records, confirmation15mRelationKey),
+    // Суров per-pair контекст (виж заявката) - за директна инспекция в JSON-а,
+    // без да се налага ръчно кръстосване на записите.
+    pairs: pairs.map((p) => ({
+      symbol: p.mr.symbol,
+      directionRelation: directionRelationKey(p),
+      tcDirection: p.tc.direction ?? null, mrDirection: p.mr.direction ?? null,
+      tcSetupScore: p.tc.setupScore ?? null, mrSetupScore: p.mr.setupScore ?? null,
+      tcConfirmation15m: p.tc.confirmation15m ?? null, mrConfirmation15m: p.mr.confirmation15m ?? null,
+      tcHtfAligned: p.tc.htfAligned ?? null, mrHtfAligned: p.mr.htfAligned ?? null,
+    })),
+  };
 }
 // Обобщава modeOverlap класификацията в count/avgOutcomePct/winRatePct
 // (+ по m5/m15/m30/m60) за трите групи - изцяло върху вече изчислената
@@ -2227,6 +2365,7 @@ function buildModeOverlapSummary(records) {
     out[key].byHorizon = {};
     for (const m of OUTCOME_HORIZONS_MIN) out[key].byHorizon[`m${m}`] = buildOutcomeStatsForField(groups[key], `outcome${m}m`);
   }
+  out.both.directionDecomposition = buildModeOverlapDirectionDecomposition(records);
   return out;
 }
 
@@ -2338,8 +2477,15 @@ function buildTelemetrySummary(records) {
   }
 
   // PR #101 т.3 - TC/MR OVERLAP (виж classifyModeOverlap/buildModeOverlapSummary
-  // по-горе) - diagnostic-only, не пипа execution logic-ата.
+  // по-горе) - diagnostic-only, не пипа execution logic-ата. Разширено в
+  // PR #102 т.2 с modeOverlap.both.directionDecomposition (same/opposite
+  // direction, TC×MR score, HTF/confirmation15m relation).
   summary.modeOverlap = buildModeOverlapSummary(records);
+
+  // PR #102 т.1 - ENTRY SCORE DECOMPOSITION (виж buildEntryScoreDecomposition
+  // по-горе) - defensere: КОЙ компонент (trap/auction/migration/confirmation15m/
+  // htfAligned/direction) обяснява наблюдаваната entryScore inverse correlation.
+  summary.entryScoreDecomposition = buildEntryScoreDecomposition(records);
 
   // PR #101 т.4 - setupMode -> confirmation15m -> HTF и обратно setupMode ->
   // HTF -> confirmation15m (виж buildDoubleNestedBreakdown по-горе) - "apparent
