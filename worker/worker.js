@@ -2042,7 +2042,7 @@ function buildTelemetryRecord({
   symbol, direction, decision, setupScore, setupBreakdown, armedAt, structRef,
   triggerClose, atr5m, triggerRange, confirmation15m, flowState,
   trapTier, trapDirection, flowWarmingTier, flowWarmingDirection, entryScore,
-  setupMode, htfAligned,
+  setupMode, htfAligned, bothQuality,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
   return {
@@ -2075,6 +2075,9 @@ function buildTelemetryRecord({
     mfe30m: null, mae30m: null, mfe30mAtr: null, mae30mAtr: null,
     mfe60m: null, mae60m: null, mfe60mAtr: null, mae60mAtr: null,
     timeToMfeMin: null, timeToMaeMin: null, maeBeforeMfePct: null, mfeBeforeMaePct: null,
+    // PR #104 - BOTH QUALITY (виж classifyBothQuality по-долу) - null освен
+    // когато TC и MR произведат ENTRY В СЪЩИЯ tick ('normal'/'degraded').
+    bothQuality: bothQuality ?? null,
   };
 }
 
@@ -2212,6 +2215,9 @@ function chaseDistanceBucketKey(r) {
   if (ratio < CHASE_MAX_ATR_MULTIPLE) return 'from1to1_5';
   return 'gte1_5';
 }
+// PR #104 - BOTH QUALITY (виж classifyBothQuality по-горе) - null за записи,
+// които не са част от same-tick BOTH ENTRY ('normal'/'degraded' само тогава).
+function bothQualityKey(r) { return (r.bothQuality === 'normal' || r.bothQuality === 'degraded') ? r.bothQuality : null; }
 // Диагностичен въпрос: "confirmation15m=false бие true - навсякъде ли, или
 // само при конкретна комбинация?" - добавя 4-те разреза directly ВЪТРЕ в
 // вече изчисления true/false бъкет (мутира на място).
@@ -2490,6 +2496,16 @@ function scoreComboKey(pair) {
   if (pair.tc.setupScore == null || pair.mr.setupScore == null) return null;
   return `tc${pair.tc.setupScore}_mr${pair.mr.setupScore}`;
 }
+// PR #104 - BOTH QUALITY: LIVE аналог на историческия findings (виж
+// scoreComboKey по-горе) - modeOverlap=both + scoreCombo=tc3_mr3 е бил
+// многократно потвърден като най-слабата BOTH подгрупа. Само маркиране
+// (alert text + telemetry поле) - НЕ hard veto, TC/MR execution логиката
+// (entryResult/trendEntryResult/state machines) остава напълно непроменена.
+// tc2_mr2 и всички останали комбинации -> 'normal' (незасегнати от заявката).
+function classifyBothQuality(mrSetupScore, tcSetupScore) {
+  if (mrSetupScore == null || tcSetupScore == null) return null;
+  return (mrSetupScore === 3 && tcSetupScore === 3) ? 'degraded' : 'normal';
+}
 // Групира ПОДАДЕНИТЕ pairs по keyFn(pair) - за всяка група взима и двете
 // страни (mr И tc записа) на всяка двойка, после смята count/avgOutcomePct/
 // winRatePct на всеки хоризонт - огледално на buildFieldHorizonBreakdown
@@ -2689,6 +2705,13 @@ function buildTelemetrySummary(records) {
   // по-горе) - MFE/MAE path профил на CONFIRMED и MISSED, диагностика на
   // причината зад m15/m60 inverse correlation-а от PR #102.
   summary.pathDiagnostics = buildPathDiagnostics(records);
+
+  // PR #104 - BOTH QUALITY (виж classifyBothQuality/bothQualityKey по-горе) -
+  // измерва РЕАЛНИЯ ефект от живото маркиране: NORMAL (both, не tc3_mr3) vs
+  // DEGRADED (both, tc3_mr3) изход по m5/m15/m30/m60. Само записите от MOMEHTA
+  // на деплоя нататък ще имат непразно bothQuality (виж wiring-а в
+  // scanSymbolSignals) - исторически записи остават null, не се реконструират.
+  summary.bothQualityStats = buildFieldHorizonBreakdown(records, bothQualityKey);
   return summary;
 }
 
@@ -3987,6 +4010,10 @@ async function scanSymbolSignals(env, symbol) {
   // мрежови заявки. ENTRY/MISSED консумират ARMED (сядат в state.armed=null) -
   // едностранно събитие на епизод, огледално на самия state machine дизайн.
   let entryResult = { status: 'none' };
+  // PR #104 - BOTH QUALITY: пази record.at на MR telemetry записа от ТОЗИ tick
+  // (ако е създаден), за да може TC блокът по-долу да го patch-не с bothQuality,
+  // ако TC СЪЩО влезе в ENTRY в СЪЩИЯ tick (виж classifyBothQuality по-горе).
+  let mrTelemetryRecordAt = null;
   if (state.armed) {
     const entryDirection = state.armed.direction;
     const atr5m = calcATR(c5Closed, 14);
@@ -4021,6 +4048,7 @@ async function scanSymbolSignals(env, symbol) {
         entryScore: entryResult.score,
         setupMode: 'mean_reversion', htfAligned: entryResult.htfAligned,
       });
+      mrTelemetryRecordAt = record.at; // PR #104 - виж коментара при декларацията по-горе
       if (env.ALERT_STATE) {
         // setupMode-суфикс в KV ключа - предпазва от презаписване, ако
         // MEAN REVERSION и TREND CONTINUATION произведат telemetry запис за
@@ -4096,6 +4124,18 @@ async function scanSymbolSignals(env, symbol) {
       candle15m: c15Closed.length ? c15Closed[c15Closed.length - 1] : null, atr15m,
       structRef, flowVeto, flowBoost, htfAligned,
     });
+    // PR #104 - BOTH QUALITY: по тук entryResult (MEAN REVERSION) е ВЕЧЕ
+    // напълно финализиран (блокът по-горе завърши) - можем безопасно да
+    // проверим дали TC СЪЩО влиза в ENTRY в СЪЩИЯ tick (винаги в
+    // MODE_OVERLAP_WINDOW_MS - виж коментара при константата). Само
+    // маркиране - НЕ hard veto, entryResult/trendEntryResult статусите по-горе
+    // остават непроменени.
+    const bothEntryThisTick = entryResult.status === 'entry' && trendEntryResult.status === 'entry';
+    const bothQuality = bothEntryThisTick ? classifyBothQuality(setupState.score, trendSetupState.score) : null;
+    if (bothEntryThisTick) {
+      entryResult.bothQuality = bothQuality;
+      trendEntryResult.bothQuality = bothQuality;
+    }
     if (trendEntryResult.status === 'entry' || trendEntryResult.status === 'missed' || trendEntryResult.status === 'veto') {
       const decision = trendEntryResult.status === 'entry' ? 'confirmed' : trendEntryResult.status;
       const record = buildTelemetryRecord({
@@ -4110,6 +4150,7 @@ async function scanSymbolSignals(env, symbol) {
         trapTier, trapDirection, flowWarmingTier, flowWarmingDirection,
         entryScore: trendEntryResult.score,
         setupMode: 'trend_continuation', htfAligned: trendEntryResult.htfAligned,
+        bothQuality,
       });
       if (env.ALERT_STATE) {
         const telemetryKey = `telemetry:${symbol}:${record.at}:${record.setupMode}`;
@@ -4121,6 +4162,18 @@ async function scanSymbolSignals(env, symbol) {
             entryPrice: record.triggerClose, direction: entryDirection,
             entryAt: record.at, atr5m, // PR #103 PATH DIAGNOSTICS (MFE/MAE) - виж updateExcursion
           });
+        }
+        // PR #104 - MR записът (по-горе) е бил записан ПРЕДИ да знаем дали TC
+        // СЪЩО ще влезе - patch-ваме го тук със същия bothQuality (fetch-merge-
+        // put, огледално на resolvePendingOutcomeHorizons wiring-а по-долу).
+        if (bothEntryThisTick && mrTelemetryRecordAt != null) {
+          const mrTelemetryKey = `telemetry:${symbol}:${mrTelemetryRecordAt}:mean_reversion`;
+          const rawMr = await env.ALERT_STATE.get(mrTelemetryKey);
+          if (rawMr) {
+            const mrRecord = JSON.parse(rawMr);
+            mrRecord.bothQuality = bothQuality;
+            await env.ALERT_STATE.put(mrTelemetryKey, JSON.stringify(mrRecord));
+          }
         }
       }
     }
@@ -4425,6 +4478,9 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
             `FLOW: ${entryResult.flowBoost ? '✓ потвърждава' : '—'}`,
             `HTF CONTEXT: ${entryResult.htfAligned ? '✓ съвпада' : '—'}`,
             `ENTRY SCORE: ${entryResult.score}/5`,
+            // PR #104 - BOTH QUALITY (виж classifyBothQuality по-горе) - само
+            // маркиране, само за tc3_mr3 same-tick BOTH случая. НЕ hard veto.
+            ...(entryResult.bothQuality === 'degraded' ? [`⚠️ BOTH QUALITY: DEGRADED (TC+MR едновременно, tc3_mr3 - исторически по-слаб резултат)`] : []),
             `⚠️ Не гони цената отвъд ${formatPrice(entryResult.structRef)} USD`,
           ];
           await sendWhatsApp(env, entryLines.join('\n'));
@@ -4479,6 +4535,9 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
             `FLOW: ${trendEntryResult.flowBoost ? '✓ потвърждава' : '—'}`,
             `HTF CONTEXT: ${trendEntryResult.htfAligned ? '✓ съвпада' : '—'}`,
             `ENTRY SCORE: ${trendEntryResult.score}/5`,
+            // PR #104 - BOTH QUALITY (виж classifyBothQuality по-горе) - само
+            // маркиране, само за tc3_mr3 same-tick BOTH случая. НЕ hard veto.
+            ...(trendEntryResult.bothQuality === 'degraded' ? [`⚠️ BOTH QUALITY: DEGRADED (TC+MR едновременно, tc3_mr3 - исторически по-слаб резултат)`] : []),
             `⚠️ Не гони цената отвъд ${formatPrice(trendEntryResult.structRef)} USD`,
           ];
           await sendWhatsApp(env, entryLines.join('\n'));
