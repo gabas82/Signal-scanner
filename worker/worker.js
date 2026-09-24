@@ -2043,6 +2043,7 @@ function buildTelemetryRecord({
   triggerClose, atr5m, triggerRange, confirmation15m, flowState,
   trapTier, trapDirection, flowWarmingTier, flowWarmingDirection, entryScore,
   setupMode, htfAligned, bothQuality,
+  timeFromArmMin, pctMoveFromArm, atrMoveFromArm,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
   return {
@@ -2078,6 +2079,11 @@ function buildTelemetryRecord({
     // PR #104 - BOTH QUALITY (виж classifyBothQuality по-долу) - null освен
     // когато TC и MR произведат ENTRY В СЪЩИЯ tick ('normal'/'degraded').
     bothQuality: bothQuality ?? null,
+    // PR #105 - TC LIFECYCLE TELEMETRY (виж buildTcArmedResetRecord по-долу) -
+    // само за TREND CONTINUATION call site-а (MR никога не ги подава, остават
+    // null) - ARMED -> ENTRY EVALUATION latency/move контекст.
+    timeFromArmMin: timeFromArmMin ?? null, pctMoveFromArm: pctMoveFromArm ?? null,
+    atrMoveFromArm: atrMoveFromArm ?? null,
   };
 }
 
@@ -2095,6 +2101,44 @@ function pctExcursionToAtrRatio(pct, entryPrice, atr) {
   if (pct == null || entryPrice == null || !(atr > 0)) return null;
   const priceDelta = Math.abs((pct / 100) * entryPrice);
   return priceDelta / atr;
+}
+
+// ═══ PR #105 - TC LIFECYCLE TELEMETRY (diagnostic-only) ═══════════════════════
+// Отговаря на въпроса "КЪДЕ се губят TC сигналите между SETUP -> ARMED ->
+// ENTRY?" (виж discussion-а за BTC 05:40/05:45 повторно ARMED). Само
+// TREND CONTINUATION - НЕ пипа MEAN REVERSION, НЕ пипа execution логиката
+// (calcTrendContinuationSetupState/calcArmedTrigger/calcEntryTrigger остават
+// байт-идентични - виж wiring-а в scanSymbolSignals). Собствен KV namespace
+// (tclifecycle:), никога не се чете обратно от ARMED/ENTRY логиката - чист
+// append-only recorder.
+function buildTcSetupCreatedRecord({ symbol, direction, price, setupScore, confidenceMajority }) {
+  return {
+    kind: 'setup_created', symbol, direction, at: Date.now(),
+    price: price ?? null, setupScore: setupScore ?? null,
+    confidenceMajority: confidenceMajority ?? null,
+  };
+}
+function buildTcArmedCreatedRecord({ symbol, direction, priceAtArm, structuralReference, atrAtArm, setupAt }) {
+  return {
+    kind: 'armed_created', symbol, direction, at: Date.now(),
+    priceAtArm: priceAtArm ?? null, structuralReference: structuralReference ?? null,
+    atrAtArm: (atrAtArm > 0) ? atrAtArm : null, setupAt: setupAt ?? null,
+  };
+}
+// reason: 'confidence_lost'|'direction_changed'|'expired_6h'|'entry_confirmed'|
+// 'entry_missed' - виж discussion-а защо точно тия 5 (единствените реални
+// клонове, при които state.trendArmed се нулира в кода). pctMoveFromArm/
+// atrMoveFromArm реюзват СЪЩАТА calcOutcomePct/pctExcursionToAtrRatio формула
+// като MFE/MAE (PR #103) - без нова математика.
+function buildTcArmedResetRecord({ symbol, direction, armedAt, priceAtArm, reason, price, atrAtArm }) {
+  const at = Date.now();
+  const armedDurationMin = (armedAt != null) ? (at - armedAt) / 60000 : null;
+  const pctMoveFromArm = calcOutcomePct(direction, priceAtArm, price);
+  const atrMoveFromArm = pctExcursionToAtrRatio(pctMoveFromArm, priceAtArm, atrAtArm);
+  return {
+    kind: 'armed_reset', symbol, direction, at, armedAt: armedAt ?? null, reason,
+    price: price ?? null, armedDurationMin, pctMoveFromArm, atrMoveFromArm,
+  };
 }
 
 // Актуализира running MFE/MAE на ЕДИН pending outcome, използвайки вече
@@ -2713,6 +2757,143 @@ function buildTelemetrySummary(records) {
   // scanSymbolSignals) - исторически записи остават null, не се реконструират.
   summary.bothQualityStats = buildFieldHorizonBreakdown(records, bothQualityKey);
   return summary;
+}
+
+// ═══ PR #105 - TC LIFECYCLE TELEMETRY SUMMARY (viж buildTcSetupCreatedRecord/
+// buildTcArmedCreatedRecord/buildTcArmedResetRecord по-горе) - прост funnel
+// SETUP -> ARMED -> RE-ARM/RESET -> ENTRY EVALUATION -> CONFIRMED/MISSED/VETO,
+// за да отговорим "КЪДЕ се губят TC сигналите?" (A: няма trigger свещ / B:
+// chase protection / C: FLOW veto / D: confidence flicker / E: чака твърде
+// дълго). Diagnostic-only - изцяло върху вече записаните records, БЕЗ нов fetch.
+
+// resetByReason - динамични ключове (само реално срещнатите reasons, огледално
+// на setupBreakdownComboKey другаде в тоя файл) - 'confidence_lost'/
+// 'direction_changed'/'expired_6h'/'entry_confirmed'/'entry_missed' са
+// ЕДИНСТВЕНИТЕ реални клонове в кода (виж wiring-а в scanSymbolSignals).
+function buildTcResetByReason(resetRecords) {
+  const out = {};
+  for (const r of resetRecords) {
+    if (!r.reason) continue;
+    out[r.reason] = (out[r.reason] || 0) + 1;
+  }
+  return out;
+}
+
+// RE-ARM (виж заявката: "колко пъти symbol+direction се ARMED-ва повторно" +
+// "времето между re-arm") - derived ИЗЦЯЛО от armed_created записите,
+// сортирани по symbol+direction+timestamp - без нов "episode id" state
+// (потвърдено с потребителя: TC SETUP се нулира на СЪЩОТО условие като TC
+// ARMED, затова "по-голям episode" не съществува като стабилно състояние в
+// кода - това е НАЙ-ДОБРИЯТ proxy, не изкуствена дефиниция).
+function buildTcReArmStats(armedCreatedRecords) {
+  const bySymbolDirection = {};
+  for (const r of armedCreatedRecords) {
+    const key = `${r.symbol}_${r.direction}`;
+    if (!bySymbolDirection[key]) bySymbolDirection[key] = [];
+    bySymbolDirection[key].push(r.at);
+  }
+  let reArmCount = 0;
+  const allGapsMin = [];
+  const bySymbolDirectionOut = {};
+  for (const key of Object.keys(bySymbolDirection)) {
+    const times = bySymbolDirection[key].slice().sort((a, b) => a - b);
+    const gapsMin = [];
+    for (let i = 1; i < times.length; i++) gapsMin.push((times[i] - times[i - 1]) / 60000);
+    reArmCount += gapsMin.length;
+    allGapsMin.push(...gapsMin);
+    bySymbolDirectionOut[key] = { armedCount: times.length, reArmCount: gapsMin.length, gapsMin };
+  }
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  const median = (arr) => (arr.length ? calcPercentile([...arr].sort((a, b) => a - b), 50) : null);
+  return {
+    reArmCount, avgReArmGapMin: avg(allGapsMin), medianReArmGapMin: median(allGapsMin),
+    bySymbolDirection: bySymbolDirectionOut,
+  };
+}
+
+// Latency buckets ARMED -> ENTRY evaluation (виж заявката) - на база
+// timeFromArmMin, вече записан на ENTRY EVALUATION записите (PR #105
+// buildTelemetryRecord разширение). null timeFromArmMin (легаси записи отпреди
+// деплоя) не участва в никой bucket - не се реконструира.
+const TC_ARM_TO_ENTRY_LATENCY_BUCKETS = ['lt1min', 'from1to5min', 'from5to10min', 'from10to30min', 'from30to60min', 'gte60min'];
+function tcArmToEntryLatencyBucketKey(timeFromArmMin) {
+  if (timeFromArmMin == null) return null;
+  if (timeFromArmMin < 1) return 'lt1min';
+  if (timeFromArmMin < 5) return 'from1to5min';
+  if (timeFromArmMin < 10) return 'from5to10min';
+  if (timeFromArmMin < 30) return 'from10to30min';
+  if (timeFromArmMin < 60) return 'from30to60min';
+  return 'gte60min';
+}
+function buildTcLatencyBucketStats(records) {
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  const pctVals = records.map((r) => r.pctMoveFromArm).filter((v) => v != null);
+  const atrVals = records.map((r) => r.atrMoveFromArm).filter((v) => v != null);
+  return {
+    count: records.length,
+    confirmed: records.filter((r) => r.decision === 'confirmed').length,
+    missed: records.filter((r) => r.decision === 'missed').length,
+    veto: records.filter((r) => r.decision === 'veto').length,
+    avgPctMoveFromArm: avg(pctVals), avgAtrMoveFromArm: avg(atrVals),
+  };
+}
+function buildTcLatencyBuckets(tcEntryRecords) {
+  const groups = {};
+  for (const r of tcEntryRecords) {
+    const k = tcArmToEntryLatencyBucketKey(r.timeFromArmMin);
+    if (k == null) continue;
+    if (!groups[k]) groups[k] = [];
+    groups[k].push(r);
+  }
+  const out = {};
+  for (const k of TC_ARM_TO_ENTRY_LATENCY_BUCKETS) out[k] = buildTcLatencyBucketStats(groups[k] || []);
+  return out;
+}
+
+// Главният funnel - tcEntryRecords = вече съществуващите telemetry: записи,
+// филтрирани по setupMode='trend_continuation' (ENTRY EVALUATION - CONFIRMED/
+// MISSED/VETO), lifecycleRecords = новите tclifecycle: записи (setup_created/
+// armed_created/armed_reset). armedAt свързва ENTRY EVALUATION към неговия
+// ARMED епизод (вече съществуващо поле, виж buildTelemetryRecord).
+function buildTcLifecycleSummary(lifecycleRecords, tcEntryRecords) {
+  const setupCreatedRecords = lifecycleRecords.filter((r) => r.kind === 'setup_created');
+  const armedCreatedRecords = lifecycleRecords.filter((r) => r.kind === 'armed_created');
+  const resetRecords = lifecycleRecords.filter((r) => r.kind === 'armed_reset');
+
+  const confirmed = tcEntryRecords.filter((r) => r.decision === 'confirmed').length;
+  const missed = tcEntryRecords.filter((r) => r.decision === 'missed').length;
+  const vetoRecords = tcEntryRecords.filter((r) => r.decision === 'veto');
+  const veto = vetoRecords.length;
+  // episodesWithVeto (уникални ARMED епизоди с >=1 VETO) vs rawVetoEvaluations
+  // (общ брой VETO evaluation-и) - VETO НЕ е терминален за епизода (виж
+  // discussion-а), затова двете НЕ съвпадат automatически.
+  const episodesWithVeto = new Set(vetoRecords.map((r) => `${r.symbol}|${r.armedAt}`)).size;
+  const avgVetoPerVetoEpisode = episodesWithVeto ? veto / episodesWithVeto : null;
+  const armedEpisodesReachingEvaluation = new Set(tcEntryRecords.map((r) => `${r.symbol}|${r.armedAt}`)).size;
+
+  const armedCreatedCount = armedCreatedRecords.length;
+  const setupCreatedCount = setupCreatedRecords.length;
+  const pct = (num, den) => (den ? (num / den) * 100 : null);
+
+  return {
+    setupCreated: setupCreatedCount,
+    armedCreated: armedCreatedCount,
+    reArm: buildTcReArmStats(armedCreatedRecords),
+    resetByReason: buildTcResetByReason(resetRecords),
+    entryEvaluation: {
+      total: tcEntryRecords.length, confirmed, missed, veto,
+      episodesWithVeto, rawVetoEvaluations: veto, avgVetoPerVetoEpisode,
+      armedEpisodesReachingEvaluation,
+    },
+    conversionPct: {
+      setupToArmedPct: pct(armedCreatedCount, setupCreatedCount),
+      armedToAnyEvaluationPct: pct(armedEpisodesReachingEvaluation, armedCreatedCount),
+      armedToConfirmedPct: pct(confirmed, armedCreatedCount),
+      armedToMissedPct: pct(missed, armedCreatedCount),
+      armedToVetoEpisodePct: pct(episodesWithVeto, armedCreatedCount),
+    },
+    latencyBuckets: buildTcLatencyBuckets(tcEntryRecords),
+  };
 }
 
 // ENTRY ENGINE STAGE DIRECTION COUNTS - diagnostic-only брояч на LONG/SHORT
@@ -4087,12 +4268,51 @@ async function scanSymbolSignals(env, symbol) {
   });
   const trendSetupFired = trendSetupCanFire(state, trendSetupState.direction);
   if (trendSetupFired) markTrendSetupFired(state, trendSetupState.direction, trendSetupState.score, price);
+  // PR #105 - TC LIFECYCLE TELEMETRY: SETUP CREATED - на СЪЩИЯ edge-trigger
+  // момент като WhatsApp SETUP известието (trendSetupFired), diagnostic-only.
+  if (trendSetupFired && env.ALERT_STATE) {
+    const tcSetupRecord = buildTcSetupCreatedRecord({
+      symbol, direction: trendSetupState.direction, price,
+      setupScore: trendSetupState.score, confidenceMajority: confidence.majority,
+    });
+    await env.ALERT_STATE.put(`tclifecycle:${symbol}:${tcSetupRecord.at}:setup_created`, JSON.stringify(tcSetupRecord));
+  }
   if (!trendSetupState.direction) state.trendSetup = null;
 
-  if (!trendSetupState.direction || (state.trendArmed && state.trendArmed.direction !== trendSetupState.direction)) {
+  // PR #105 - TC LIFECYCLE TELEMETRY: ARMED RESET (confidence_lost/
+  // direction_changed) - пазим СТАРИЯ state.trendArmed ПРЕДИ да го нулираме,
+  // за да запишем armedDurationMin/pctMoveFromArm/atrMoveFromArm за епизода,
+  // който приключва тук. trendArmedResetReason се смята ПЪРВО, после се
+  // прилага reset-а - byte-идентично поведение на предишното единично if
+  // (state.trendArmed завършва null в двата случая), само добавя diagnostic
+  // reason преди мутацията.
+  const prevTrendArmed = state.trendArmed;
+  let trendArmedResetReason = null;
+  if (prevTrendArmed) {
+    if (!trendSetupState.direction) trendArmedResetReason = 'confidence_lost';
+    else if (prevTrendArmed.direction !== trendSetupState.direction) trendArmedResetReason = 'direction_changed';
+  }
+  if (trendArmedResetReason) {
     state.trendArmed = null;
+    if (env.ALERT_STATE) {
+      const resetRecord = buildTcArmedResetRecord({
+        symbol, direction: prevTrendArmed.direction, armedAt: prevTrendArmed.at,
+        priceAtArm: prevTrendArmed.priceAtArm, reason: trendArmedResetReason, price,
+        atrAtArm: prevTrendArmed.atrAtArm,
+      });
+      await env.ALERT_STATE.put(`tclifecycle:${symbol}:${resetRecord.at}:armed_reset`, JSON.stringify(resetRecord));
+    }
   }
   if (state.trendArmed && (Date.now() - state.trendArmed.at) >= ARMED_EXPIRY_HOURS * 3600000) {
+    // PR #105 - TC LIFECYCLE TELEMETRY: ARMED RESET (expired_6h)
+    if (env.ALERT_STATE) {
+      const expiredRecord = buildTcArmedResetRecord({
+        symbol, direction: state.trendArmed.direction, armedAt: state.trendArmed.at,
+        priceAtArm: state.trendArmed.priceAtArm, reason: 'expired_6h', price,
+        atrAtArm: state.trendArmed.atrAtArm,
+      });
+      await env.ALERT_STATE.put(`tclifecycle:${symbol}:${expiredRecord.at}:armed_reset`, JSON.stringify(expiredRecord));
+    }
     state.trendArmed = null;
   }
   let trendArmedFired = false;
@@ -4100,8 +4320,28 @@ async function scanSymbolSignals(env, symbol) {
     const lastClosed5mForTrend = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
     const trendArmedDirectionCandidate = calcArmedTrigger(trendSetupState.direction, state.swingStruct, lastClosed5mForTrend);
     if (trendArmedDirectionCandidate) {
-      state.trendArmed = { direction: trendArmedDirectionCandidate, at: Date.now(), priceAtArm: price };
+      // PR #105 - TC LIFECYCLE TELEMETRY: ATRAtArm/structuralReference - четем
+      // вече наличните c5Closed/state.swingStruct малко по-рано от обичайното
+      // (иначе се смятат чак в ENTRY TRIGGER блока по-долу) - чисто
+      // преместване на READ, БЕЗ нова мрежова заявка, БЕЗ промяна на
+      // ARMED/ENTRY логиката.
+      const atr5mAtArm = calcATR(c5Closed, 14);
+      const structuralReferenceAtArm = trendArmedDirectionCandidate === 'short'
+        ? (state.swingStruct.lastSwingLow ? state.swingStruct.lastSwingLow.price : null)
+        : (state.swingStruct.lastSwingHigh ? state.swingStruct.lastSwingHigh.price : null);
+      state.trendArmed = {
+        direction: trendArmedDirectionCandidate, at: Date.now(), priceAtArm: price,
+        atrAtArm: (atr5mAtArm > 0) ? atr5mAtArm : null, // PR #105 - чисто информационен, виж коментара по-горе
+      };
       trendArmedFired = true;
+      if (env.ALERT_STATE) {
+        const armedRecord = buildTcArmedCreatedRecord({
+          symbol, direction: trendArmedDirectionCandidate, priceAtArm: price,
+          structuralReference: structuralReferenceAtArm, atrAtArm: atr5mAtArm,
+          setupAt: state.trendSetup ? state.trendSetup.at : null,
+        });
+        await env.ALERT_STATE.put(`tclifecycle:${symbol}:${armedRecord.at}:armed_created`, JSON.stringify(armedRecord));
+      }
     }
   }
   const trendArmedDirection = state.trendArmed ? state.trendArmed.direction : null;
@@ -4124,6 +4364,17 @@ async function scanSymbolSignals(env, symbol) {
       candle15m: c15Closed.length ? c15Closed[c15Closed.length - 1] : null, atr15m,
       structRef, flowVeto, flowBoost, htfAligned,
     });
+    // PR #105 - TC LIFECYCLE TELEMETRY: смята се веднага след calcEntryTrigger,
+    // СПОДЕЛЕНО между ENTRY EVALUATION записа по-долу и терминалния ARMED
+    // RESET запис (entry_confirmed/entry_missed, виж по-долу) - една смятана
+    // стойност, реюзвана, а не дублирана математика. null за status:'none'
+    // (няма evaluation този tick).
+    let tcTimeFromArmMin = null, tcPctMoveFromArm = null, tcAtrMoveFromArm = null;
+    if (trendEntryResult.status !== 'none') {
+      tcTimeFromArmMin = (Date.now() - state.trendArmed.at) / 60000;
+      tcPctMoveFromArm = calcOutcomePct(entryDirection, state.trendArmed.priceAtArm, trendEntryResult.triggerClose);
+      tcAtrMoveFromArm = pctExcursionToAtrRatio(tcPctMoveFromArm, state.trendArmed.priceAtArm, state.trendArmed.atrAtArm);
+    }
     // PR #104 - BOTH QUALITY: по тук entryResult (MEAN REVERSION) е ВЕЧЕ
     // напълно финализиран (блокът по-горе завърши) - можем безопасно да
     // проверим дали TC СЪЩО влиза в ENTRY в СЪЩИЯ tick (винаги в
@@ -4151,6 +4402,7 @@ async function scanSymbolSignals(env, symbol) {
         entryScore: trendEntryResult.score,
         setupMode: 'trend_continuation', htfAligned: trendEntryResult.htfAligned,
         bothQuality,
+        timeFromArmMin: tcTimeFromArmMin, pctMoveFromArm: tcPctMoveFromArm, atrMoveFromArm: tcAtrMoveFromArm,
       });
       if (env.ALERT_STATE) {
         const telemetryKey = `telemetry:${symbol}:${record.at}:${record.setupMode}`;
@@ -4180,6 +4432,20 @@ async function scanSymbolSignals(env, symbol) {
     if (trendEntryResult.status === 'entry' || trendEntryResult.status === 'missed') {
       trendEntryResult.direction = entryDirection;
       trendEntryResult.priceAtArm = state.trendArmed.priceAtArm; // само за контекст в известието
+      // PR #105 - TC LIFECYCLE TELEMETRY: ARMED RESET (entry_confirmed/
+      // entry_missed) - реюзва tcTimeFromArmMin/tcPctMoveFromArm/
+      // tcAtrMoveFromArm, вече изчислени по-горе - без дублирана математика,
+      // за да съвпадат точно с ENTRY EVALUATION записа за същия момент.
+      if (env.ALERT_STATE) {
+        const terminalReason = trendEntryResult.status === 'entry' ? 'entry_confirmed' : 'entry_missed';
+        const terminalResetRecord = {
+          kind: 'armed_reset', symbol, direction: entryDirection, at: Date.now(),
+          armedAt: state.trendArmed.at, reason: terminalReason,
+          price: trendEntryResult.triggerClose, armedDurationMin: tcTimeFromArmMin,
+          pctMoveFromArm: tcPctMoveFromArm, atrMoveFromArm: tcAtrMoveFromArm,
+        };
+        await env.ALERT_STATE.put(`tclifecycle:${symbol}:${terminalResetRecord.at}:armed_reset`, JSON.stringify(terminalResetRecord));
+      }
       state.trendArmed = null; // само СВОЯ слот - state.armed (MEAN REVERSION) остава непокътнат
     }
   }
@@ -5827,6 +6093,82 @@ export default {
         records: records.slice(0, limit),
         summary: buildTelemetrySummary(records),
         stageDirectionCounts,
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    }
+
+    // PR #105 - TC LIFECYCLE TELEMETRY: read-only debug ендпойнт (виж
+    // buildTcLifecycleSummary по-горе). Огледален на /telemetry по-горе -
+    // същия TELEMETRY_TOKEN, същия MAX_KEYS_SCANNED таван, същия fail-closed
+    // auth. Комбинира ДВЕ KV namespaces: tclifecycle: (setup_created/
+    // armed_created/armed_reset, нови в PR #105) + telemetry: филтрирано по
+    // setupMode='trend_continuation' (вече съществуващите ENTRY EVALUATION
+    // записи, разширени в PR #105 с timeFromArmMin/pctMoveFromArm/
+    // atrMoveFromArm). Чисто READ - никаква промяна на ARMED/ENTRY логиката.
+    if (path === "/tc-lifecycle" && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ALERT_STATE) {
+        return new Response(JSON.stringify({ error: "ALERT_STATE not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const symbolFilter = url.searchParams.get("symbol");
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 500);
+      const MAX_KEYS_SCANNED = 2000;
+
+      const lifecyclePrefix = symbolFilter ? `tclifecycle:${symbolFilter}:` : "tclifecycle:";
+      let lifecycleKeys = [];
+      let lcCursor;
+      do {
+        const listResult = await env.ALERT_STATE.list({ prefix: lifecyclePrefix, cursor: lcCursor, limit: 1000 });
+        lifecycleKeys.push(...listResult.keys);
+        lcCursor = listResult.list_complete ? undefined : listResult.cursor;
+      } while (lcCursor && lifecycleKeys.length < MAX_KEYS_SCANNED);
+      const lifecycleTruncated = lifecycleKeys.length > MAX_KEYS_SCANNED;
+      lifecycleKeys = lifecycleKeys.slice(0, MAX_KEYS_SCANNED);
+      const lifecycleRecords = [];
+      for (const k of lifecycleKeys) {
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        lifecycleRecords.push(rec);
+      }
+      lifecycleRecords.sort((a, b) => b.at - a.at);
+
+      // Реюзва вече съществуващите telemetry: записи (ENTRY EVALUATION), само
+      // trend_continuation - без duplicate storage на CONFIRMED/MISSED/VETO
+      // данните, които вече живеят в /telemetry.
+      const telemetryPrefix = symbolFilter ? `telemetry:${symbolFilter}:` : "telemetry:";
+      let telemetryKeys = [];
+      let tCursor;
+      do {
+        const listResult = await env.ALERT_STATE.list({ prefix: telemetryPrefix, cursor: tCursor, limit: 1000 });
+        telemetryKeys.push(...listResult.keys);
+        tCursor = listResult.list_complete ? undefined : listResult.cursor;
+      } while (tCursor && telemetryKeys.length < MAX_KEYS_SCANNED);
+      const telemetryTruncated = telemetryKeys.length > MAX_KEYS_SCANNED;
+      telemetryKeys = telemetryKeys.slice(0, MAX_KEYS_SCANNED);
+      const tcEntryRecords = [];
+      for (const k of telemetryKeys) {
+        if (!k.name.endsWith(':trend_continuation')) continue;
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        tcEntryRecords.push(rec);
+      }
+
+      return new Response(JSON.stringify({
+        lifecycleCount: lifecycleRecords.length, lifecycleTruncated,
+        entryEvaluationCount: tcEntryRecords.length, telemetryTruncated,
+        records: lifecycleRecords.slice(0, limit),
+        summary: buildTcLifecycleSummary(lifecycleRecords, tcEntryRecords),
       }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
     }
 
