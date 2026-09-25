@@ -4745,20 +4745,31 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
         const dirLabel = entryResult.direction === 'long' ? 'LONG' : 'SHORT';
         if (entryResult.status === 'entry') {
+          // Козметично форматиране (по искане на потребителя) - целта е
+          // финалният ENTRY CONFIRMED да се набива на очи сред останалите
+          // WhatsApp известия (SETUP/ARMED/PHASE CYCLE и т.н.), защото това е
+          // единственият момент с конкретна входна цена за forward тестване.
+          // Данните вътре са same - само визуалният layout е нов.
           const entryLines = [
-            `🔥 ENTRY CONFIRMED ${symbolNoUsdt}`,
-            dirLabel,
-            `ENTRY: ${formatPrice(entryResult.triggerClose)} USD`,
-            `STRUCTURE: ARMED (${entryResult.direction === 'short' ? 'lower high / structure loss' : 'higher low / structure reclaim'}) ✓`,
-            `5м TRIGGER: ${dirLabel} ✓`,
-            `15м CONFIRMATION: ${entryResult.confirmation15m ? '✓' : '—'}`,
-            `FLOW: ${entryResult.flowBoost ? '✓ потвърждава' : '—'}`,
-            `HTF CONTEXT: ${entryResult.htfAligned ? '✓ съвпада' : '—'}`,
-            `ENTRY SCORE: ${entryResult.score}/5`,
+            `🚨🚨🚨 ENTRY NOW — CONFIRMED 🚨🚨🚨`,
+            ``,
+            `🔥 ${symbolNoUsdt}`,
+            entryResult.direction === 'long' ? '🟢 LONG' : '🔴 SHORT',
+            ``,
+            `🔄 MODE: MEAN REVERSION`,
+            ``,
+            `💰 ENTRY: ${formatPrice(entryResult.triggerClose)} USD`,
+            `⭐ ENTRY SCORE: ${entryResult.score}/5`,
+            ``,
+            `5M TRIGGER: ✓`,
+            `15M CONFIRMATION: ${entryResult.confirmation15m ? '✓' : '—'}`,
+            `FLOW: ${entryResult.flowBoost ? '✓' : '—'}`,
+            `HTF CONTEXT: ${entryResult.htfAligned ? '✓' : '—'}`,
             // PR #104 - BOTH QUALITY (виж classifyBothQuality по-горе) - само
             // маркиране, само за tc3_mr3 same-tick BOTH случая. НЕ hard veto.
-            ...(entryResult.bothQuality === 'degraded' ? [`⚠️ BOTH QUALITY: DEGRADED (TC+MR едновременно, tc3_mr3 - исторически по-слаб резултат)`] : []),
-            `⚠️ Не гони цената отвъд ${formatPrice(entryResult.structRef)} USD`,
+            ...(entryResult.bothQuality === 'degraded' ? [``, `⚠️ BOTH QUALITY: DEGRADED (TC+MR едновременно, tc3_mr3 - исторически по-слаб резултат)`] : []),
+            ``,
+            `⚠️ MAX CHASE: ${formatPrice(entryResult.structRef)} USD`,
           ];
           await sendWhatsApp(env, entryLines.join('\n'));
         } else {
@@ -4803,19 +4814,28 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
         const dirLabel = trendEntryResult.direction === 'long' ? 'LONG' : 'SHORT';
         if (trendEntryResult.status === 'entry') {
+          // Козметично форматиране (виж бележката при mean_reversion ENTRY
+          // CONFIRMED по-горе) - огледално, само MODE-редът е различен.
           const entryLines = [
-            `🔥 ENTRY CONFIRMED ${symbolNoUsdt} (TREND CONTINUATION)`,
-            dirLabel,
-            `ENTRY: ${formatPrice(trendEntryResult.triggerClose)} USD`,
-            `5м TRIGGER: ${dirLabel} ✓`,
-            `15м CONFIRMATION: ${trendEntryResult.confirmation15m ? '✓' : '—'}`,
-            `FLOW: ${trendEntryResult.flowBoost ? '✓ потвърждава' : '—'}`,
-            `HTF CONTEXT: ${trendEntryResult.htfAligned ? '✓ съвпада' : '—'}`,
-            `ENTRY SCORE: ${trendEntryResult.score}/5`,
+            `🚨🚨🚨 ENTRY NOW — CONFIRMED 🚨🚨🚨`,
+            ``,
+            `🔥 ${symbolNoUsdt}`,
+            trendEntryResult.direction === 'long' ? '🟢 LONG' : '🔴 SHORT',
+            ``,
+            `📈 MODE: TREND CONTINUATION`,
+            ``,
+            `💰 ENTRY: ${formatPrice(trendEntryResult.triggerClose)} USD`,
+            `⭐ ENTRY SCORE: ${trendEntryResult.score}/5`,
+            ``,
+            `5M TRIGGER: ✓`,
+            `15M CONFIRMATION: ${trendEntryResult.confirmation15m ? '✓' : '—'}`,
+            `FLOW: ${trendEntryResult.flowBoost ? '✓' : '—'}`,
+            `HTF CONTEXT: ${trendEntryResult.htfAligned ? '✓' : '—'}`,
             // PR #104 - BOTH QUALITY (виж classifyBothQuality по-горе) - само
             // маркиране, само за tc3_mr3 same-tick BOTH случая. НЕ hard veto.
-            ...(trendEntryResult.bothQuality === 'degraded' ? [`⚠️ BOTH QUALITY: DEGRADED (TC+MR едновременно, tc3_mr3 - исторически по-слаб резултат)`] : []),
-            `⚠️ Не гони цената отвъд ${formatPrice(trendEntryResult.structRef)} USD`,
+            ...(trendEntryResult.bothQuality === 'degraded' ? [``, `⚠️ BOTH QUALITY: DEGRADED (TC+MR едновременно, tc3_mr3 - исторически по-слаб резултат)`] : []),
+            ``,
+            `⚠️ MAX CHASE: ${formatPrice(trendEntryResult.structRef)} USD`,
           ];
           await sendWhatsApp(env, entryLines.join('\n'));
         } else {
