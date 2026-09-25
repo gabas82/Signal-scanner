@@ -130,6 +130,21 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Потвърдено от Cloudflare логовете: scheduled() изпълнения увисват до
+// "exceededWallTime" (~15 мин), защото нито едно fetch() в целия файл нямаше
+// timeout - ако един external API (relay/TextMeBot/CoinGlass) не отговори,
+// целият cron run виси безкрайно вместо да продължи към следващия символ.
+const FETCH_TIMEOUT_MS = 15000;
+async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // РЕАЛЕН БЪГ, потвърден директно от Cloudflare логовете (две HTTP 403 грешки
 // със ЕДИН и същ requestId - значи от ЕДНА и съща scheduled() инвокация):
 // първият опит за throttle ("прочети lastWhatsAppSendAt -> изчакай -> запиши
@@ -164,7 +179,7 @@ async function sendWhatsAppSerialized(env, text) {
   lastWhatsAppSendAt = Date.now();
   const url = `https://api.textmebot.com/send.php?recipient=${encodeURIComponent(env.CALLMEBOT_PHONE)}&apikey=${encodeURIComponent(env.TEXTMEBOT_APIKEY)}&text=${encodeURIComponent(text)}`;
   try {
-    const r = await fetch(url);
+    const r = await fetchWithTimeout(url);
     const body = await r.text();
     // Досега неуспешен HTTP отговор от TextMeBot (напр. изчерпан лимит, невалиден
     // recipient, изтекла връзка) минаваше напълно тихо - връщаше се {ok:false,...},
@@ -901,7 +916,7 @@ function markMMOscFired(state, dir) {
 // заявките минават през малкия relay сървър на DigitalOcean (виж relay/README.md),
 // не директно към fapi.binance.com. RELAY_URL/RELAY_TOKEN са Worker Secrets.
 async function fetchKlinesWorker(env, symbol, interval, limit) {
-  const r = await fetch(`${env.RELAY_URL}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+  const r = await fetchWithTimeout(`${env.RELAY_URL}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
   const bodyText = await r.text();
   if (!r.ok) {
     throw new Error(`Relay klines ${symbol} ${interval} -> HTTP ${r.status}: ${bodyText.slice(0, 300)}`);
@@ -929,7 +944,7 @@ function calcSupportResistance(candles, lookback = 20) {
 // при грешка/липсващи данни, за да не чупи известието заради спомагателна инфо.
 async function fetchLongShortWorker(env, symbol) {
   try {
-    const r = await fetch(`${env.RELAY_URL}/longshort?symbol=${symbol}&period=1h&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/longshort?symbol=${symbol}&period=1h&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
     if (!r.ok) return null;
     const data = await r.json();
     const entry = Array.isArray(data) ? data[0] : null;
@@ -949,7 +964,7 @@ async function fetchLongShortWorker(env, symbol) {
 // данни, за да не чупи checkMacroSqueeze заради спомагателна инфо.
 async function fetchFundingWorker(env, symbol) {
   try {
-    const r = await fetch(`${env.RELAY_URL}/funding?symbol=${symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/funding?symbol=${symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
     if (!r.ok) return null;
     const data = await r.json();
     const entry = Array.isArray(data) ? data[0] : null;
@@ -984,7 +999,7 @@ async function fetchFundingWorker(env, symbol) {
 // не го ползва.
 async function fetchLiquidationOrdersWorker(env, symbol) {
   try {
-    const r = await fetch(`https://open-api-v4.coinglass.com/api/futures/liquidation/order?symbol=${symbol}&exchange=Binance&min_liquidation_amount=1`, {
+    const r = await fetchWithTimeout(`https://open-api-v4.coinglass.com/api/futures/liquidation/order?symbol=${symbol}&exchange=Binance&min_liquidation_amount=1`, {
       headers: { 'CG-API-KEY': env.CG_API_KEY },
     });
     if (!r.ok) return null;
@@ -1217,7 +1232,7 @@ function calcTakerFlowDelta(takerHist) {
 // fetchOpenInterestHistWorker по-долу.
 async function fetchTakerLongShortWorker(env, symbol, period = '5m', limit = 13) {
   try {
-    const r = await fetch(`${env.RELAY_URL}/takerlongshort?symbol=${symbol}&period=${period}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/takerlongshort?symbol=${symbol}&period=${period}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
     if (!r.ok) return null;
     const data = await r.json();
     if (!Array.isArray(data) || !data.length) return null;
@@ -3155,7 +3170,7 @@ function markLiqGravityFired(state, key, direction) {
 // или null при грешка/липсващи данни.
 async function fetchOpenInterestHistWorker(env, symbol, period = '5m', limit = 6) {
   try {
-    const r = await fetch(`${env.RELAY_URL}/openinterest?symbol=${symbol}&period=${period}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/openinterest?symbol=${symbol}&period=${period}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
     if (!r.ok) return null;
     const data = await r.json();
     if (!Array.isArray(data) || !data.length) return null;
@@ -3182,7 +3197,7 @@ function calcOiDeltaPct(oiHist, lookback = 3) {
 const ORDER_BOOK_WALL_MAX_DISTANCE_PCT = 15;
 async function fetchOrderBookWallsWorker(env, symbol, price) {
   try {
-    const r = await fetch(`${env.RELAY_URL}/depth?symbol=${symbol}&limit=500&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/depth?symbol=${symbol}&limit=500&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
     if (!r.ok) return null;
     const data = await r.json();
     if (!Array.isArray(data.bids) || !Array.isArray(data.asks) || price == null) return null;
@@ -3199,7 +3214,7 @@ async function fetchOrderBookWallsWorker(env, symbol, price) {
 // детектора (секция C от предложението). Връща null при грешка/липсващи данни.
 async function fetch24hChangeWorker(env, symbol) {
   try {
-    const r = await fetch(`${env.RELAY_URL}/ticker24hr?symbol=${symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/ticker24hr?symbol=${symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
     if (!r.ok) return null;
     const data = await r.json();
     const chg = parseFloat(data.priceChangePercent);
@@ -5017,7 +5032,7 @@ async function checkDcaLevels(env, watchlist = WATCHLIST) {
   for (const pos of watchlist) {
     if (!pos.entryPrice || !pos.side) continue;
     try {
-      const r = await fetch(`${env.RELAY_URL}/ticker?symbol=${pos.symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+      const r = await fetchWithTimeout(`${env.RELAY_URL}/ticker?symbol=${pos.symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
       const d = await r.json();
       const price = parseFloat(d.price);
       if (!price) continue;
@@ -5254,7 +5269,7 @@ function calcDiscoveryConfidence(metrics, baseline, direction) {
 const DISCOVERY_RADAR_INTERVAL_MIN = 15; // v1 начална точка - виж чата (5м прекалено шумно за rolling 24ч delta, 30м прекалено бавно)
 
 async function fetchMarketWideTicker24hrWorker(env) {
-  const r = await fetch(`${env.RELAY_URL}/ticker24hr?token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+  const r = await fetchWithTimeout(`${env.RELAY_URL}/ticker24hr?token=${encodeURIComponent(env.RELAY_TOKEN)}`);
   if (!r.ok) throw new Error(`bulk /ticker24hr HTTP ${r.status}`);
   return await r.json();
 }
