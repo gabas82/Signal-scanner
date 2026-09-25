@@ -46,7 +46,7 @@ const WATCHLIST = [
   { symbol: 'ENAUSDT' },
   { symbol: 'PENDLEUSDT' },
   { symbol: 'WIFUSDT' },
-  { symbol: 'PEPEUSDT' },
+  { symbol: '1000PEPEUSDT' }, // Binance Futures няма 'PEPEUSDT' - цената на PEPE е твърде малка, борсата търгува контракт за 1000 token-а наведнъж
   { symbol: 'DOGEUSDT' },
   { symbol: 'AVAXUSDT' },
   { symbol: 'FETUSDT' },
