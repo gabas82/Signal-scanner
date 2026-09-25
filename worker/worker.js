@@ -2006,6 +2006,17 @@ function buildPendingOutcomeHorizons(recordAt) {
 function resolvePendingOutcomeHorizons(pending, price, now = Date.now()) {
   const updates = {};
   let allResolved = true;
+  // Defensive guard - легаси pendingOutcomes записи отпреди `horizons` полето
+  // (или всякакви други повредени/непълни записи) нямат pending.horizons и
+  // преди тази проверка гърмяха с "Cannot convert undefined or null to
+  // object" на Object.keys(undefined) - crash-ът се случваше ПРЕДИ
+  // saveSymbolState() в scanSymbolSignals, затова state никога не се
+  // записваше за целия tick (включително несвързани мутации по-рано в
+  // същия tick, напр. TC ARMED reset) - виж discussion-а. Третираме такъв
+  // запис като приключил (allResolved=true, updates={}), за да се
+  // премахне от state.pendingOutcomes на следващия ред (stillPending),
+  // вместо да блокира целия scan за символа безкрайно.
+  if (!pending.horizons || typeof pending.horizons !== 'object') return { updates, allResolved };
   for (const field of Object.keys(pending.horizons)) {
     const h = pending.horizons[field];
     if (h.resolved) continue;
