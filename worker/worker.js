@@ -2069,12 +2069,21 @@ function buildTelemetryRecord({
   triggerClose, atr5m, triggerRange, confirmation15m, flowState,
   trapTier, trapDirection, flowWarmingTier, flowWarmingDirection, entryScore,
   setupMode, htfAligned, bothQuality,
-  timeFromArmMin, pctMoveFromArm, atrMoveFromArm,
+  timeFromArmMin, pctMoveFromArm, atrMoveFromArm, setupAt,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
   return {
     symbol, direction, decision, at: Date.now(),
     setupScore, setupBreakdown, armedAt,
+    // OBSERVATION - директна lifecycle връзка към SETUP episode-а (виж
+    // state.setup.at за MEAN REVERSION / state.trendArmed.setupAt за TREND
+    // CONTINUATION - и двата вече съществуват като стабилен идентификатор,
+    // непроменен през re-arm циклите на СЪЩИЯ directional episode - виж
+    // markSetupFired/markTrendSetupFired по-горе). Само за FIRST vs RE-ENTRY
+    // анализ - НЕ се чете обратно от SETUP/ARMED/ENTRY логиката. null-safe -
+    // стари записи без него остават валидни, просто без episode linkage.
+    setupAt: setupAt ?? null,
+    episodeId: setupAt != null ? `${symbol}_${setupMode}_${direction}_${setupAt}` : null,
     structRef, triggerClose, atr5m,
     triggerRangeAtrRatio: (atr5m > 0 && triggerRange != null) ? triggerRange / atr5m : null,
     chaseDistance,
@@ -4254,6 +4263,7 @@ async function scanSymbolSignals(env, symbol) {
         trapTier, trapDirection, flowWarmingTier, flowWarmingDirection,
         entryScore: entryResult.score,
         setupMode: 'mean_reversion', htfAligned: entryResult.htfAligned,
+        setupAt: state.setup ? state.setup.at : null,
       });
       mrTelemetryRecordAt = record.at; // PR #104 - виж коментара при декларацията по-горе
       if (env.ALERT_STATE) {
@@ -4429,6 +4439,7 @@ async function scanSymbolSignals(env, symbol) {
         setupMode: 'trend_continuation', htfAligned: trendEntryResult.htfAligned,
         bothQuality,
         timeFromArmMin: tcTimeFromArmMin, pctMoveFromArm: tcPctMoveFromArm, atrMoveFromArm: tcAtrMoveFromArm,
+        setupAt: state.trendArmed.setupAt,
       });
       if (env.ALERT_STATE) {
         const telemetryKey = `telemetry:${symbol}:${record.at}:${record.setupMode}`;
