@@ -2072,6 +2072,8 @@ function buildTelemetryRecord({
   timeFromArmMin, pctMoveFromArm, atrMoveFromArm, setupAt,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
+  const chaseDistanceAtrRatio = (atr5m > 0 && chaseDistance != null) ? chaseDistance / atr5m : null;
+  const entryQuality = classifyEntryQuality({ setupMode, chaseDistanceAtrRatio, htfAligned, confirmation15m });
   return {
     symbol, direction, decision, at: Date.now(),
     setupScore, setupBreakdown, armedAt,
@@ -2087,7 +2089,7 @@ function buildTelemetryRecord({
     structRef, triggerClose, atr5m,
     triggerRangeAtrRatio: (atr5m > 0 && triggerRange != null) ? triggerRange / atr5m : null,
     chaseDistance,
-    chaseDistanceAtrRatio: (atr5m > 0 && chaseDistance != null) ? chaseDistance / atr5m : null,
+    chaseDistanceAtrRatio,
     confirmation15m: confirmation15m ?? null, flowState,
     trapTier: trapTier ?? 'none', trapDirection: trapDirection ?? null,
     flowWarmingTier: flowWarmingTier ?? 'none', flowWarmingDirection: flowWarmingDirection ?? null,
@@ -2114,6 +2116,11 @@ function buildTelemetryRecord({
     // PR #104 - BOTH QUALITY (виж classifyBothQuality по-долу) - null освен
     // когато TC и MR произведат ENTRY В СЪЩИЯ tick ('normal'/'degraded').
     bothQuality: bothQuality ?? null,
+    // OBSERVATION-ONLY ENTRY QUALITY SCORE (виж classifyEntryQuality по-долу) -
+    // производно от вече изчислените по-горе chaseDistanceAtrRatio/htfAligned/
+    // confirmation15m/setupMode. null само ако setupMode не е разпознат.
+    entryQualityScore: entryQuality ? entryQuality.score : null,
+    entryQualityTier: entryQuality ? entryQuality.tier : null,
     // PR #105 - TC LIFECYCLE TELEMETRY (виж buildTcArmedResetRecord по-долу) -
     // само за TREND CONTINUATION call site-а (MR никога не ги подава, остават
     // null) - ARMED -> ENTRY EVALUATION latency/move контекст.
@@ -2297,6 +2304,9 @@ function chaseDistanceBucketKey(r) {
 // PR #104 - BOTH QUALITY (виж classifyBothQuality по-горе) - null за записи,
 // които не са част от same-tick BOTH ENTRY ('normal'/'degraded' само тогава).
 function bothQualityKey(r) { return (r.bothQuality === 'normal' || r.bothQuality === 'degraded') ? r.bothQuality : null; }
+// OBSERVATION-ONLY ENTRY QUALITY (виж classifyEntryQuality по-долу) - null,
+// само ако setupMode не е разпознат (никога не би трябвало да се случи).
+function entryQualityTierKey(r) { return r.entryQualityTier ?? null; }
 // Диагностичен въпрос: "confirmation15m=false бие true - навсякъде ли, или
 // само при конкретна комбинация?" - добавя 4-те разреза directly ВЪТРЕ в
 // вече изчисления true/false бъкет (мутира на място).
@@ -2585,6 +2595,47 @@ function classifyBothQuality(mrSetupScore, tcSetupScore) {
   if (mrSetupScore == null || tcSetupScore == null) return null;
   return (mrSetupScore === 3 && tcSetupScore === 3) ? 'degraded' : 'normal';
 }
+// OBSERVATION-ONLY ENTRY QUALITY SCORE - произлиза САМО от вече съществуващи
+// telemetry полета (chaseDistanceAtrRatio/htfAligned/confirmation15m/
+// setupMode), калибрирано от натрупаните /telemetry summary агрегати към
+// 2026-09-27 (~1800-2000 evaluations на снапшот):
+//   - chaseDistanceAtrRatio bucket (виж chaseDistanceBucketKey по-горе) е
+//     най-консистентният разделител, наблюдаван досега: TC lt0_5 ->
+//     avgOutcomePct ~+0.14/+0.16%, TC gte1_5 -> ~-0.09/-0.12% (MR показва
+//     същата посока, по-слабо изразена).
+//   - htfAligned=true корелира с по-добър outcome при TREND CONTINUATION
+//     (aligned бъкетът последователно над notAligned/none в TC breakdown-а),
+//     почти плоско при MEAN REVERSION.
+//   - confirmation15m=true ПАРАДОКСАЛНО показва ПО-НИСЪК winRatePct от false
+//     във ВСЕКИ досегашен снапшот (~42-44% срещу ~47-49%) - затова тук носи
+//     лек ОТРИЦАТЕЛЕН принос, нарочно обратно на наивното очакване.
+//   - setupMode базата отразява постоянната разлика: MEAN REVERSION
+//     последователно ~49-50% winRatePct срещу TREND CONTINUATION ~43-44%.
+// Теглата са малки, именувани константи - нарочно, за да могат лесно да се
+// прекалибрират при по-голяма forward извадка (виж разговора от 2026-09-27),
+// без да се пипа функцията структурно. Диагностика/observability САМО - НЕ
+// се чете обратно от SETUP/ARMED/ENTRY логиката, thresholds, scoring, chase
+// protection, FLOW veto или WhatsApp gating.
+const ENTRY_QUALITY_WEIGHTS = {
+  setupModeBase: { mean_reversion: 50, trend_continuation: 44 },
+  chaseDistanceBucket: { lt0_5: 8, from0_5to1: 2, from1to1_5: -3, gte1_5: -10 },
+  htfAlignedTrue: 3, htfAlignedFalse: -1,
+  confirmation15mTrue: -2, confirmation15mFalse: 2,
+};
+function classifyEntryQuality({ setupMode, chaseDistanceAtrRatio, htfAligned, confirmation15m }) {
+  const base = ENTRY_QUALITY_WEIGHTS.setupModeBase[setupMode];
+  if (base == null) return null;
+  let score = base;
+  const bucket = chaseDistanceBucketKey({ chaseDistanceAtrRatio });
+  if (bucket != null) score += ENTRY_QUALITY_WEIGHTS.chaseDistanceBucket[bucket];
+  if (htfAligned === true) score += ENTRY_QUALITY_WEIGHTS.htfAlignedTrue;
+  else if (htfAligned === false) score += ENTRY_QUALITY_WEIGHTS.htfAlignedFalse;
+  if (confirmation15m === true) score += ENTRY_QUALITY_WEIGHTS.confirmation15mTrue;
+  else if (confirmation15m === false) score += ENTRY_QUALITY_WEIGHTS.confirmation15mFalse;
+  score = Math.max(0, Math.min(100, score));
+  const tier = score >= 55 ? 'A' : score >= 45 ? 'B' : score >= 35 ? 'C' : 'D';
+  return { score, tier };
+}
 // Групира ПОДАДЕНИТЕ pairs по keyFn(pair) - за всяка група взима и двете
 // страни (mr И tc записа) на всяка двойка, после смята count/avgOutcomePct/
 // winRatePct на всеки хоризонт - огледално на buildFieldHorizonBreakdown
@@ -2791,6 +2842,10 @@ function buildTelemetrySummary(records) {
   // на деплоя нататък ще имат непразно bothQuality (виж wiring-а в
   // scanSymbolSignals) - исторически записи остават null, не се реконструират.
   summary.bothQualityStats = buildFieldHorizonBreakdown(records, bothQualityKey);
+  // OBSERVATION-ONLY ENTRY QUALITY SCORE (виж classifyEntryQuality по-горе) -
+  // A/B/C/D tier breakdown по m5/m15/m30/m60, за проверка дали score-ът
+  // реално разделя win rate-а, докато се трупа по-голяма forward извадка.
+  summary.entryQualityStats = buildFieldHorizonBreakdown(records, entryQualityTierKey);
   return summary;
 }
 
