@@ -4320,6 +4320,8 @@ async function scanSymbolSignals(env, symbol) {
         setupMode: 'mean_reversion', htfAligned: entryResult.htfAligned,
         setupAt: state.setup ? state.setup.at : null,
       });
+      entryResult.entryQualityScore = record.entryQualityScore;
+      entryResult.entryQualityTier = record.entryQualityTier;
       mrTelemetryRecordAt = record.at; // PR #104 - виж коментара при декларацията по-горе
       if (env.ALERT_STATE) {
         // setupMode-суфикс в KV ключа - предпазва от презаписване, ако
@@ -4496,6 +4498,8 @@ async function scanSymbolSignals(env, symbol) {
         timeFromArmMin: tcTimeFromArmMin, pctMoveFromArm: tcPctMoveFromArm, atrMoveFromArm: tcAtrMoveFromArm,
         setupAt: state.trendArmed.setupAt,
       });
+      trendEntryResult.entryQualityScore = record.entryQualityScore;
+      trendEntryResult.entryQualityTier = record.entryQualityTier;
       if (env.ALERT_STATE) {
         const telemetryKey = `telemetry:${symbol}:${record.at}:${record.setupMode}`;
         await env.ALERT_STATE.put(telemetryKey, JSON.stringify(record));
@@ -4850,6 +4854,11 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
             // маркиране, само за tc3_mr3 same-tick BOTH случая. НЕ hard veto.
             ...(entryResult.bothQuality === 'degraded' ? [``, `⚠️ BOTH QUALITY: DEGRADED (TC+MR едновременно, tc3_mr3 - исторически по-слаб резултат)`] : []),
             ``,
+            // PR #112 - ENTRY QUALITY TIER (виж classifyEntryQuality по-горе) -
+            // observation-only score/tier, показан тук само информативно (НЕ
+            // гейт/филтър на кои сигнали се пращат - decision логиката е same).
+            `🏆 QUALITY TIER: ${entryResult.entryQualityTier ?? '—'} (score ${entryResult.entryQualityScore ?? '—'})`,
+            ``,
             `⚠️ MAX CHASE: ${formatPrice(entryResult.structRef)} USD`,
           ];
           await sendWhatsApp(env, entryLines.join('\n'));
@@ -4915,6 +4924,11 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
             // PR #104 - BOTH QUALITY (виж classifyBothQuality по-горе) - само
             // маркиране, само за tc3_mr3 same-tick BOTH случая. НЕ hard veto.
             ...(trendEntryResult.bothQuality === 'degraded' ? [``, `⚠️ BOTH QUALITY: DEGRADED (TC+MR едновременно, tc3_mr3 - исторически по-слаб резултат)`] : []),
+            ``,
+            // PR #112 - ENTRY QUALITY TIER (виж classifyEntryQuality по-горе) -
+            // observation-only score/tier, показан тук само информативно (НЕ
+            // гейт/филтър на кои сигнали се пращат - decision логиката е same).
+            `🏆 QUALITY TIER: ${trendEntryResult.entryQualityTier ?? '—'} (score ${trendEntryResult.entryQualityScore ?? '—'})`,
             ``,
             `⚠️ MAX CHASE: ${formatPrice(trendEntryResult.structRef)} USD`,
           ];
