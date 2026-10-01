@@ -1997,7 +1997,11 @@ function calcEntryTrigger({ direction, candle5m, atr5m, candle15m, atr15m, struc
 // от ЕДНА и съща вече изтеглена `price` (виж wiring-а в scanSymbolSignals) -
 // БЕЗ никакви нови мрежови заявки, само по-нататъшно изчакване на съществуващия
 // tick цикъл.
-const OUTCOME_HORIZONS_MIN = [5, 15, 30, 60];
+// PR #113-след (4h хоризонт, предпазлив първи стъпка - виж discussion-а: само
+// 240, 1d (1440) се добавя по-късно след наблюдение на state размера) - виж
+// бележката при state.pendingOutcomes в scanSymbolSignals за защо това НЕ е
+// козметична промяна (pending записите вече стоят в state до 4ч вместо 1ч).
+const OUTCOME_HORIZONS_MIN = [5, 15, 30, 60, 240];
 
 // Изгражда "чакащите" хоризонти за един нов telemetry запис - чист pure
 // helper, извикван веднъж при confirmed/missed решение (виж wiring-а).
@@ -2105,13 +2109,15 @@ function buildTelemetryRecord({
     // не се предполага false, за да различаваме "не се е стигнало до проверка"
     // от "проверено и НЕ съвпада".
     htfAligned: htfAligned ?? null,
-    outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, // попълват се по-късно от resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals
+    outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome240m: null, // попълват се по-късно от resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals
     // PR #103 PATH DIAGNOSTICS (MFE/MAE) - попълват се по-късно от
     // updateExcursion/resolvePendingOutcomeHorizons, огледално на outcome{X}m.
     mfe5m: null, mae5m: null, mfe5mAtr: null, mae5mAtr: null,
     mfe15m: null, mae15m: null, mfe15mAtr: null, mae15mAtr: null,
     mfe30m: null, mae30m: null, mfe30mAtr: null, mae30mAtr: null,
     mfe60m: null, mae60m: null, mfe60mAtr: null, mae60mAtr: null,
+    // 4ч хоризонт (виж discussion-а - предпазлива първа стъпка, 1d остава за по-късно)
+    mfe240m: null, mae240m: null, mfe240mAtr: null, mae240mAtr: null,
     timeToMfeMin: null, timeToMaeMin: null, maeBeforeMfePct: null, mfeBeforeMaePct: null,
     // PR #104 - BOTH QUALITY (виж classifyBothQuality по-долу) - null освен
     // когато TC и MR произведат ENTRY В СЪЩИЯ tick ('normal'/'degraded').
@@ -5686,7 +5692,7 @@ function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord, liveActivityS
   if (episode.entry || !entryTelemetryRecord) return episode;
   const {
     at, decision, triggerClose: entryPrice, entryScore, atr5m, chaseDistanceAtrRatio,
-    outcome5m, outcome15m, outcome30m, outcome60m, setupMode,
+    outcome5m, outcome15m, outcome30m, outcome60m, outcome240m, setupMode,
   } = entryTelemetryRecord;
   const leadTimeEntryMin = (at - episode.discovery.at) / 60000;
   const pctMoveToEntry = (entryPrice != null && episode.discovery.price > 0)
@@ -5699,12 +5705,14 @@ function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord, liveActivityS
       at, price: entryPrice, decision, entryScore: entryScore ?? null,
       atr5m: atr5m ?? null, chaseDistanceAtrRatio: chaseDistanceAtrRatio ?? null,
       // Multi-horizon (PR #101, огледално на основната ENTRY telemetry) -
-      // всичките четирите тръгват null тук (outcome механизмът ги попълва по-
+      // всичките пет тръгват null тук (outcome механизмът ги попълва по-
       // късно, виж applyDiscoveryEpisodeOutcome по-долу), пазени ОТДЕЛНО по
       // decision (confirmed срещу missed) чрез самото entry.decision поле -
       // никога не се смесват в агрегацията (виж buildDiscoveryEpisodeSummary).
+      // outcome240m (4ч) добавен по-късно (виж discussion-а) - 1d остава за след наблюдение.
       outcome5m: outcome5m ?? null, outcome15m: outcome15m ?? null,
       outcome30m: outcome30m ?? null, outcome60m: outcome60m ?? null,
+      outcome240m: outcome240m ?? null,
       // Пазим setupMode, за да можем по-късно да пресъздадем ТОЧНИЯ KV ключ
       // (telemetry:{symbol}:{at}:{setupMode}, виж updateDiscoveryEpisodes по-долу)
       // - иначе outcome refresh-ът никога няма да намери записа.
@@ -5723,12 +5731,12 @@ function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord, liveActivityS
   };
 }
 
-// Опреснява outcome5m/15m/30m/60m от СЪЩИЯ вече записан entry telemetry
+// Опреснява outcome5m/15m/30m/60m/240m от СЪЩИЯ вече записан entry telemetry
 // запис, веднъж щом съществуващият multi-horizon outcome механизъм
 // (resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals) ги попълни -
 // чисто четене, никаква нова логика за самите outcome стойности. Episode-ът
-// минава в 'complete' едва след като ВСИЧКИТЕ 4 хоризонта са резолвнати
-// (outcome60m последен) - до тогава остава 'entry_pending_outcome', за да
+// минава в 'complete' едва след като ВСИЧКИТЕ 5 хоризонта са резолвнати
+// (outcome240m последен) - до тогава остава 'entry_pending_outcome', за да
 // продължи updateDiscoveryEpisodes да го опреснява.
 function applyDiscoveryEpisodeOutcome(episode, freshRecord) {
   if (!episode.entry || (episode.entry.decision !== 'confirmed' && episode.entry.decision !== 'missed') || !freshRecord) {
@@ -5736,11 +5744,12 @@ function applyDiscoveryEpisodeOutcome(episode, freshRecord) {
   }
   const entry = { ...episode.entry };
   let changed = false;
-  for (const field of ['outcome5m', 'outcome15m', 'outcome30m', 'outcome60m']) {
+  for (const field of ['outcome5m', 'outcome15m', 'outcome30m', 'outcome60m', 'outcome240m']) {
     if (entry[field] == null && freshRecord[field] != null) { entry[field] = freshRecord[field]; changed = true; }
   }
   if (!changed) return episode;
-  const allResolved = entry.outcome5m != null && entry.outcome15m != null && entry.outcome30m != null && entry.outcome60m != null;
+  const allResolved = entry.outcome5m != null && entry.outcome15m != null && entry.outcome30m != null
+    && entry.outcome60m != null && entry.outcome240m != null;
   return { ...episode, entry, status: allResolved ? 'complete' : episode.status };
 }
 
