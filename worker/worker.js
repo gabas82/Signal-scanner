@@ -4627,15 +4627,17 @@ async function scanSymbolSignals(env, symbol) {
 // преизползва ПОСЛЕДНИЯ реален BTC контекст от CORE-ния run (виж
 // persistBtcFlowContext по-долу), вместо да пада на neutral default само
 // защото BTCUSDT никога не е позиция 0 в pool-а.
-async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOverride = null) {
-  // IDEA 07 - "RELATIVE FLOW" (виж calcRelativeFlow по-горе) - BTC е ВИНАГИ
-  // watchlist[0] (виж WATCHLIST по-горе), а for-of цикълът е строго
-  // последователен (await вътре), затова BTC гарантирано се обработва ПЪРВИ и
-  // резултатът му може да се преизползва за всички следващи монети в СЪЩИЯ
-  // тик - нула допълнителни заявки. Default стойността (без hard factor)
-  // важи само за самата BTC итерация, преди да е записан собственият ѝ резултат.
-  let btcFlowContext = btcFlowContextOverride || { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
-  for (const pos of watchlist) {
+// Извлечена от checkMarketSignals (виж по-долу) - реалния scan + всички
+// независими известия за ЕДИН символ в едно cron изпълнение, байт-идентична
+// логика на преди рефакторинга (виж discussion-а: 35 символа последователно
+// удряха Cloudflare-овия wall-time лимит за scheduled(), ~24с wall само за
+// ~180мс реален CPU - чисто мрежово чакане). btcFlowContext се подава и се
+// връща (опреснен само когато pos е BTCUSDT) - позволява на checkMarketSignals
+// да обработи BTC последователно първи, а останалите паралелно на партиди.
+// sendWhatsApp вече е безопасен при паралелни извиквания (виж whatsAppChain
+// по-горе) - scheduled() вече пуска 6-те top-level задачи паралелно без
+// проблем за точно същата причина.
+async function processWatchlistSymbol(env, pos, btcFlowContext) {
     try {
       const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult, trendSetupFired, trendSetupDirection, trendSetupScore, trendSetupBreakdown, trendArmedFired, trendArmedDirection, trendEntryResult } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
@@ -5044,6 +5046,30 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
         await sendWhatsApp(env, reloadLines.join('\n'));
       }
     } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }
+  return btcFlowContext;
+}
+
+// IDEA 07 - "RELATIVE FLOW" (виж calcRelativeFlow по-горе) - BTC трябва да се
+// обработи ПРЕДИ останалите (резултатът му се преизползва от тях в СЪЩИЯ тик,
+// виж processWatchlistSymbol по-горе) - затова винаги първо, последователно,
+// сам. Останалите символи вече НЕ са задължени да чакат един друг (единствената
+// реална зависимост беше BTC), затова се обработват паралелно на партиди -
+// виж SYMBOL_CHUNK_SIZE по-долу защо партиди, не всички наведнъж.
+async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOverride = null) {
+  let btcFlowContext = btcFlowContextOverride || { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
+  const btcPos = watchlist.find((p) => p.symbol === 'BTCUSDT');
+  const restPositions = btcPos ? watchlist.filter((p) => p.symbol !== 'BTCUSDT') : watchlist;
+  if (btcPos) {
+    btcFlowContext = await processWatchlistSymbol(env, btcPos, btcFlowContext);
+  }
+  // SYMBOL_CHUNK_SIZE - предпазливо избран (виж discussion-а) - паралелизира
+  // символите на малки партиди вместо "всички наведнъж", за да не претовари
+  // env.RELAY_URL с рязък burst от конкурентни заявки (всеки символ прави ~12
+  // fetch-а към релея в 2 вълни). Може да се вдигне по-късно след наблюдение.
+  const SYMBOL_CHUNK_SIZE = 6;
+  for (let i = 0; i < restPositions.length; i += SYMBOL_CHUNK_SIZE) {
+    const chunk = restPositions.slice(i, i + SYMBOL_CHUNK_SIZE);
+    await Promise.all(chunk.map((pos) => processWatchlistSymbol(env, pos, btcFlowContext)));
   }
 }
 
