@@ -6436,6 +6436,18 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    // Cloudflare може да преизползва "топъл" isolate между отделни scheduled()
+    // извиквания - ако предишна инвокация бъде убита (wall-time/CPU лимит)
+    // точно докато чака вътре в sendWhatsAppSerialized (await sleep/fetch),
+    // нейната Promise увисва завинаги. whatsAppChain (module-scope, виж по-горе)
+    // наследява тази увиснала Promise и ВСИЧКИ бъдещи sendWhatsApp() извиквания
+    // (във всеки следващ тик) чакат зад нея - завинаги (потвърдено от
+    // Observability: пълна тишина във WhatsApp + exception на всеки тик, точно
+    // след бурст от 15+ известия). Ресетваме веригата в началото на ВСЯКА нова
+    // инвокация, за да не наследява потенциално увиснала Promise от предишна -
+    // lastWhatsAppSendAt (обикновено число, не Promise/IO обект) остава както си
+    // е, за да пази реалното темпо между тиковете.
+    whatsAppChain = Promise.resolve();
     ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env), checkPriceLevels(env), updateDiscoverySnapshotState(env), runDiscoveryFullAnalysis(env)]));
   }
 };
