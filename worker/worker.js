@@ -205,6 +205,35 @@ async function sendWhatsAppSerialized(env, text) {
   }
 }
 
+// Observability потвърди 160 TextMeBot 403 "rate limit" грешки за 1 час, явно
+// обемен проблем (не само мрежов jitter) - при волатилен пазар processWatchlistSymbol
+// (виж по-долу) може да натрупа 15+ отделни известия от различни символи в
+// ЕДИН тик. Вместо всеки сигнал да праща отделно HTTP извикване (дори
+// коректно сериализирани на 6с едно от друго), ги групираме в по-малко,
+// по-големи съобщения - точно каквото TextMeBot сам предлага в грешката си
+// ("group them into one message"). batch е ЛОКАЛЕН масив (подаден от
+// извикващия, не module-scope) - виж бележката при checkMarketSignals защо.
+const WHATSAPP_BATCH_MAX_CHARS = 3000; // запас под типичния WhatsApp/TextMeBot лимит за дължина на съобщение
+const WHATSAPP_BATCH_SEPARATOR = '\n\n━━━━━━━━━━\n\n';
+async function flushWhatsAppBatch(env, batch) {
+  if (batch.length === 0) return;
+  const chunks = [];
+  let current = '';
+  for (const text of batch) {
+    const candidate = current ? current + WHATSAPP_BATCH_SEPARATOR + text : text;
+    if (current && candidate.length > WHATSAPP_BATCH_MAX_CHARS) {
+      chunks.push(current);
+      current = text;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+  for (const chunk of chunks) {
+    await sendWhatsApp(env, chunk);
+  }
+}
+
 // ============================================================================
 // Пазарни сигнали (без нужда от твоя позиция) - byte-identical копия на
 // съответните pure функции от signal-logic.js: Capitulation Suite (FLUSH/BASE/
@@ -4650,7 +4679,7 @@ async function scanSymbolSignals(env, symbol) {
 // sendWhatsApp вече е безопасен при паралелни извиквания (виж whatsAppChain
 // по-горе) - scheduled() вече пуска 6-те top-level задачи паралелно без
 // проблем за точно същата причина.
-async function processWatchlistSymbol(env, pos, btcFlowContext) {
+async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
     try {
       const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult, trendSetupFired, trendSetupDirection, trendSetupScore, trendSetupBreakdown, trendArmedFired, trendArmedDirection, trendEntryResult } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
@@ -4710,7 +4739,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           lines.push('🧠 Активни потвърждения:');
           lines.push(...previouslyActive);
         }
-        await sendWhatsApp(env, lines.join('\n'));
+        batch.push(lines.join('\n'));
       }
       // IDEA 02 - "TARGET / DESTINATION SCORE" (виж calcTargetScore по-горе) -
       // изцяло отделно известие, огледално на FLOW WARMING/TRAP. POC е целта
@@ -4731,7 +4760,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           targetLines.push(`Магнити по пътя: ${targetMagnets.map(m => formatPrice(m.price)).join(' → ')}`);
         }
         targetLines.push(`⚠️ Ориентировъчна цел (mean-reversion) - НЕ Е entry сигнал`);
-        await sendWhatsApp(env, targetLines.join('\n'));
+        batch.push(targetLines.join('\n'));
       }
       // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore по-горе) -
       // изцяло отделно известие, огледално на TRAP. Тясна+скосена Value Area,
@@ -4747,7 +4776,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
           `⚠️ Тесен/скосен профил - вероятен trend режим, НЕ Е entry сигнал сам по себе си`,
         ];
-        await sendWhatsApp(env, auctionLines.join('\n'));
+        batch.push(auctionLines.join('\n'));
       }
       // IDEA 04 - "VALUE MIGRATION" (виж calcValueMigrationScore по-горе) -
       // изцяло отделно известие, огледално на TRAP/AUCTION. Сравнява POC на
@@ -4763,7 +4792,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
           `⚠️ Value migration - НЕ Е entry сигнал сам по себе си`,
         ];
-        await sendWhatsApp(env, migrationLines.join('\n'));
+        batch.push(migrationLines.join('\n'));
       }
       // IDEA 08 - "LIQUIDATION GRAVITY" (виж calcLiquidationGravityScore
       // по-горе) - изцяло отделно известие, огледално на TRAP/AUCTION/
@@ -4781,7 +4810,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
           `⚠️ Хипотеза за тестване (историческа ликвидационна зона) - НЕ Е entry сигнал`,
         ];
-        await sendWhatsApp(env, liqGravityLines.join('\n'));
+        batch.push(liqGravityLines.join('\n'));
       }
       // AUTO VAH/VAL STRUCTURE DETECTOR (виж calcVahValStructureEvent по-горе) -
       // изцяло отделни известия, независими от TARGET (не се гейтват едно
@@ -4802,7 +4831,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           lines.push(`🎯 TARGET: ${targetDirection === 'long' ? 'LONG' : 'SHORT'} ${targetTier.toUpperCase()} (за същата монета)`);
         }
         lines.push(`⚠️ Структурно събитие - НЕ Е entry сигнал сам по себе си`);
-        await sendWhatsApp(env, lines.join('\n'));
+        batch.push(lines.join('\n'));
       }
       // ENTRY ENGINE - ЕТАП 1: "SETUP" (виж calcSetupState по-горе) - ПЪРВИЯТ
       // слой от последователността TARGET -> SETUP -> ARMED -> ENTRY
@@ -4821,7 +4850,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           `SETUP QUALITY: ${setupScore}/5`,
           `⚠️ Все още НЕ Е entry - следи за развитие (Етап 2: ARMED)`,
         ];
-        await sendWhatsApp(env, setupLines.join('\n'));
+        batch.push(setupLines.join('\n'));
       }
       // ENTRY ENGINE - ЕТАП 2: "ARMED" (виж calcArmedTrigger по-горе) - чисто
       // структурно, sticky (не трепка при всяка промяна на swing точките).
@@ -4841,7 +4870,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           reasons.join(' + '),
           `⚠️ Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3)`,
         ];
-        await sendWhatsApp(env, armedLines.join('\n'));
+        batch.push(armedLines.join('\n'));
       }
       // ENTRY ENGINE - ЕТАП 3: "ENTRY TRIGGER" (виж calcEntryTrigger по-горе) -
       // финалният преход: 🔥 ENTRY CONFIRMED ("ТОВА Е ВХОД") или ⚠️ ENTRY
@@ -4882,7 +4911,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
             ``,
             `⚠️ MAX CHASE: ${formatPrice(entryResult.structRef)} USD`,
           ];
-          await sendWhatsApp(env, entryLines.join('\n'));
+          batch.push(entryLines.join('\n'));
         } else {
           const missedLines = [
             `⚠️ ENTRY MISSED ${symbolNoUsdt}`,
@@ -4891,7 +4920,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
             `Trigger close: ${formatPrice(entryResult.triggerClose)} USD`,
             `WAIT RETEST`,
           ];
-          await sendWhatsApp(env, missedLines.join('\n'));
+          batch.push(missedLines.join('\n'));
         }
       }
       // TREND CONTINUATION SETUP/ARMED/ENTRY - огледални известия на MEAN
@@ -4911,7 +4940,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           `SETUP QUALITY: ${trendSetupScore}/5`,
           `⚠️ Все още НЕ Е entry - следи за развитие (Етап 2: ARMED)`,
         ];
-        await sendWhatsApp(env, trendSetupLines.join('\n'));
+        batch.push(trendSetupLines.join('\n'));
       }
       if (trendArmedFired) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
@@ -4919,7 +4948,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           `⚡ ARMED ${trendArmedDirection === 'long' ? 'LONG' : 'SHORT'} ${symbolNoUsdt} (TREND CONTINUATION)`,
           `⚠️ Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3)`,
         ];
-        await sendWhatsApp(env, trendArmedLines.join('\n'));
+        batch.push(trendArmedLines.join('\n'));
       }
       if (trendEntryResult.status === 'entry' || trendEntryResult.status === 'missed') {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
@@ -4953,7 +4982,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
             ``,
             `⚠️ MAX CHASE: ${formatPrice(trendEntryResult.structRef)} USD`,
           ];
-          await sendWhatsApp(env, entryLines.join('\n'));
+          batch.push(entryLines.join('\n'));
         } else {
           const missedLines = [
             `⚠️ ENTRY MISSED ${symbolNoUsdt} (TREND CONTINUATION)`,
@@ -4962,7 +4991,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
             `Trigger close: ${formatPrice(trendEntryResult.triggerClose)} USD`,
             `WAIT RETEST`,
           ];
-          await sendWhatsApp(env, missedLines.join('\n'));
+          batch.push(missedLines.join('\n'));
         }
       }
       // PHASE CYCLE ENGINE - изцяло отделно известие от горното, независимо
@@ -4976,7 +5005,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           `LONG SCORE: ${cycleLongScore}/9`,
           `SHORT SCORE: ${cycleShortScore}/9`,
         ];
-        await sendWhatsApp(env, cycleLines.join('\n'));
+        batch.push(cycleLines.join('\n'));
       }
       // SPARK - ранно откриване ПРЕДИ импулса (виж бележката при
       // calcSparkScore по-горе). Изцяло отделно известие, огледално на
@@ -5006,7 +5035,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           sparkLines.push(`${RELATIVE_FLOW_LABELS[relativeFlow.classification]} спрямо BTC`);
         }
         sparkLines.push(`⚠️ Все още НЕ Е entry - следи за развитие`);
-        await sendWhatsApp(env, sparkLines.join('\n'));
+        batch.push(sparkLines.join('\n'));
       }
       // FLOW WARMING (IDEA 05, виж calcFlowWarmingScore по-горе) - изцяло
       // отделно известие, огледално на SPARK/"🔮 ЦИКЪЛ" - праща се САМО при
@@ -5024,7 +5053,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           `VOL 1ч/4ч ср.: ${sparkVolRatio != null ? sparkVolRatio.toFixed(2) + 'x' : '--'} · Цена 1ч: ${fmtPct(sparkChg1h)}`,
           `⚠️ Все още НЕ Е entry - следи за развитие`,
         ];
-        await sendWhatsApp(env, flowWarmingLines.join('\n'));
+        batch.push(flowWarmingLines.join('\n'));
       }
       // TRAP (IDEA 01, виж calcTrapScore по-горе) - изцяло отделно известие,
       // огледално на SPARK/FLOW WARMING. ИЗРИЧНО НЕ Е entry сигнал (виж
@@ -5041,7 +5070,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
           `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
           `⚠️ САМО ранно предупреждение - НЕ Е entry сигнал, изчакай потвърждение`,
         ];
-        await sendWhatsApp(env, trapLines.join('\n'));
+        batch.push(trapLines.join('\n'));
       }
       // RELOAD (IDEA 06, виж calcSecondImpulseTrigger по-горе) - изцяло
       // отделно известие. За разлика от SPARK/FLOW WARMING/TRAP, това е
@@ -5056,7 +5085,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext) {
         ];
         if (price != null) reloadLines.push(`Цена: ${formatPrice(price)} USD`);
         reloadLines.push(`⚠️ Провери графиката преди вход - независим сигнал, не DCA`);
-        await sendWhatsApp(env, reloadLines.join('\n'));
+        batch.push(reloadLines.join('\n'));
       }
     } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }
   return btcFlowContext;
@@ -5072,8 +5101,14 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
   let btcFlowContext = btcFlowContextOverride || { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
   const btcPos = watchlist.find((p) => p.symbol === 'BTCUSDT');
   const restPositions = btcPos ? watchlist.filter((p) => p.symbol !== 'BTCUSDT') : watchlist;
+  // batch - локален за ТОВА извикване на checkMarketSignals (НЕ module-scope),
+  // защото runDiscoveryFullAnalysis вика checkMarketSignals ВТОРИ път (за
+  // pool watchlist-а) паралелно на този основен извикване (виж Promise.all в
+  // scheduled()) - споделен масив би разбъркал известията на двете отделни
+  // извиквания. Виж flushWhatsAppBatch по-горе защо изобщо батчваме.
+  const batch = [];
   if (btcPos) {
-    btcFlowContext = await processWatchlistSymbol(env, btcPos, btcFlowContext);
+    btcFlowContext = await processWatchlistSymbol(env, btcPos, btcFlowContext, batch);
   }
   // SYMBOL_CHUNK_SIZE - предпазливо избран (виж discussion-а) - паралелизира
   // символите на малки партиди вместо "всички наведнъж", за да не претовари
@@ -5082,8 +5117,9 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
   const SYMBOL_CHUNK_SIZE = 6;
   for (let i = 0; i < restPositions.length; i += SYMBOL_CHUNK_SIZE) {
     const chunk = restPositions.slice(i, i + SYMBOL_CHUNK_SIZE);
-    await Promise.all(chunk.map((pos) => processWatchlistSymbol(env, pos, btcFlowContext)));
+    await Promise.all(chunk.map((pos) => processWatchlistSymbol(env, pos, btcFlowContext, batch)));
   }
+  await flushWhatsAppBatch(env, batch);
 }
 
 // ---- Macro SQUEEZE следене (извиква се от scheduled()) ---------------------
