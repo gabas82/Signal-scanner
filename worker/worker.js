@@ -214,18 +214,24 @@ async function sendWhatsAppSerialized(env, text) {
 // ("group them into one message"). batch е ЛОКАЛЕН масив (подаден от
 // извикващия, не module-scope) - виж бележката при checkMarketSignals защо.
 const WHATSAPP_BATCH_MAX_CHARS = 3000; // запас под типичния WhatsApp/TextMeBot лимит за дължина на съобщение
+const WHATSAPP_BATCH_MAX_SIGNALS = 2; // макс. сигнала в едно комбинирано съобщение, за да остане четимо
 const WHATSAPP_BATCH_SEPARATOR = '\n\n━━━━━━━━━━\n\n';
 async function flushWhatsAppBatch(env, batch) {
   if (batch.length === 0) return;
   const chunks = [];
   let current = '';
+  let currentCount = 0;
   for (const text of batch) {
     const candidate = current ? current + WHATSAPP_BATCH_SEPARATOR + text : text;
-    if (current && candidate.length > WHATSAPP_BATCH_MAX_CHARS) {
+    const wouldOverflow = current
+      && (candidate.length > WHATSAPP_BATCH_MAX_CHARS || currentCount >= WHATSAPP_BATCH_MAX_SIGNALS);
+    if (wouldOverflow) {
       chunks.push(current);
       current = text;
+      currentCount = 1;
     } else {
       current = candidate;
+      currentCount += 1;
     }
   }
   if (current) chunks.push(current);
