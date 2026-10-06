@@ -2323,6 +2323,7 @@ function buildKeyedOutcomeBreakdown(records, keyFn, allowedKeys = []) {
   return out;
 }
 function directionKey(r) { return (r.direction === 'long' || r.direction === 'short') ? r.direction : null; }
+function symbolKey(r) { return r.symbol || null; }
 function setupScoreKey(r) { return r.setupScore != null ? String(r.setupScore) : null; }
 function confirmation15mKey(r) { return (r.confirmation15m === true || r.confirmation15m === false) ? String(r.confirmation15m) : null; }
 // 'none' покрива и исторически записи отпреди добавянето на htfAligned полето
@@ -2371,6 +2372,18 @@ function attachConfirmation15mCrossBreakdowns(bucket, records) {
   bucket.byHtfAligned = buildKeyedOutcomeBreakdown(records, htfAlignedKey, ['aligned', 'notAligned', 'none']);
   return bucket;
 }
+// Диагностичен въпрос: "HTF alignment ефектът (виж byHtfAligned по-горе,
+// обратен по посока между MR и TC) стабилен ли е по символ, или е noise от
+// 1-2 символа?" - вложено bySymbol ВЪТРЕ във вече изчисления aligned/
+// notAligned/none бъкет (мутира на място, огледално на
+// attachConfirmation15mCrossBreakdowns по-горе).
+function attachHtfAlignedSymbolBreakdown(htfAlignedBucket, records) {
+  for (const key of Object.keys(htfAlignedBucket)) {
+    const groupRecords = records.filter((r) => htfAlignedKey(r) === key);
+    htfAlignedBucket[key].bySymbol = buildKeyedOutcomeBreakdown(groupRecords, symbolKey);
+  }
+  return htfAlignedBucket;
+}
 // Диагностичен breakdown СПЕЦИФИЧНО за TREND CONTINUATION (и огледално MEAN
 // REVERSION, за симетрия) - direction/quality/confirmation15m/HTF/chase-distance,
 // всичко вече записано в telemetry записите, БЕЗ нов fetch.
@@ -2379,6 +2392,7 @@ function attachSetupModeCrossBreakdowns(bucket, records) {
   bucket.bySetupScore = buildKeyedOutcomeBreakdown(records, setupScoreKey);
   bucket.byConfirmation15m = buildKeyedOutcomeBreakdown(records, confirmation15mKey, ['true', 'false']);
   bucket.byHtfAligned = buildKeyedOutcomeBreakdown(records, htfAlignedKey, ['aligned', 'notAligned', 'none']);
+  attachHtfAlignedSymbolBreakdown(bucket.byHtfAligned, records);
   bucket.byChaseDistanceBucket = buildKeyedOutcomeBreakdown(records, chaseDistanceBucketKey, ['lt0_5', 'from0_5to1', 'from1to1_5', 'gte1_5']);
   return bucket;
 }
