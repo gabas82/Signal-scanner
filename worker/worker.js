@@ -4906,9 +4906,11 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
             `15M CONFIRMATION: ${entryResult.confirmation15m ? '✓' : '—'}`,
             `FLOW: ${entryResult.flowBoost ? '✓' : '—'}`,
             `HTF CONTEXT: ${entryResult.htfAligned ? '✓' : '—'}`,
-            // PR #104 - BOTH QUALITY (виж classifyBothQuality по-горе) - само
-            // маркиране, само за tc3_mr3 same-tick BOTH случая. НЕ hard veto.
-            ...(entryResult.bothQuality === 'degraded' ? [``, `⚠️ BOTH QUALITY: DEGRADED (TC+MR едновременно, tc3_mr3 - исторически по-слаб резултат)`] : []),
+            // PR #104/#119 - BOTH QUALITY (виж classifyBothQuality по-горе) -
+            // маркиране за ВСЯКА TC+MR same-tick BOTH комбинация (не само
+            // tc3_mr3) - данните показват, че всички both комбинации
+            // исторически се представят по-добре от самостоятелните TC/MR.
+            ...(entryResult.bothQuality != null ? [``, `🌟 BOTH QUALITY: ${entryResult.bothQuality === 'degraded' ? 'DEGRADED (tc3_mr3)' : 'NORMAL'} (TC+MR едновременно на символа)`] : []),
             ``,
             // PR #112 - ENTRY QUALITY TIER (виж classifyEntryQuality по-горе) -
             // observation-only score/tier, показан тук само информативно (НЕ
@@ -4917,7 +4919,13 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
             ``,
             `⚠️ MAX CHASE: ${formatPrice(entryResult.structRef)} USD`,
           ];
-          batch.push(entryLines.join('\n'));
+          // PR #119 - D-tier confirmed входове исторически се представят
+          // по-слабо (виж entryQualityStats) - НЕ се пращат в WhatsApp, но
+          // ENTRY decision/telemetry логиката по-горе е напълно непроменена
+          // (записът вече е в records/pending outcomes независимо от това).
+          if (entryResult.entryQualityTier !== 'D') {
+            batch.push(entryLines.join('\n'));
+          }
         } else {
           const missedLines = [
             `⚠️ ENTRY MISSED ${symbolNoUsdt}`,
@@ -4977,9 +4985,11 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
             `15M CONFIRMATION: ${trendEntryResult.confirmation15m ? '✓' : '—'}`,
             `FLOW: ${trendEntryResult.flowBoost ? '✓' : '—'}`,
             `HTF CONTEXT: ${trendEntryResult.htfAligned ? '✓' : '—'}`,
-            // PR #104 - BOTH QUALITY (виж classifyBothQuality по-горе) - само
-            // маркиране, само за tc3_mr3 same-tick BOTH случая. НЕ hard veto.
-            ...(trendEntryResult.bothQuality === 'degraded' ? [``, `⚠️ BOTH QUALITY: DEGRADED (TC+MR едновременно, tc3_mr3 - исторически по-слаб резултат)`] : []),
+            // PR #104/#119 - BOTH QUALITY (виж classifyBothQuality по-горе) -
+            // маркиране за ВСЯКА TC+MR same-tick BOTH комбинация (не само
+            // tc3_mr3) - данните показват, че всички both комбинации
+            // исторически се представят по-добре от самостоятелните TC/MR.
+            ...(trendEntryResult.bothQuality != null ? [``, `🌟 BOTH QUALITY: ${trendEntryResult.bothQuality === 'degraded' ? 'DEGRADED (tc3_mr3)' : 'NORMAL'} (TC+MR едновременно на символа)`] : []),
             ``,
             // PR #112 - ENTRY QUALITY TIER (виж classifyEntryQuality по-горе) -
             // observation-only score/tier, показан тук само информативно (НЕ
@@ -4988,7 +4998,13 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
             ``,
             `⚠️ MAX CHASE: ${formatPrice(trendEntryResult.structRef)} USD`,
           ];
-          batch.push(entryLines.join('\n'));
+          // PR #119 - D-tier confirmed входове исторически се представят
+          // по-слабо (виж entryQualityStats) - НЕ се пращат в WhatsApp, но
+          // ENTRY decision/telemetry логиката по-горе е напълно непроменена
+          // (записът вече е в records/pending outcomes независимо от това).
+          if (trendEntryResult.entryQualityTier !== 'D') {
+            batch.push(entryLines.join('\n'));
+          }
         } else {
           const missedLines = [
             `⚠️ ENTRY MISSED ${symbolNoUsdt} (TREND CONTINUATION)`,
