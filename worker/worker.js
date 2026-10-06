@@ -125,7 +125,7 @@ function calcDCALevels(entryPrice, side, symbol) {
 // разкри реалната причина зад известия, които просто не пристигаха: TextMeBot
 // отговаря с HTTP 403 "There is currently a limit of 1 messages per 5 seconds
 // to prevent a ban from whatsapp".
-const WHATSAPP_MIN_INTERVAL_MS = 6000; // буфер над обявения лимит от 5 сек (вдигнат от 5200 - все още виждахме HTTP 403 заради мрежов jitter между relay/TextMeBot)
+const WHATSAPP_MIN_INTERVAL_MS = 12000; // буфер над обявения лимит от 5 сек (вдигнат от 6000 - Observability показа системни 403 на ВСЕКИ първи опит, на ~12с интервали: lastWhatsAppSendAt се обновява и на неуспешни опити, retry-ят с +6с обикновено успяваше тихо, но следващото съобщение пак стартираше само с 6с буфер и пак падаше - 6с явно не стигаше като margin)
 const WHATSAPP_RATE_LIMIT_RETRY_MS = 6000; // допълнително изчакване преди retry при HTTP 403 rate-limit (вместо да губим съобщението тихо)
 const WHATSAPP_MAX_RATE_LIMIT_RETRIES = 2; // до 2 допълнителни опита при повторен 403 rate-limit
 function sleep(ms) {
