@@ -2563,6 +2563,7 @@ function buildPathDiagnostics(records) {
       byConfirmation15m: buildKeyedExcursionBreakdown(confirmed, confirmation15mKey),
       byHtfAligned: buildKeyedExcursionBreakdown(confirmed, htfAlignedKey),
       byModeOverlap: buildExcursionModeOverlapBreakdown(confirmed),
+      byChaseDistanceBucket: buildKeyedExcursionBreakdown(confirmed, chaseDistanceBucketKey),
     },
     missed: {
       overall: buildExcursionGroup(missed),
