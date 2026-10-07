@@ -2688,7 +2688,13 @@ function classifyBothQuality(mrSetupScore, tcSetupScore) {
 const ENTRY_QUALITY_WEIGHTS = {
   setupModeBase: { mean_reversion: 50, trend_continuation: 44 },
   chaseDistanceBucket: { lt0_5: 8, from0_5to1: 2, from1to1_5: -3, gte1_5: -10 },
-  htfAlignedTrue: 3, htfAlignedFalse: -1,
+  // HTF alignment ефектът е ОБРАТЕН по посока между MR и TC (виж
+  // bySetupMode.<mode>.byHtfAligned.<group>.bySymbol diagnostic-а от PR #123)
+  // - при MR aligned исторически по-добър и консистентен по символ, при TC
+  // notAligned системно по-добър (ALGOUSDT/1000PEPEUSDT/AAVEUSDT) - вече не е
+  // еднакво тегло за двата мода.
+  htfAlignedTrueBySetupMode: { mean_reversion: 3, trend_continuation: -1 },
+  htfAlignedFalseBySetupMode: { mean_reversion: -1, trend_continuation: 1 },
   confirmation15mTrue: -2, confirmation15mFalse: 2,
 };
 function classifyEntryQuality({ setupMode, chaseDistanceAtrRatio, htfAligned, confirmation15m }) {
@@ -2697,8 +2703,8 @@ function classifyEntryQuality({ setupMode, chaseDistanceAtrRatio, htfAligned, co
   let score = base;
   const bucket = chaseDistanceBucketKey({ chaseDistanceAtrRatio });
   if (bucket != null) score += ENTRY_QUALITY_WEIGHTS.chaseDistanceBucket[bucket];
-  if (htfAligned === true) score += ENTRY_QUALITY_WEIGHTS.htfAlignedTrue;
-  else if (htfAligned === false) score += ENTRY_QUALITY_WEIGHTS.htfAlignedFalse;
+  if (htfAligned === true) score += ENTRY_QUALITY_WEIGHTS.htfAlignedTrueBySetupMode[setupMode];
+  else if (htfAligned === false) score += ENTRY_QUALITY_WEIGHTS.htfAlignedFalseBySetupMode[setupMode];
   if (confirmation15m === true) score += ENTRY_QUALITY_WEIGHTS.confirmation15mTrue;
   else if (confirmation15m === false) score += ENTRY_QUALITY_WEIGHTS.confirmation15mFalse;
   score = Math.max(0, Math.min(100, score));
