@@ -5697,7 +5697,7 @@ function buildDiscoveryTopListMessage(pool) {
   if (!pool.length) return null;
   const unlockedSorted = pool.filter((m) => !m.locked).sort((a, b) => (a.rank ?? Infinity) - (b.rank ?? Infinity));
   const lockedMembers = pool.filter((m) => m.locked);
-  const lines = [`📡 DISCOVERY TOP ${unlockedSorted.length}`];
+  const lines = [`📡 DISCOVERY TOP ${pool.length}`];
   for (const m of unlockedSorted) {
     const dirIcon = m.lastDirection === 'long' ? '🟢' : m.lastDirection === 'short' ? '🔴' : '⚪';
     let movement;
