@@ -5596,7 +5596,7 @@ async function updateDiscoverySnapshotState(env, watchlist = WATCHLIST) {
 // displacement. FULL ANALYSIS (Stage E) все още не съществува, затова пуловите
 // кандидати днес никога реално нямат setup/armed - защитата вече е коректна и
 // тествана със синтетично sigstate, но е "тиха" в продукция до Stage E.
-const DISCOVERY_POOL_MAX_SIZE = 6;
+const DISCOVERY_POOL_MAX_SIZE = 5; // намалено от 6 - по-фокусиран pool върху най-силните кандидати, преди бъдещия rank-tracking/Stage E
 const DISCOVERY_POOL_TTL_MS = 48 * 3600000; // 48ч - начална точка (виж чата), не финална
 const DISCOVERY_WEAK_SCORE_THRESHOLD = 1; // Activity Score под това ниво се брои "слаб" tick
 const DISCOVERY_WEAK_TICK_LIMIT = 4; // толкова ПОРЕДНИ слаби тика (~1ч при 15-мин radar interval) -> eviction
