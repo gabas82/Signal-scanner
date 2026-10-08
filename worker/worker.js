@@ -5739,26 +5739,34 @@ function computeDiscoveryPoolUpdate({ currentPool, scoresBySymbol, lockedSymbols
 function buildDiscoveryTopListMessage(pool, trapBySymbol = {}) {
   if (!pool.length) return null;
   const unlockedSorted = pool.filter((m) => !m.locked).sort((a, b) => (a.rank ?? Infinity) - (b.rank ?? Infinity));
-  const lockedMembers = pool.filter((m) => m.locked);
+  // Заключените НЕ се конкурират за слот (виж computeDiscoveryPoolUpdate),
+  // затова никога не получават rank/prevRank там - тук само ги подреждаме
+  // ПОМЕЖДУ СИ по същата вече съществуваща Activity Score (lastScore, освежава
+  // се всеки tick независимо от lock статуса) за показна номерация,
+  // продължаваща от незаключените - БЕЗ движение (↑/↓/🆕), защото реда им
+  // помежду им не се следи tick-to-tick като при незаключените.
+  const lockedSorted = pool.filter((m) => m.locked).sort((a, b) => (b.lastScore ?? -Infinity) - (a.lastScore ?? -Infinity));
   const lines = [`📡 DISCOVERY TOP ${pool.length}`];
   const trapSuffix = (symbol) => {
     const trap = trapBySymbol[symbol];
     if (!trap || (trap.tier !== 'watch' && trap.tier !== 'confirmed')) return '';
     return ` 🪤 TRAP ${trap.direction === 'long' ? '▲' : '▼'}`;
   };
+  const dirIconOf = (m) => (m.lastDirection === 'long' ? '🟢' : m.lastDirection === 'short' ? '🔴' : '⚪');
   for (const m of unlockedSorted) {
-    const dirIcon = m.lastDirection === 'long' ? '🟢' : m.lastDirection === 'short' ? '🔴' : '⚪';
     let movement;
     if (m.prevRank == null) movement = '🆕 нов';
     else if (m.rank < m.prevRank) movement = `↑ от #${m.prevRank}`;
     else if (m.rank > m.prevRank) movement = `↓ от #${m.prevRank}`;
     else movement = '→ без промяна';
     const score = m.lastScore != null ? m.lastScore.toFixed(1) : '--';
-    lines.push(`#${m.rank} ${dirIcon} ${m.symbol.replace('USDT', '')} - score ${score} (${movement})${trapSuffix(m.symbol)}`);
+    lines.push(`#${m.rank} ${dirIconOf(m)} ${m.symbol.replace('USDT', '')} - score ${score} (${movement})${trapSuffix(m.symbol)}`);
   }
-  for (const m of lockedMembers) {
-    lines.push(`🔒 ${m.symbol.replace('USDT', '')} - активен SETUP/ARMED (заключен слот)${trapSuffix(m.symbol)}`);
-  }
+  lockedSorted.forEach((m, idx) => {
+    const num = unlockedSorted.length + idx + 1;
+    const score = m.lastScore != null ? m.lastScore.toFixed(1) : '--';
+    lines.push(`#${num} 🔒 ${dirIconOf(m)} ${m.symbol.replace('USDT', '')} - score ${score} (заключен слот - активен SETUP/ARMED)${trapSuffix(m.symbol)}`);
+  });
   return lines.join('\n');
 }
 
