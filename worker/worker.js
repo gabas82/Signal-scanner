@@ -5535,6 +5535,33 @@ function filterDiscoveryUniverse(bulkTicker, coreSymbols) {
   return bySymbol;
 }
 
+// Чиста функция: открива символи, присъстващи в текущия universe snapshot, но
+// отсъстващи в предишния (~DISCOVERY_RADAR_INTERVAL_MIN мин по-рано) - т.е.
+// нов listing на борсата. isFirstSnapshot пази от фалшив "всичко е ново" flood
+// при самия първи tick (когато изобщо няма предишен snapshot). maxFlood пази
+// от временен glitch на борсата/relay (масово изчезване+връщане на символи в
+// bulk отговора не би трябвало да се третира като истински listing бум).
+function detectNewDiscoveryListings(prevBySymbol, currBySymbol, isFirstSnapshot, maxFlood = 10) {
+  if (isFirstSnapshot) return [];
+  const prevSet = new Set(Object.keys(prevBySymbol || {}));
+  const newSymbols = Object.keys(currBySymbol || {}).filter((s) => !prevSet.has(s));
+  if (newSymbols.length > maxFlood) return [];
+  return newSymbols;
+}
+
+// Чиста функция: форматира WhatsApp известие за новооткрити listing-и. null
+// при празен списък (без известие).
+function buildNewListingMessage(newSymbols, currBySymbol) {
+  if (!newSymbols.length) return null;
+  const lines = ['🆕 НОВ LISTING ОТКРИТ'];
+  for (const symbol of newSymbols) {
+    const price = currBySymbol[symbol]?.price;
+    const priceStr = Number.isFinite(price) ? price : '--';
+    lines.push(`${symbol} - цена ${priceStr}`);
+  }
+  return lines.join('\n');
+}
+
 // Гейтнато обновяване (извиква се от scheduled() на всеки CORE тик, но реално
 // работи само на ~DISCOVERY_RADAR_INTERVAL_MIN мин). Собствени KV ключове
 // (discoverysnapshot/discoverybaseline/discoveryscores) - не споделя нищо със
@@ -5552,6 +5579,10 @@ async function updateDiscoverySnapshotState(env, watchlist = WATCHLIST) {
     const bulk = await fetchMarketWideTicker24hrWorker(env);
     const coreSymbols = watchlist.map((w) => w.symbol);
     const currBySymbol = filterDiscoveryUniverse(bulk, coreSymbols);
+
+    const newListings = detectNewDiscoveryListings(state.bySymbol, currBySymbol, state.at === 0);
+    const newListingMessage = buildNewListingMessage(newListings, currBySymbol);
+    if (newListingMessage) await sendWhatsApp(env, newListingMessage);
 
     const rawBaseline = await env.ALERT_STATE.get('discoverybaseline');
     const baselines = rawBaseline ? JSON.parse(rawBaseline) : {};
