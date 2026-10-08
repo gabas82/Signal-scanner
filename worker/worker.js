@@ -179,9 +179,15 @@ async function sendWhatsAppSerialized(env, text) {
   const waitMs = WHATSAPP_MIN_INTERVAL_MS - (Date.now() - lastWhatsAppSendAt);
   if (waitMs > 0) await sleep(waitMs);
   const url = `https://api.textmebot.com/send.php?recipient=${encodeURIComponent(env.CALLMEBOT_PHONE)}&apikey=${encodeURIComponent(env.TEXTMEBOT_APIKEY)}&text=${encodeURIComponent(text)}`;
-  // Ретрай само за HTTP 403 "limit of 1 messages per 5 seconds" - потвърдено от
-  // Observability логовете, че буферът над 5 сек понякога не стига (мрежов jitter
-  // между relay/TextMeBot). Преди просто губехме съобщението тихо (само console.error).
+  // Ретрай за HTTP 403 "limit of 1 messages per 5 seconds", HTTP 409 (recipient
+  // conflict - виж по-долу) и мрежови/timeout изключения - потвърдено от
+  // Observability логовете (02:58:06-39 бърст): AbortError (FETCH_TIMEOUT_MS
+  // изтекъл client-side) последван от HTTP 409 "Recipient's Phone number
+  // conflict" на следващото съобщение - timeout-ът при НАС не значи, че
+  // TextMeBot също е прекъснал заявката; тя вероятно продължава да се
+  // обработва при тях, и следващият опит към СЪЩИЯ recipient се удря в
+  // "вече в процес на обработка" конфликт. Преди просто губехме съобщението
+  // тихо (само console.error, без retry за нито един от трите случая).
   for (let attempt = 0; attempt <= WHATSAPP_MAX_RATE_LIMIT_RETRIES; attempt++) {
     lastWhatsAppSendAt = Date.now();
     try {
@@ -193,13 +199,18 @@ async function sendWhatsAppSerialized(env, text) {
       // но НИКЪДЕ не се логваше, за разлика от мрежово изключение (catch по-долу).
       console.error(`TextMeBot non-OK response: HTTP ${r.status}: ${body.slice(0, 300)}`);
       const isRateLimit = r.status === 403 && /limit of \d+ messages? per \d+ seconds?/i.test(body);
-      if (isRateLimit && attempt < WHATSAPP_MAX_RATE_LIMIT_RETRIES) {
+      const isConflict = r.status === 409;
+      if ((isRateLimit || isConflict) && attempt < WHATSAPP_MAX_RATE_LIMIT_RETRIES) {
         await sleep(WHATSAPP_RATE_LIMIT_RETRY_MS);
         continue;
       }
       return { ok: false, status: r.status, body: body.slice(0, 500) };
     } catch (e) {
       console.error('TextMeBot send error:', e);
+      if (attempt < WHATSAPP_MAX_RATE_LIMIT_RETRIES) {
+        await sleep(WHATSAPP_RATE_LIMIT_RETRY_MS);
+        continue;
+      }
       return { ok: false, error: e.message };
     }
   }
