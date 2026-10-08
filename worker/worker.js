@@ -4185,6 +4185,13 @@ async function scanSymbolSignals(env, symbol) {
   const trapMaxScore = Math.max(trapScore.longScore, trapScore.shortScore);
   const trapHasHardFactor = trapDirection === 'long' ? trapScore.hasHardFactorLong : trapScore.hasHardFactorShort;
   const trapTier = getTrapTier(trapMaxScore, trapHasHardFactor);
+  // "Жива" снимка на ТЕКУЩИЯ TRAP статус - за разлика от state.trap по-долу
+  // (hysteresis-гейтнат "кога за последно гръмна известието"), това поле се
+  // презаписва на ВСЕКИ tick, независимо дали е имало ново известие - чисто
+  // диагностично, четено само от Discovery TOP списъка (виж
+  // buildDiscoveryTopListMessage) за 🪤 маркировка. Никой threshold/gate не
+  // го чете обратно.
+  state.trapSnapshot = { tier: trapTier, direction: trapDirection, at: Date.now() };
   // sweep candleTime (последната затворена 1ч свещ) - собствен key компонент,
   // за да не се повтори известието на СЪЩАТА затворена свещ (огледално на
   // candleTime конвенцията за структурните тагове, но с key вместо label).
@@ -5724,11 +5731,21 @@ function computeDiscoveryPoolUpdate({ currentPool, scoresBySymbol, lockedSymbols
 // членове (виж isDiscoveryPoolMemberLocked - реално активни с wire-натия
 // Stage E, не само синтетично тествани) се показват последни, без rank
 // movement (не участват в ranking-а).
-function buildDiscoveryTopListMessage(pool) {
+// trapBySymbol - { symbol: { tier, direction } } снимка от state.trapSnapshot
+// (виж scanSymbolSignals) за текущите pool членове - ЧИСТО диагностична
+// 🪤 маркировка до монети с активен TRAP WATCH/CONFIRMED В МОМЕНТА на
+// снимката. Не участва в ranking/eviction/score по никакъв начин - само
+// визуално съпоставя вече съществуващото TRAP известие с TOP списъка.
+function buildDiscoveryTopListMessage(pool, trapBySymbol = {}) {
   if (!pool.length) return null;
   const unlockedSorted = pool.filter((m) => !m.locked).sort((a, b) => (a.rank ?? Infinity) - (b.rank ?? Infinity));
   const lockedMembers = pool.filter((m) => m.locked);
   const lines = [`📡 DISCOVERY TOP ${pool.length}`];
+  const trapSuffix = (symbol) => {
+    const trap = trapBySymbol[symbol];
+    if (!trap || (trap.tier !== 'watch' && trap.tier !== 'confirmed')) return '';
+    return ` 🪤 TRAP ${trap.direction === 'long' ? '▲' : '▼'}`;
+  };
   for (const m of unlockedSorted) {
     const dirIcon = m.lastDirection === 'long' ? '🟢' : m.lastDirection === 'short' ? '🔴' : '⚪';
     let movement;
@@ -5737,10 +5754,10 @@ function buildDiscoveryTopListMessage(pool) {
     else if (m.rank > m.prevRank) movement = `↓ от #${m.prevRank}`;
     else movement = '→ без промяна';
     const score = m.lastScore != null ? m.lastScore.toFixed(1) : '--';
-    lines.push(`#${m.rank} ${dirIcon} ${m.symbol.replace('USDT', '')} - score ${score} (${movement})`);
+    lines.push(`#${m.rank} ${dirIcon} ${m.symbol.replace('USDT', '')} - score ${score} (${movement})${trapSuffix(m.symbol)}`);
   }
   for (const m of lockedMembers) {
-    lines.push(`🔒 ${m.symbol.replace('USDT', '')} - активен SETUP/ARMED (заключен слот)`);
+    lines.push(`🔒 ${m.symbol.replace('USDT', '')} - активен SETUP/ARMED (заключен слот)${trapSuffix(m.symbol)}`);
   }
   return lines.join('\n');
 }
@@ -5756,9 +5773,11 @@ async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now()) {
     const currentPool = rawPool ? JSON.parse(rawPool) : [];
 
     const lockedSymbols = new Set();
+    const trapBySymbol = {};
     for (const member of currentPool) {
       const sigstate = await loadSymbolState(env, member.symbol);
       if (isDiscoveryPoolMemberLocked(sigstate)) lockedSymbols.add(member.symbol);
+      if (sigstate && sigstate.trapSnapshot) trapBySymbol[member.symbol] = sigstate.trapSnapshot;
     }
 
     const { newPool, exited } = computeDiscoveryPoolUpdate({
@@ -5777,7 +5796,7 @@ async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now()) {
     // Периодичен TOP списък (виж discussion-а - rank + движение #5->#2 и т.н.)
     // Пуска се само тук, на реалния ~DISCOVERY_RADAR_INTERVAL_MIN gate (НЕ на
     // всеки 5-мин CORE tick) - едно известие на radar tick, не на watchlist tick.
-    const topListMessage = buildDiscoveryTopListMessage(newPool);
+    const topListMessage = buildDiscoveryTopListMessage(newPool, trapBySymbol);
     if (topListMessage) await sendWhatsApp(env, topListMessage);
   } catch (e) { console.error(`DISCOVERY RADAR pool update error: ${e.message}`); }
 }
