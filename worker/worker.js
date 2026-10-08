@@ -2122,6 +2122,7 @@ function buildTelemetryRecord({
   trapTier, trapDirection, flowWarmingTier, flowWarmingDirection, entryScore,
   setupMode, htfAligned, bothQuality,
   timeFromArmMin, pctMoveFromArm, atrMoveFromArm, setupAt,
+  targetScore, targetTier, targetDirection,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
   const chaseDistanceAtrRatio = (atr5m > 0 && chaseDistance != null) ? chaseDistance / atr5m : null;
@@ -2180,6 +2181,13 @@ function buildTelemetryRecord({
     // null) - ARMED -> ENTRY EVALUATION latency/move контекст.
     timeFromArmMin: timeFromArmMin ?? null, pctMoveFromArm: pctMoveFromArm ?? null,
     atrMoveFromArm: atrMoveFromArm ?? null,
+    // DIAGNOSTIC-ONLY (виж discussion-а: "TARGET SCORE в WhatsApp съобщение
+    // същото ли е като ENTRY SCORE") - текущата TARGET (POC distance/strength,
+    // виж calcTargetScore по-горе) стойност В МОМЕНТА на ENTRY evaluation-а
+    // (СЪЩИЯ tick), за да проверим дали корелира с CONFIRMED резултатите.
+    // НЕ се чете обратно от ENTRY ENGINE логиката - чисто наблюдение.
+    targetScore: targetScore ?? null, targetTier: targetTier ?? null,
+    targetDirection: targetDirection ?? null,
   };
 }
 
@@ -2330,6 +2338,10 @@ function confirmation15mKey(r) { return (r.confirmation15m === true || r.confirm
 // (винаги undefined за тях) - "не сме проверили", различно от "проверено и не съвпада".
 function htfAlignedKey(r) { return r.htfAligned === true ? 'aligned' : r.htfAligned === false ? 'notAligned' : 'none'; }
 function setupModeKey(r) { return (r.setupMode === 'mean_reversion' || r.setupMode === 'trend_continuation') ? r.setupMode : null; }
+// DIAGNOSTIC-ONLY (виж discussion-а: TARGET SCORE/tier от calcTargetScore,
+// записан В МОМЕНТА на ENTRY evaluation-а - проверка дали корелира с
+// CONFIRMED резултатите, преди евентуално да се ползва в ENTRY логиката).
+function targetTierKey(r) { return (r.targetTier === 'none' || r.targetTier === 'watch' || r.targetTier === 'strong') ? r.targetTier : null; }
 // PR #102 т.1 - entryScore (ENTRY TRIGGER-ово качество) е ОТДЕЛНО поле от
 // setupScore (SETUP-ово качество) - вече съществуващият setupScoreKey не го
 // покрива. Липсващ entryScore (missed/veto нямат) -> null, пропуска се.
@@ -2888,6 +2900,14 @@ function buildTelemetrySummary(records) {
   // PR #102 т.2 с modeOverlap.both.directionDecomposition (same/opposite
   // direction, TC×MR score, HTF/confirmation15m relation).
   summary.modeOverlap = buildModeOverlapSummary(records);
+
+  // DIAGNOSTIC-ONLY (виж discussion-а: "TARGET SCORE в WhatsApp съобщение
+  // същото ли е като ENTRY SCORE, и може ли да помогне за по-прецизен вход")
+  // - targetTier (none/watch/strong) записан В МОМЕНТА на ENTRY evaluation-а
+  // (виж targetScore/targetTier полетата в buildTelemetryRecord по-горе),
+  // breakdown по confirmed/missed/veto + outcome статистика. Чисто
+  // observability - targetTier/targetScore НЕ участват в ENTRY решението.
+  summary.byTargetTier = buildKeyedOutcomeBreakdown(records, targetTierKey, ['none', 'watch', 'strong']);
 
   // PR #102 т.1 - ENTRY SCORE DECOMPOSITION (виж buildEntryScoreDecomposition
   // по-горе) - defensere: КОЙ компонент (trap/auction/migration/confirmation15m/
@@ -4394,6 +4414,7 @@ async function scanSymbolSignals(env, symbol) {
         entryScore: entryResult.score,
         setupMode: 'mean_reversion', htfAligned: entryResult.htfAligned,
         setupAt: state.setup ? state.setup.at : null,
+        targetScore: targetScore.score, targetTier, targetDirection: targetScore.direction,
       });
       entryResult.entryQualityScore = record.entryQualityScore;
       entryResult.entryQualityTier = record.entryQualityTier;
@@ -4572,6 +4593,7 @@ async function scanSymbolSignals(env, symbol) {
         bothQuality,
         timeFromArmMin: tcTimeFromArmMin, pctMoveFromArm: tcPctMoveFromArm, atrMoveFromArm: tcAtrMoveFromArm,
         setupAt: state.trendArmed.setupAt,
+        targetScore: targetScore.score, targetTier, targetDirection: targetScore.direction,
       });
       trendEntryResult.entryQualityScore = record.entryQualityScore;
       trendEntryResult.entryQualityTier = record.entryQualityTier;
