@@ -5589,14 +5589,15 @@ async function updateDiscoverySnapshotState(env, watchlist = WATCHLIST) {
 }
 
 // ---- DISCOVERY RADAR (Stage D) - pool ranking/eviction ---------------------
-// Управлява DISCOVERY_POOL (макс. 6 монети): ranking по Activity Score (не
-// "първите намерени"), TTL + weak-score eviction, и твърда защита - монета с
-// активно ENTRY ENGINE състояние (SETUP или ARMED, виж sigstate:{symbol}) НЕ
-// може да отпадне нито от TTL, нито от слаб score, нито от ranking
-// displacement. FULL ANALYSIS (Stage E) все още не съществува, затова пуловите
-// кандидати днес никога реално нямат setup/armed - защитата вече е коректна и
-// тествана със синтетично sigstate, но е "тиха" в продукция до Stage E.
-const DISCOVERY_POOL_MAX_SIZE = 5; // намалено от 6 - по-фокусиран pool върху най-силните кандидати, преди бъдещия rank-tracking/Stage E
+// Управлява DISCOVERY_POOL (макс. DISCOVERY_POOL_MAX_SIZE монети): ranking по
+// Activity Score (не "първите намерени"), TTL + weak-score eviction, и твърда
+// защита - монета с активно ENTRY ENGINE състояние (SETUP или ARMED, виж
+// sigstate:{symbol}) НЕ може да отпадне нито от TTL, нито от слаб score, нито
+// от ranking displacement. FULL ANALYSIS (Stage E, виж runDiscoveryFullAnalysis
+// по-долу) Е wire-нат в scheduled() - pool членовете РЕАЛНО минават през
+// пълната SETUP/ARMED/ENTRY верига на всеки CORE tick, защитата тук вече
+// активно пази реални, не само синтетични sigstate записи.
+const DISCOVERY_POOL_MAX_SIZE = 5; // намалено от 6 - по-фокусиран pool върху най-силните кандидати
 const DISCOVERY_POOL_TTL_MS = 48 * 3600000; // 48ч - начална точка (виж чата), не финална
 const DISCOVERY_WEAK_SCORE_THRESHOLD = 1; // Activity Score под това ниво се брои "слаб" tick
 const DISCOVERY_WEAK_TICK_LIMIT = 4; // толкова ПОРЕДНИ слаби тика (~1ч при 15-мин radar interval) -> eviction
@@ -5676,7 +5677,10 @@ function computeDiscoveryPoolUpdate({ currentPool, scoresBySymbol, lockedSymbols
   const openSlots = Math.max(0, config.maxSize - lockedMembers.length);
   const ranked = [...unlockedSurvivors, ...newCandidates]
     .sort((a, b) => (b.lastScore ?? -Infinity) - (a.lastScore ?? -Infinity));
-  const kept = ranked.slice(0, openSlots);
+  // RANK TRACKING (diagnostic-only, не участва в ranking-а самия) - 1-based
+  // позиция СЛЕД тазтиковия ranking + предишната позиция (null за нов член),
+  // за да виждаме движение #5->#2 и т.н. при периодичния TOP списък.
+  const kept = ranked.slice(0, openSlots).map((m, idx) => ({ ...m, prevRank: m.rank ?? null, rank: idx + 1 }));
   const displaced = ranked.slice(openSlots)
     .filter((m) => unlockedSurvivors.includes(m))
     .map((m) => ({ ...m, exitReason: 'displaced' }));
@@ -5684,9 +5688,36 @@ function computeDiscoveryPoolUpdate({ currentPool, scoresBySymbol, lockedSymbols
   return { newPool: [...lockedMembers, ...kept], exited: [...ttlOrWeakExited, ...displaced] };
 }
 
+// Форматира периодичния TOP списък (виж updateDiscoveryPool по-долу) -
+// pool-ът вече Е сортиран по rank (1 = най-висок Activity Score), locked
+// членове (виж isDiscoveryPoolMemberLocked - реално активни с wire-натия
+// Stage E, не само синтетично тествани) се показват последни, без rank
+// movement (не участват в ranking-а).
+function buildDiscoveryTopListMessage(pool) {
+  if (!pool.length) return null;
+  const unlockedSorted = pool.filter((m) => !m.locked).sort((a, b) => (a.rank ?? Infinity) - (b.rank ?? Infinity));
+  const lockedMembers = pool.filter((m) => m.locked);
+  const lines = [`📡 DISCOVERY TOP ${unlockedSorted.length}`];
+  for (const m of unlockedSorted) {
+    const dirIcon = m.lastDirection === 'long' ? '🟢' : m.lastDirection === 'short' ? '🔴' : '⚪';
+    let movement;
+    if (m.prevRank == null) movement = '🆕 нов';
+    else if (m.rank < m.prevRank) movement = `↑ от #${m.prevRank}`;
+    else if (m.rank > m.prevRank) movement = `↓ от #${m.prevRank}`;
+    else movement = '→ без промяна';
+    const score = m.lastScore != null ? m.lastScore.toFixed(1) : '--';
+    lines.push(`#${m.rank} ${dirIcon} ${m.symbol.replace('USDT', '')} - score ${score} (${movement})`);
+  }
+  for (const m of lockedMembers) {
+    lines.push(`🔒 ${m.symbol.replace('USDT', '')} - активен SETUP/ARMED (заключен слот)`);
+  }
+  return lines.join('\n');
+}
+
 // Wiring: чете/пише discoverypool в KV, чете sigstate само за текущите (макс.
-// 6) pool членове, за да прецени locked статуса им - собствен try/catch, за
-// да не завлече вече записаните score-ове по-горе, ако тук нещо гръмне.
+// DISCOVERY_POOL_MAX_SIZE) pool членове, за да прецени locked статуса им -
+// собствен try/catch, за да не завлече вече записаните score-ове по-горе,
+// ако тук нещо гръмне.
 async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now()) {
   if (!env.ALERT_STATE) return;
   try {
@@ -5712,6 +5743,11 @@ async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now()) {
       console.log(`DISCOVERY RADAR pool exits: ${exited.map((e) => `${e.symbol}(${e.exitReason})`).join(', ')}`);
       await markDiscoveryEpisodesExited(env, exited, now);
     }
+    // Периодичен TOP списък (виж discussion-а - rank + движение #5->#2 и т.н.)
+    // Пуска се само тук, на реалния ~DISCOVERY_RADAR_INTERVAL_MIN gate (НЕ на
+    // всеки 5-мин CORE tick) - едно известие на radar tick, не на watchlist tick.
+    const topListMessage = buildDiscoveryTopListMessage(newPool);
+    if (topListMessage) await sendWhatsApp(env, topListMessage);
   } catch (e) { console.error(`DISCOVERY RADAR pool update error: ${e.message}`); }
 }
 
