@@ -5149,6 +5149,14 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
               symbol: pos.symbol, direction: flowWarmingDirection, tier: flowWarmingTier,
               score: flowWarmingMaxScore, oiDelta15m: sparkOiDelta15m, takerDelta15m,
               volRatio: sparkVolRatio, chg1h: sparkChg1h, coinTier: getSparkCoinTier(symbolNoUsdt),
+              // Цената от СЪЩИЯ market snapshot (последната затворена 5м свещ,
+              // виж `price` в scanSymbolSignals), вече изчислена - нула нови
+              // мрежови заявки. Валидирана (краен, положителен number) - при
+              // невалидна стойност пазим null, НЕ блокираме известието по-горе
+              // (то вече е в batch-а, независимо от тази проверка). За бъдеща
+              // FLOW WARMING -> SETUP -> ARMED -> ENTRY съпоставка (lead time
+              // + % движение на цената) - виж discussion-а.
+              price: (Number.isFinite(price) && price > 0) ? price : null,
               at: Date.now(),
             };
             await env.ALERT_STATE.put(`flowwarmingevent:${pos.symbol}:${flowWarmingEventRecord.at}`, JSON.stringify(flowWarmingEventRecord));
