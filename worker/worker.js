@@ -5766,11 +5766,28 @@ async function updateDiscoverySnapshotState(env, watchlist = WATCHLIST) {
     await env.ALERT_STATE.put('discoverybaseline', JSON.stringify(newBaselines));
     await env.ALERT_STATE.put('discoveryscores', JSON.stringify(newScores));
 
+    // FIRST QUALIFYING WAKE-UP (Етап 2, виж updateDiscoveryWakeups по-горе) -
+    // ФАЗА A, ПРЕДИ pool ъпдейта - за да може computeDiscoveryPoolUpdate да
+    // знае (през wakeupBySymbol) кои от днешните нови pool кандидати вече имат
+    // по-ранно "будене", и да стампира immutable снимката му. null при грешка
+    // (виж коментара в updateDiscoveryWakeups) - {} подадено на pool-а,
+    // финализацията по-долу се прескача изцяло, за да не презапише
+    // discoverywakeupactive с грешни данни.
+    const wakeupActiveAfterPhaseA = await updateDiscoveryWakeups(env, newScores, now);
+
     // Pool-ъпдейтът тръгва СЛЕД като score-овете вече са трайно записани по-горе
     // (дори ако тук долу гръмне нещо, score-овете за тоя tick не се губят) - и
     // само когато реално е имало нов radar tick (не на всеки 5-мин CORE tick),
     // за да не брои weakTicks/TTL по-често от истинския ~15-мин radar interval.
-    await updateDiscoveryPool(env, newScores, now);
+    const { newPool } = await updateDiscoveryPool(env, newScores, now, wakeupActiveAfterPhaseA || {});
+
+    // ФАЗА B, СЛЕД pool ъпдейта - затваря wake-up наблюденията, промотирани в
+    // pool-а тоя тик (discovery_promoted), и пише финалния discoverywakeupactive.
+    // Прескача се изцяло, ако Фаза A е гръмнала (wakeupActiveAfterPhaseA===null) -
+    // виж бележката по-горе.
+    if (wakeupActiveAfterPhaseA) {
+      await finalizeDiscoveryWakeupPromotions(env, wakeupActiveAfterPhaseA, newPool || [], now);
+    }
   } catch (e) { console.error(`DISCOVERY RADAR snapshot update error: ${e.message}`); }
 }
 
@@ -5809,7 +5826,7 @@ function isDiscoveryPoolMemberLocked(sigstate) {
 // Заключените членове ВИНАГИ пазят слота си - остатъчният капацитет
 // (maxSize - брой заключени) се конкурира само измежду НЕзаключените
 // оцелели + новите кандидати, ранкирани по Activity Score низходящо.
-function computeDiscoveryPoolUpdate({ currentPool, scoresBySymbol, lockedSymbols, now, config }) {
+function computeDiscoveryPoolUpdate({ currentPool, scoresBySymbol, lockedSymbols, now, config, wakeupBySymbol = {} }) {
   const isLocked = (symbol) => !!(lockedSymbols && lockedSymbols.has(symbol));
 
   const ttlSurvivors = [];
@@ -5858,6 +5875,17 @@ function computeDiscoveryPoolUpdate({ currentPool, scoresBySymbol, lockedSymbols
       // увереност, не от най-скорошните.
       discoveryPrice: scoresBySymbol[symbol].price, discoveryScore: scoresBySymbol[symbol].score,
       discoveryDirection: scoresBySymbol[symbol].direction, discoveryConfidence: scoresBySymbol[symbol].confidence,
+      // FIRST QUALIFYING WAKE-UP (Етап 2, виж updateDiscoveryWakeupState по-долу) -
+      // ако символът влиза в pool-а с вече активно wake-up наблюдение, пазим
+      // immutable снимка на МОМЕНТА на първото пресичане на qualifying прага
+      // (може да е много по-рано от самия pool entry) - wakeupBySymbol вече е
+      // изчислен ПРЕДИ тоя tick's updateDiscoveryPool извикване (виж
+      // updateDiscoverySnapshotState). null, ако символът няма активно
+      // wake-up (влязъл директно в pool-а без засечено "будене").
+      wakeupAt: wakeupBySymbol[symbol] ? wakeupBySymbol[symbol].firstQualifyingAt : null,
+      wakeupPrice: wakeupBySymbol[symbol] ? wakeupBySymbol[symbol].firstQualifyingPrice : null,
+      wakeupScore: wakeupBySymbol[symbol] ? wakeupBySymbol[symbol].initialScore : null,
+      wakeupConfidence: wakeupBySymbol[symbol] ? wakeupBySymbol[symbol].confidence : null,
     }));
 
   const openSlots = Math.max(0, config.maxSize - lockedMembers.length);
@@ -5930,8 +5958,12 @@ function buildDiscoveryTopListMessage(pool, trapBySymbol = {}, lockedDirectionBy
 // DISCOVERY_POOL_MAX_SIZE) pool членове, за да прецени locked статуса им -
 // собствен try/catch, за да не завлече вече записаните score-ове по-горе,
 // ако тук нещо гръмне.
-async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now()) {
-  if (!env.ALERT_STATE) return;
+// wakeupBySymbol (Етап 2, default {} - запазва 100% стария сигнатура/behavior
+// за всеки съществуващ caller/тест, който не го подава) - само за immutable
+// снимка на новите pool кандидати (виж computeDiscoveryPoolUpdate по-горе),
+// не участва в ranking/eviction логиката по никакъв начин.
+async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now(), wakeupBySymbol = {}) {
+  if (!env.ALERT_STATE) return { newPool: null, exited: [] };
   try {
     const rawPool = await env.ALERT_STATE.get('discoverypool');
     const currentPool = rawPool ? JSON.parse(rawPool) : [];
@@ -5951,7 +5983,7 @@ async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now()) {
     }
 
     const { newPool, exited } = computeDiscoveryPoolUpdate({
-      currentPool, scoresBySymbol, lockedSymbols, now,
+      currentPool, scoresBySymbol, lockedSymbols, now, wakeupBySymbol,
       config: {
         maxSize: DISCOVERY_POOL_MAX_SIZE, ttlMs: DISCOVERY_POOL_TTL_MS,
         weakScoreThreshold: DISCOVERY_WEAK_SCORE_THRESHOLD, weakTickLimit: DISCOVERY_WEAK_TICK_LIMIT,
@@ -5968,7 +6000,211 @@ async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now()) {
     // всеки 5-мин CORE tick) - едно известие на radar tick, не на watchlist tick.
     const topListMessage = buildDiscoveryTopListMessage(newPool, trapBySymbol, lockedDirectionBySymbol);
     if (topListMessage) await sendWhatsApp(env, topListMessage);
-  } catch (e) { console.error(`DISCOVERY RADAR pool update error: ${e.message}`); }
+    return { newPool, exited };
+  } catch (e) { console.error(`DISCOVERY RADAR pool update error: ${e.message}`); return { newPool: null, exited: [] }; }
+}
+
+// ---- DISCOVERY RADAR (Stage D.5) - FIRST QUALIFYING WAKE-UP ---------------
+// Етап 2 (виж discussion-а "EARLY DISCOVERY -> MARKET INTENT") - открива
+// МОМЕНТА, в който символ, ОЩЕ извън DISCOVERY_POOL (Stage D), за ПЪРВИ път
+// пресича вече съществуващия DISCOVERY_WEAK_SCORE_THRESHOLD (>=, СЪЩАТА
+// граница като "не-слаб" тик в computeDiscoveryPoolUpdate по-горе - БЕЗ нов
+// праг). Собствен KV ключ (discoverywakeupactive - един консолидиран обект,
+// огледално на discoverypool), собствен try/catch - диагностична грешка тук
+// НЕ бива да прекъсва Discovery Radar-а (виж updateDiscoverySnapshotState
+// wiring-а по-долу). ЧИСТО observability - нищо по-долу/по-горе не чете тия
+// записи обратно, нулево влияние върху SETUP/ARMED/ENTRY/scoring/cooldown.
+//
+// LOOK-AHEAD BIAS - firstQualifyingAt е РЕАЛНИЯТ Date.now() в момента на тоя
+// radar tick (forward-only, никога не се "връща назад"). maxFavorablePct/
+// maxAdversePct се смятат САМО от scoresBySymbol[symbol].price (lastPrice,
+// семплиран на всеки ~15-мин тик) - НИКОГА от борсовия 24ч high/low (виж
+// filterDiscoveryUniverse) - last price би замърсил "наблюдавано от
+// wake-up-а насам" с екстремум ОТПРЕДИ firstQualifyingAt. Следствие: тия
+// стойности НЕ са intrabar high/low, а дискретни ~15-мин снимки.
+//
+// Чиста функция - direction-aware % движение спрямо firstQualifyingPrice.
+// За 'short' wake-up "favorable" е спад (знакът се обръща). За 'neutral'
+// (calcDiscoveryDirection може да върне 'neutral') няма implied посока за
+// търговия - третира се по конвенция като 'long' (favorable=нагоре), само
+// етикет за агрегация, НЕ предположение за бъдещо движение (виж Уточнение №5).
+function calcWakeupMovePct(direction, firstPrice, currentPrice) {
+  if (!(firstPrice > 0) || !Number.isFinite(currentPrice)) return null;
+  const rawPct = ((currentPrice - firstPrice) / firstPrice) * 100;
+  return direction === 'short' ? -rawPct : rawPct;
+}
+
+// Чиста reducer функция, огледална на computeDiscoveryPoolUpdate по-горе -
+// приема текущия активен wake-up блок + тазтиковите Discovery score-ове,
+// връща новия активен блок + списък затворени (ttl_expired/weak_score).
+// discovery_promoted затваряне НЕ е тук - изисква newPool-а от
+// updateDiscoveryPool, който на тоя етап още не съществува (виж
+// closeWakeupsPromotedToPool + wiring-а в updateDiscoverySnapshotState).
+function updateDiscoveryWakeupState(activeBySymbol, scoresBySymbol, now, config) {
+  const active = { ...(activeBySymbol || {}) };
+  const closed = [];
+  for (const symbol of Object.keys(active)) {
+    const entry = active[symbol];
+    const scoreEntry = scoresBySymbol[symbol];
+    const qualifies = !!scoreEntry && scoreEntry.score >= config.weakScoreThreshold;
+    const updated = { ...entry };
+    if (qualifies) {
+      updated.weakTicks = 0;
+      updated.lastPrice = scoreEntry.price;
+      const movePct = calcWakeupMovePct(entry.direction, entry.firstQualifyingPrice, scoreEntry.price);
+      if (movePct != null) {
+        if (updated.maxFavorablePct == null || movePct > updated.maxFavorablePct) {
+          updated.maxFavorablePct = movePct; updated.maxFavorableAt = now;
+        }
+        if (updated.maxAdversePct == null || movePct < updated.maxAdversePct) {
+          updated.maxAdversePct = movePct; updated.maxAdverseAt = now;
+        }
+      }
+    } else {
+      updated.weakTicks = (entry.weakTicks || 0) + 1;
+      if (scoreEntry) updated.lastPrice = scoreEntry.price;
+    }
+    // TTL проверката е ПЪРВА - дори ако символът точно тоя тик ОЩЕ qualifies
+    // (weakTicks вече е 0 по-горе), 48ч капът затваря наблюдението и (виж
+    // новите qualifying по-долу) веднага отваря НОВО, прясно "будене" - съзнателно,
+    // bounds размера на ЕДНО наблюдение, не губи продължаващата активност.
+    if (now - entry.firstQualifyingAt >= config.ttlMs) {
+      closed.push({ symbol, entry: updated, closeReason: 'ttl_expired' });
+      delete active[symbol];
+      continue;
+    }
+    if (updated.weakTicks >= config.weakTickLimit) {
+      closed.push({ symbol, entry: updated, closeReason: 'weak_score' });
+      delete active[symbol];
+      continue;
+    }
+    active[symbol] = updated;
+  }
+  for (const [symbol, scoreEntry] of Object.entries(scoresBySymbol)) {
+    if (active[symbol]) continue; // вече активен (или току-що презатворен и презастартиран по-долу е friendly fire - виж бележката за TTL по-горе)
+    if (scoreEntry.score >= config.weakScoreThreshold) {
+      active[symbol] = {
+        symbol, firstQualifyingAt: now, firstQualifyingPrice: scoreEntry.price,
+        initialScore: scoreEntry.score, direction: scoreEntry.direction, confidence: scoreEntry.confidence,
+        weakTicks: 0, lastPrice: scoreEntry.price,
+        maxFavorablePct: 0, maxFavorableAt: now, maxAdversePct: 0, maxAdverseAt: now,
+      };
+    }
+  }
+  return { active, closed };
+}
+
+// DISCOVERY PROMOTION затваряне - СЛЕД updateDiscoveryPool (нуждае се от
+// newPool-а). Чиста функция - символ с активно wake-up наблюдение, който вече
+// присъства в newPool, се третира като "промотиран" (единствения начин да е
+// нов pool член е computeDiscoveryPoolUpdate по-горе, който вече е консумирал
+// снимката му през wakeupBySymbol - виж wiring-а).
+function closeWakeupsPromotedToPool(activeBySymbol, newPool, now) {
+  const active = { ...(activeBySymbol || {}) };
+  const closed = [];
+  const poolSymbols = new Set((newPool || []).map((m) => m.symbol));
+  for (const symbol of Object.keys(active)) {
+    if (poolSymbols.has(symbol)) {
+      closed.push({ symbol, entry: active[symbol], closeReason: 'discovery_promoted' });
+      delete active[symbol];
+    }
+  }
+  return { active, closed };
+}
+
+// Чист builder - трайният архивен запис (виж Уточнение №1 - "неуспешните
+// wake-up наблюдения не изчезват без следа"). Не дублира firstQualifyingPrice
+// екстремум цени - maxFavorablePct/maxAdversePct + firstQualifyingPrice +
+// direction са достатъчни за реконструкция (price = firstQualifyingPrice *
+// (1 + signedPct/100), виж calcWakeupMovePct за знаковата конвенция).
+function buildWakeupArchiveRecord(entry, closedAt, closeReason, reachedDiscoveryPool) {
+  return {
+    symbol: entry.symbol, firstQualifyingAt: entry.firstQualifyingAt, firstQualifyingPrice: entry.firstQualifyingPrice,
+    initialScore: entry.initialScore, direction: entry.direction, confidence: entry.confidence,
+    closedAt, closeReason, reachedDiscoveryPool,
+    observedMovement: {
+      maxFavorablePct: entry.maxFavorablePct, maxFavorableAt: entry.maxFavorableAt,
+      maxAdversePct: entry.maxAdversePct, maxAdverseAt: entry.maxAdverseAt,
+      lastPrice: entry.lastPrice,
+    },
+  };
+}
+
+// Чист summary builder за /discovery-wakeup ендпойнта по-долу - само
+// механични брояци (closeReason/reachedDiscoveryPool/direction), БЕЗ
+// SUCCESSFUL/FAILED/EXPIRED етикети (виж Уточнение №5 - "първо наблюдения,
+// после закономерности" - тия категории изискват праг за "значимо движение",
+// който съзнателно не въвеждаме тук, преди да имаме реални данни за калибрация).
+function buildDiscoveryWakeupSummary(archiveRecords, truncated) {
+  const summary = {
+    recordsAnalyzed: archiveRecords.length, truncated: !!truncated,
+    byCloseReason: { ttl_expired: 0, weak_score: 0, discovery_promoted: 0 },
+    byReachedDiscoveryPool: { true: 0, false: 0 },
+    byDirection: { long: 0, short: 0, neutral: 0 },
+  };
+  for (const r of archiveRecords) {
+    if (summary.byCloseReason[r.closeReason] != null) summary.byCloseReason[r.closeReason]++;
+    const reachedKey = r.reachedDiscoveryPool ? 'true' : 'false';
+    summary.byReachedDiscoveryPool[reachedKey]++;
+    if (summary.byDirection[r.direction] != null) summary.byDirection[r.direction]++;
+  }
+  return summary;
+}
+
+// Пише архивните записи за затворените wake-up-и (един KV ключ per случай,
+// discoverywakeuparchive:{symbol}:{firstQualifyingAt} - firstQualifyingAt е
+// episode-ID-то, огледално на discoveryepisode:{symbol}:{enteredAt}).
+// Неуспешен PUT (виж заданието "при неуспешен archive PUT активният запис не
+// бива да бъде окончателно премахнат") - връща списъка на НЕуспешните, за да
+// може caller-ът да ги върне обратно в active блока за повторен опит на
+// следващия тик (той самия ОЩЕ не е записал нищо на тоя етап).
+async function archiveClosedWakeups(env, closedList, reachedDiscoveryPool) {
+  const failed = [];
+  for (const c of closedList) {
+    try {
+      const key = `discoverywakeuparchive:${c.symbol}:${c.entry.firstQualifyingAt}`;
+      const record = buildWakeupArchiveRecord(c.entry, Date.now(), c.closeReason, reachedDiscoveryPool);
+      await env.ALERT_STATE.put(key, JSON.stringify(record));
+    } catch (e) {
+      console.error(`DISCOVERY WAKEUP archive error for ${c.symbol}: ${e.message}`);
+      failed.push(c);
+    }
+  }
+  return failed;
+}
+
+// Фаза A (ПРЕДИ updateDiscoveryPool) - чете discoverywakeupactive, прилага
+// updateDiscoveryWakeupState (нови qualifying + ttl/weak_score затваряния),
+// архивира затворените. Връща null при грешка (вместо {}) - caller-ът НЕ
+// бива да запише празен/грешен blob върху вече натрупаните активни
+// наблюдения само защото тая стъпка е гръмнала (виж discussion-а "диагностична
+// грешка не бива да изтрива KV състояние").
+async function updateDiscoveryWakeups(env, scoresBySymbol, now) {
+  if (!env.ALERT_STATE) return null;
+  try {
+    const raw = await env.ALERT_STATE.get('discoverywakeupactive');
+    const currentActive = raw ? JSON.parse(raw) : {};
+    const { active, closed } = updateDiscoveryWakeupState(currentActive, scoresBySymbol, now, {
+      weakScoreThreshold: DISCOVERY_WEAK_SCORE_THRESHOLD, weakTickLimit: DISCOVERY_WEAK_TICK_LIMIT, ttlMs: DISCOVERY_POOL_TTL_MS,
+    });
+    const failed = await archiveClosedWakeups(env, closed, false);
+    for (const f of failed) active[f.symbol] = f.entry;
+    return active;
+  } catch (e) { console.error(`DISCOVERY WAKEUP update error: ${e.message}`); return null; }
+}
+
+// Фаза B (СЛЕД updateDiscoveryPool) - затваря промотираните, архивира ги,
+// и пише ЕДИНСТВЕНИЯ финален PUT на discoverywakeupactive за тоя тик (един
+// GET + един PUT на целия тик, независимо от броя активни наблюдения -
+// виж Уточнение №4/KV разходи).
+async function finalizeDiscoveryWakeupPromotions(env, activeAfterPhaseA, newPool, now) {
+  if (!env.ALERT_STATE) return;
+  try {
+    const { active, closed } = closeWakeupsPromotedToPool(activeAfterPhaseA, newPool, now);
+    const failed = await archiveClosedWakeups(env, closed, true);
+    for (const f of failed) active[f.symbol] = f.entry;
+    await env.ALERT_STATE.put('discoverywakeupactive', JSON.stringify(active));
+  } catch (e) { console.error(`DISCOVERY WAKEUP promotion finalize error: ${e.message}`); }
 }
 
 // Пренася Stage D-то вече изчислено exited[] (ttl_expired/weak_score/
@@ -6202,6 +6438,16 @@ function buildDiscoveryEpisode(poolMember) {
       confidence: poolMember.discoveryConfidence ?? null,
     },
     setup: null, armed: null, entry: null,
+    // FIRST QUALIFYING WAKE-UP (Етап 2) - immutable снимка на момента, в
+    // който символът ПЪРВО пресякъл DISCOVERY_WEAK_SCORE_THRESHOLD, ПРЕДИ да
+    // влезе в pool-а (poolMember.wakeupAt - виж computeDiscoveryPoolUpdate/
+    // wakeupBySymbol stamping-а по-горе). null, ако символът е влязъл в
+    // pool-а директно, без предходно засечено "будене" (напр. qualifying
+    // прага пресечен в СЪЩИЯ тик, в който pool-ът има свободен слот).
+    wakeup: poolMember.wakeupAt != null ? {
+      at: poolMember.wakeupAt, price: poolMember.wakeupPrice ?? null,
+      score: poolMember.wakeupScore ?? null, confidence: poolMember.wakeupConfidence ?? null,
+    } : null,
     // activityScoreAtDiscovery/confidenceAtDiscovery (PR #101) - чист alias на
     // discovery.activityScore/confidence по-горе, държан и тук за да живеят
     // ВСИЧКИТЕ "At*" evolution снимки (Discovery/Setup/Entry) в ЕДНО общо
@@ -6804,6 +7050,77 @@ export default {
         count: records.length, truncated,
         records: records.slice(0, limit),
         summary: buildDiscoveryEpisodeSummary(records),
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    }
+
+    // FIRST QUALIFYING WAKE-UP - read-only debug ендпойнт (Етап 2, виж
+    // updateDiscoveryWakeups/buildDiscoveryWakeupSummary по-горе). Огледален
+    // на /discovery-episodes по-горе - същия TELEMETRY_TOKEN, същия
+    // fail-closed auth, същия MAX_KEYS_SCANNED таван. Показва и активните
+    // (discoverywakeupactive - един консолидиран обект, няма truncation риск
+    // там отделно от самия MAX_KEYS_SCANNED капан на архива), и архивираните
+    // (discoverywakeuparchive:) наблюдения - изрично разделени в отговора, за
+    // да не се бъркат "в момента будни" с "вече приключени".
+    if (path === "/discovery-wakeup" && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ALERT_STATE) {
+        return new Response(JSON.stringify({ error: "ALERT_STATE not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const symbolFilter = url.searchParams.get("symbol");
+      const since = url.searchParams.get("since") ? Number(url.searchParams.get("since")) : null;
+      const until = url.searchParams.get("until") ? Number(url.searchParams.get("until")) : null;
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 500);
+      const MAX_KEYS_SCANNED = 2000;
+
+      let active = {};
+      try {
+        const rawActive = await env.ALERT_STATE.get('discoverywakeupactive');
+        active = rawActive ? JSON.parse(rawActive) : {};
+      } catch (e) { /* observability only */ }
+      let activeEntries = Object.values(active);
+      if (symbolFilter) activeEntries = activeEntries.filter((e) => e.symbol === symbolFilter);
+      if (since != null) activeEntries = activeEntries.filter((e) => e.firstQualifyingAt >= since);
+      if (until != null) activeEntries = activeEntries.filter((e) => e.firstQualifyingAt <= until);
+      activeEntries.sort((a, b) => b.firstQualifyingAt - a.firstQualifyingAt);
+
+      const archivePrefix = symbolFilter ? `discoverywakeuparchive:${symbolFilter}:` : "discoverywakeuparchive:";
+      let allKeys = [];
+      let cursor;
+      do {
+        const listResult = await env.ALERT_STATE.list({ prefix: archivePrefix, cursor, limit: 1000 });
+        allKeys.push(...listResult.keys);
+        cursor = listResult.list_complete ? undefined : listResult.cursor;
+      } while (cursor && allKeys.length < MAX_KEYS_SCANNED);
+      const truncated = allKeys.length > MAX_KEYS_SCANNED;
+      allKeys = allKeys.slice(0, MAX_KEYS_SCANNED);
+
+      const archiveRecords = [];
+      for (const k of allKeys) {
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        if (since != null && rec.firstQualifyingAt < since) continue;
+        if (until != null && rec.firstQualifyingAt > until) continue;
+        archiveRecords.push(rec);
+      }
+      archiveRecords.sort((a, b) => b.closedAt - a.closedAt); // най-новите първи
+
+      return new Response(JSON.stringify({
+        active: { count: activeEntries.length, records: activeEntries.slice(0, limit) },
+        archive: {
+          count: archiveRecords.length, truncated,
+          records: archiveRecords.slice(0, limit),
+          summary: buildDiscoveryWakeupSummary(archiveRecords, truncated),
+        },
       }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
     }
 
