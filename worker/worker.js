@@ -1844,7 +1844,11 @@ function setupCanFire(state, direction) {
   return !state.setup || state.setup.direction !== direction;
 }
 function markSetupFired(state, direction, score, price) {
-  state.setup = { direction, score, at: Date.now(), price: price ?? null };
+  // MR RE-ARM DIAGNOSTIC TELEMETRY - reArmCount/lastArmStructRef живеят на
+  // episode (state.setup) ниво и се нулират тук при ВСЯКО ново markSetupFired
+  // (нов episode или смяна на посока) - виж wiring-а в ARM формирането
+  // по-долу. Чисто diagnostic state, не участва в SETUP/ARMED/ENTRY решения.
+  state.setup = { direction, score, at: Date.now(), price: price ?? null, reArmCount: 0, lastArmStructRef: null };
 }
 
 // ═══ TREND CONTINUATION SETUP (втори, независим SETUP режим) ═══════════════════
@@ -1976,6 +1980,29 @@ function calcArmedTrigger(setupDirection, swingEntry, lastClosedCandle) {
   }
   if (setupDirection === 'long') {
     return (calcHigherLow(swingEntry) || calcStructureReclaimUp(swingEntry, lastClosedCandle)) ? 'long' : null;
+  }
+  return null;
+}
+
+// MR RE-ARM DIAGNOSTIC TELEMETRY (diagnostic-only, виж discussion-а "дали
+// многократните ENTRY известия са полезни или шум") - ЧИСТО observational
+// replay на ТОЧНО СЪЩИЯ приоритет като calcArmedTrigger по-горе (fresh pivot
+// проверен ПЪРВО, structure break/reclaim ВТОРО, огледално на `||`
+// short-circuit реда там) - calcArmedTrigger остава БАЙТ-ИДЕНТИЧНА, нищо тук
+// не влияе на fire gate-а. Вика се САМО след като calcArmedTrigger вече е
+// върнала non-null за тоя tick (виж wiring-а в scanSymbolSignals) - връща
+// null само в defensive случая, в който нито едно от двете условия не се
+// повтаря вярно (не би трябвало да се случи, но не гадаем).
+function calcArmedTriggerSource(setupDirection, swingEntry, lastClosedCandle) {
+  if (setupDirection === 'short') {
+    if (calcLowerHigh(swingEntry)) return 'fresh_pivot';
+    if (calcStructureLossDown(swingEntry, lastClosedCandle)) return 'structure_break';
+    return null;
+  }
+  if (setupDirection === 'long') {
+    if (calcHigherLow(swingEntry)) return 'fresh_pivot';
+    if (calcStructureReclaimUp(swingEntry, lastClosedCandle)) return 'structure_break';
+    return null;
   }
   return null;
 }
@@ -2134,6 +2161,7 @@ function buildTelemetryRecord({
   setupMode, htfAligned, bothQuality,
   timeFromArmMin, pctMoveFromArm, atrMoveFromArm, setupAt,
   targetScore, targetTier, targetDirection,
+  reArmCount, triggerSource, structuralReferenceAtArm, structRefUnchanged,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
   const chaseDistanceAtrRatio = (atr5m > 0 && chaseDistance != null) ? chaseDistance / atr5m : null;
@@ -2199,6 +2227,15 @@ function buildTelemetryRecord({
     // НЕ се чете обратно от ENTRY ENGINE логиката - чисто наблюдение.
     targetScore: targetScore ?? null, targetTier: targetTier ?? null,
     targetDirection: targetDirection ?? null,
+    // MR RE-ARM DIAGNOSTIC TELEMETRY (виж calcArmedTriggerSource/wiring-а в
+    // scanSymbolSignals по-горе) - само за MEAN REVERSION call site-а (TC
+    // никога не ги подава, остават null) - чисто observation за дали
+    // многократните ENTRY в рамките на един episodeId са реално нова
+    // структура или повторно прекосяване на статично ниво. НЕ влияят на
+    // SETUP/ARMED/ENTRY/fire gate логиката никъде.
+    reArmCount: reArmCount ?? null, triggerSource: triggerSource ?? null,
+    structuralReferenceAtArm: structuralReferenceAtArm ?? null,
+    structRefUnchanged: structRefUnchanged ?? null,
   };
 }
 
@@ -4370,7 +4407,34 @@ async function scanSymbolSignals(env, symbol) {
       // priceAtArm е ЧИСТО информационен (за контекст в известията) - НЕ
       // участва в chase protection (виж calcEntryTrigger/isTooExtended по-горе
       // и дискусията защо currentSwingReference е правилната референция).
-      state.armed = { direction: armedDirection, at: Date.now(), priceAtArm: price };
+      // MR RE-ARM DIAGNOSTIC TELEMETRY (виж calcArmedTriggerSource по-горе и
+      // discussion-а "дали многократните ENTRY известия са полезни или шум")
+      // - calcArmedTrigger вече е решил (ред по-горе, непроменен) дали да
+      // армираме; тук САМО наблюдаваме КОЙ клон е избран и дали структурата
+      // е същата като предходния ARM в тоя episode. Нищо от това не участва
+      // в самото ARM решение (виж условие 7 - no influence on fire gate).
+      const triggerSource = calcArmedTriggerSource(setupState.direction, state.swingStruct, lastClosed5m);
+      const structuralReferenceAtArm = armedDirection === 'short'
+        ? (state.swingStruct.lastSwingLow ? state.swingStruct.lastSwingLow.price : null)
+        : (state.swingStruct.lastSwingHigh ? state.swingStruct.lastSwingHigh.price : null);
+      // state.setup е гарантирано non-null тук (setupState.direction е truthy
+      // - виж проверката по-горе, което значи markSetupFired вече е минал или
+      // state.setup вече съществува от предходен tick); defensive fallback
+      // само за стари persisted state обекти отпреди тая промяна, в случай че
+      // reArmCount/lastArmStructRef липсват - виж markSetupFired по-горе.
+      const prevArmStructRef = (state.setup && state.setup.lastArmStructRef != null) ? state.setup.lastArmStructRef : null;
+      const structRefUnchanged = (prevArmStructRef != null && structuralReferenceAtArm != null)
+        ? (structuralReferenceAtArm === prevArmStructRef)
+        : null;
+      if (state.setup) {
+        state.setup.lastArmStructRef = structuralReferenceAtArm;
+        state.setup.reArmCount = (state.setup.reArmCount ?? 0) + 1;
+      }
+      state.armed = {
+        direction: armedDirection, at: Date.now(), priceAtArm: price,
+        triggerSource, structuralReferenceAtArm, structRefUnchanged,
+        reArmCount: state.setup ? state.setup.reArmCount : null,
+      };
       armedFired = true;
       // STAGE DIRECTION COUNTS (diagnostic-only) - виж коментара при SETUP по-горе.
       if (env.ALERT_STATE) {
@@ -4433,6 +4497,12 @@ async function scanSymbolSignals(env, symbol) {
         setupMode: 'mean_reversion', htfAligned: entryResult.htfAligned,
         setupAt: state.setup ? state.setup.at : null,
         targetScore: targetScore.score, targetTier, targetDirection: targetScore.direction,
+        // MR RE-ARM DIAGNOSTIC TELEMETRY (виж wiring-а в ARM формирането
+        // по-горе) - четени от state.armed, стампвани тук преди state.armed
+        // да бъде консумиран (null-нат) по-долу при entry/missed резолюция.
+        reArmCount: state.armed.reArmCount, triggerSource: state.armed.triggerSource,
+        structuralReferenceAtArm: state.armed.structuralReferenceAtArm,
+        structRefUnchanged: state.armed.structRefUnchanged,
       });
       entryResult.entryQualityScore = record.entryQualityScore;
       entryResult.entryQualityTier = record.entryQualityTier;
