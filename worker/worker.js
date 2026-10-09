@@ -2859,6 +2859,59 @@ function buildHorizonBreakdown(records, field) {
   };
 }
 
+// EPISODE-LEVEL AGGREGATION (diagnostic-only, виж discussion-а "episode
+// clustering" - UAI/AAVE случаите, при които стотици ENTRY записи
+// принадлежат на шепа дълго-живеещи episode-и) - ДОПЪЛНИТЕЛЕН изглед,
+// НЕ заменя buildTelemetrySummary по-горе/по-долу. Групира по episodeId
+// (вече съществуващо поле от buildTelemetryRecord), избира ХРОНОЛОГИЧНО
+// ПЪРВИЯ запис на всеки episode (по `at`) и смята outcome статистика САМО
+// върху тая first-fire подмножина - реюзва buildOutcomeStatsForField (виж
+// по-горе), което вече филтрира null СТОЙНОСТИ на ВСЕКИ отделен хоризонт
+// поотделно - pending (still-null) хоризонти на скорошни first-fire записи
+// автоматично не замърсяват резолвнатите, нищо допълнително не е нужно тук.
+// Записи с episodeId=null (легаси ARMED state отпреди episodeId wiring-а,
+// виж discussion-а) се броят отделно в unknownEpisode, изключени от
+// uniqueEpisodeCount - не можем да гарантираме уникалност без identifier.
+// OBSERVATION-ONLY: episode-ите тук НЕ са твърдени за независими пазарни
+// възможности (ranking/selection bias остава недоказан за независимост,
+// виж discussion-а) - чисто count/outcome агрегация.
+function buildEpisodeSummary(records, truncated) {
+  const byEpisode = {};
+  let unknownCount = 0;
+  for (const r of records) {
+    if (r.episodeId == null) { unknownCount++; continue; }
+    if (!byEpisode[r.episodeId]) byEpisode[r.episodeId] = [];
+    byEpisode[r.episodeId].push(r);
+  }
+  const episodeIds = Object.keys(byEpisode);
+  const firesPerEpisodeCounts = episodeIds.map((id) => byEpisode[id].length);
+  const firstFireRecords = episodeIds.map((id) => {
+    const group = byEpisode[id];
+    return group.reduce((earliest, r) => (r.at < earliest.at ? r : earliest), group[0]);
+  });
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  const median = (arr) => (arr.length ? calcPercentile([...arr].sort((a, b) => a - b), 50) : null);
+  const firstFireOutcomeByHorizon = {};
+  for (const m of OUTCOME_HORIZONS_MIN) {
+    firstFireOutcomeByHorizon[`m${m}`] = buildOutcomeStatsForField(firstFireRecords, `outcome${m}m`);
+  }
+  return {
+    recordsAnalyzed: records.length,
+    // Копие на top-level truncated флага (виж /telemetry wiring-а) - за да е
+    // episodeSummary самодостатъчен за четене, без кръстосано препращане към
+    // горното ниво на отговора (debug данните често се копират изолирано).
+    truncated: !!truncated,
+    uniqueEpisodeCount: episodeIds.length,
+    firesPerEpisode: {
+      avg: avg(firesPerEpisodeCounts), median: median(firesPerEpisodeCounts),
+      min: firesPerEpisodeCounts.length ? Math.min(...firesPerEpisodeCounts) : null,
+      max: firesPerEpisodeCounts.length ? Math.max(...firesPerEpisodeCounts) : null,
+    },
+    firstFireOutcome: firstFireOutcomeByHorizon,
+    unknownEpisode: { count: unknownCount },
+  };
+}
+
 function buildTelemetrySummary(records) {
   const summary = {
     totalConfirmed: 0, totalMissed: 0, totalVeto: 0,
@@ -6046,7 +6099,7 @@ function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord, liveActivityS
   if (episode.entry || !entryTelemetryRecord) return episode;
   const {
     at, decision, triggerClose: entryPrice, entryScore, atr5m, chaseDistanceAtrRatio,
-    outcome5m, outcome15m, outcome30m, outcome60m, outcome240m, setupMode,
+    outcome5m, outcome15m, outcome30m, outcome60m, outcome240m, setupMode, episodeId,
   } = entryTelemetryRecord;
   const leadTimeEntryMin = (at - episode.discovery.at) / 60000;
   const pctMoveToEntry = (entryPrice != null && episode.discovery.price > 0)
@@ -6071,6 +6124,13 @@ function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord, liveActivityS
       // (telemetry:{symbol}:{at}:{setupMode}, виж updateDiscoveryEpisodes по-долу)
       // - иначе outcome refresh-ът никога няма да намери записа.
       setupMode: setupMode ?? null,
+      // DISCOVERY -> CORE LINK (виж discussion-а "episode clustering") -
+      // entryTelemetryRecord вече носи episodeId (buildTelemetryRecord
+      // по-горе) - четем го директно тук, нулево ново изчисление/заявка.
+      // Еднократно, никога не се презаписва (огледално на entry по-горе) -
+      // еднозначен линк към ENTRY ENGINE episode-а (виж discussion-а за
+      // edge cases при повторен Discovery pool entry/нов CORE episode).
+      entryEpisodeId: episodeId ?? null,
     },
     derived: {
       ...episode.derived, leadTimeEntryMin, pctMoveToEntry, atrMoveToEntry,
@@ -6607,6 +6667,9 @@ export default {
         count: records.length, truncated,
         records: records.slice(0, limit),
         summary: buildTelemetrySummary(records),
+        // EPISODE-LEVEL AGGREGATION (виж buildEpisodeSummary по-горе) -
+        // ДОПЪЛНИТЕЛЕН изглед, не заменя summary по-горе.
+        episodeSummary: buildEpisodeSummary(records, truncated),
         stageDirectionCounts,
       }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
     }
