@@ -5137,6 +5137,23 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
           `⚠️ Все още НЕ Е entry - следи за развитие`,
         ];
         batch.push(flowWarmingLines.join('\n'));
+        // Лека diagnostic telemetry бройка (виж discussion-а - колко често
+        // реално прекосява прага FLOW WARMING, особено за major монети) -
+        // СЪЩИЯ гейт като самото известие (flowWarmingFired, hysteresis-
+        // гейтнат edge-trigger), не пресмята нищо допълнително, нула нови
+        // мрежови заявки. Собствен try/catch - грешка тук не бива да спира
+        // самото известие по-горе (вече е в batch-а).
+        if (env.ALERT_STATE) {
+          try {
+            const flowWarmingEventRecord = {
+              symbol: pos.symbol, direction: flowWarmingDirection, tier: flowWarmingTier,
+              score: flowWarmingMaxScore, oiDelta15m: sparkOiDelta15m, takerDelta15m,
+              volRatio: sparkVolRatio, chg1h: sparkChg1h, coinTier: getSparkCoinTier(symbolNoUsdt),
+              at: Date.now(),
+            };
+            await env.ALERT_STATE.put(`flowwarmingevent:${pos.symbol}:${flowWarmingEventRecord.at}`, JSON.stringify(flowWarmingEventRecord));
+          } catch (e) { console.error(`FLOW WARMING event telemetry write error: ${e.message}`); }
+        }
       }
       // TRAP (IDEA 01, виж calcTrapScore по-горе) - изцяло отделно известие,
       // огледално на SPARK/FLOW WARMING. ИЗРИЧНО НЕ Е entry сигнал (виж
@@ -6298,6 +6315,32 @@ function buildDiscoveryEpisodeSummary(episodes) {
   return summary;
 }
 
+// Агрегира вече заредени/филтрирани flowwarmingevent: записи (чисто
+// in-memory, БЕЗ KV достъп тук - виж /flow-warming-events ендпойнта по-долу).
+// Чисто diagnostic - целта е да отговори дали FLOW WARMING прагът
+// (виж calcFlowWarmingScore/getFlowWarmingTier) е прекалено строг за major
+// монети (BTC/ETH), преди да го разхлабваме на сляпо.
+function buildFlowWarmingSummary(records) {
+  const summary = {
+    total: records.length,
+    byTier: { warming: 0, leader: 0 },
+    byDirection: { long: 0, short: 0 },
+    byCoinTier: { major: 0, semi: 0, minor: 0 },
+    bySymbol: {},
+    avgScore: null,
+  };
+  let scoreSum = 0, scoreCount = 0;
+  for (const r of records) {
+    if (summary.byTier[r.tier] != null) summary.byTier[r.tier]++;
+    if (summary.byDirection[r.direction] != null) summary.byDirection[r.direction]++;
+    if (summary.byCoinTier[r.coinTier] != null) summary.byCoinTier[r.coinTier]++;
+    summary.bySymbol[r.symbol] = (summary.bySymbol[r.symbol] || 0) + 1;
+    if (typeof r.score === 'number') { scoreSum += r.score; scoreCount++; }
+  }
+  summary.avgScore = scoreCount ? +(scoreSum / scoreCount).toFixed(2) : null;
+  return summary;
+}
+
 export {
   calcDCALevels, checkDcaLevels, checkPriceLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals, checkMacroSqueeze,
   updateDiscoverySnapshotState, runDiscoveryFullAnalysis,
@@ -6620,6 +6663,61 @@ export default {
         count: records.length, truncated,
         records: records.slice(0, limit),
         summary: buildDiscoveryEpisodeSummary(records),
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    }
+
+    // FLOW WARMING EVENTS - read-only debug ендпойнт (виж buildFlowWarmingSummary
+    // по-горе) - диагностична бройка колко често FLOW WARMING реално прекосява
+    // прага си (flowwarmingevent: KV записи, същия гейт като самото известие).
+    // Огледален на /discovery-episodes по-горе - същия TELEMETRY_TOKEN, същия
+    // MAX_KEYS_SCANNED таван, същия fail-closed auth. Чисто READ - никаква
+    // промяна на FLOW WARMING прага/логиката тук.
+    if (path === "/flow-warming-events" && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ALERT_STATE) {
+        return new Response(JSON.stringify({ error: "ALERT_STATE not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const symbolFilter = url.searchParams.get("symbol");
+      const since = url.searchParams.get("since") ? Number(url.searchParams.get("since")) : null;
+      const until = url.searchParams.get("until") ? Number(url.searchParams.get("until")) : null;
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 500);
+      const MAX_KEYS_SCANNED = 2000;
+
+      const prefix = symbolFilter ? `flowwarmingevent:${symbolFilter}:` : "flowwarmingevent:";
+      let allKeys = [];
+      let cursor;
+      do {
+        const listResult = await env.ALERT_STATE.list({ prefix, cursor, limit: 1000 });
+        allKeys.push(...listResult.keys);
+        cursor = listResult.list_complete ? undefined : listResult.cursor;
+      } while (cursor && allKeys.length < MAX_KEYS_SCANNED);
+      const truncated = allKeys.length > MAX_KEYS_SCANNED;
+      allKeys = allKeys.slice(0, MAX_KEYS_SCANNED);
+
+      const records = [];
+      for (const k of allKeys) {
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        if (since != null && rec.at < since) continue;
+        if (until != null && rec.at > until) continue;
+        records.push(rec);
+      }
+      records.sort((a, b) => b.at - a.at); // най-новите първи
+
+      return new Response(JSON.stringify({
+        count: records.length, truncated,
+        records: records.slice(0, limit),
+        summary: buildFlowWarmingSummary(records),
       }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
     }
 
