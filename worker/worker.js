@@ -6730,6 +6730,21 @@ export {
   updateDiscoverySnapshotState, runDiscoveryFullAnalysis,
 };
 
+// Transport mitigation (виж discussion-а "Provider rate-limit root-cause
+// анализ" - football.html Dashboard-ова страна) - Cloudflare Observability
+// потвърди реален cluster от 3 идентични /apisports/fixtures?live=all заявки
+// в рамките на <2s, стигащи до Worker-а (вкл. поне веднъж от трафик, който
+// НЕ носи сигнатурата на Dashboard-а самия - utm_source параметър, който
+// football.html никога не добавя). Worker-ът дотогава нямаше НИКАКЪВ
+// caching/inflight dedup - всяка входяща заявка (от кой да е caller -
+// Dashboard таб, устройство, external hit) тригерваше независим реален
+// upstream fetch. `apisportsLiveAllInflightPromise` е ЕДИНСТВЕНОТО ново
+// module-level състояние - single-flight lock, СКОПиран изключително до
+// /fixtures?live=all branch-а по-долу (виж fetch()). НЕ е доказан root-cause
+// fix - само защитно намалява реалния upstream call rate за near-duplicate
+// заявки в кратък прозорец, независимо от произхода им.
+let apisportsLiveAllInflightPromise = null;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -6798,6 +6813,79 @@ export default {
           headers: { "Content-Type": "application/json" }
         });
       }
+
+      // Transport mitigation (виж коментара при apisportsLiveAllInflightPromise
+      // по-горе) - СТРИКТНО скопирана до /fixtures?live=all, нищо друго под
+      // /apisports/ не минава през тоя клон. Cache identity е canonical
+      // upstream URL (без tracking/други query параметри от входящата
+      // заявка - виж discussion-а "tracking параметри не трябва да създават
+      // отделен cache entry"), не raw incoming request URL.
+      if (apiPath === '/fixtures' && url.searchParams.get('live') === 'all') {
+        const canonicalLiveAllUrl = 'https://v3.football.api-sports.io/fixtures?live=all';
+        const cacheKey = new Request(canonicalLiveAllUrl, { method: 'GET' });
+        const cache = caches.default;
+        const cachedResponse = await cache.match(cacheKey);
+        if (cachedResponse) return cachedResponse;
+
+        if (!apisportsLiveAllInflightPromise) {
+          apisportsLiveAllInflightPromise = (async () => {
+            try {
+              const response = await fetch(canonicalLiveAllUrl, {
+                headers: { "x-apisports-key": env.APISPORTS_KEY }
+              });
+              const data = await response.json();
+              // Огледално на вече доказания detection сигнал в apiFetchAS()
+              // (football.html) - api-sports.io връща HTTP 200 дори при
+              // достигнат лимит, с {"errors":{...}} тяло. Cache-ваме
+              // ИЗКЛЮЧИТЕЛНО успешен отговор (празен errors обект/масив) -
+              // provider грешка (rateLimit или друга) никога не влиза в
+              // cache-а и никога не удължава TTL-а.
+              const hasProviderError = !!(data && data.errors && Object.keys(data.errors).length);
+              // PRE-MERGE корекция (виж discussion-а "transient/anomalous
+              // zero response caching риск") - production наблюдение (6 live
+              // мача -> 0 -> 0 -> 6 отново, без user interaction) доказа, че
+              // upstream МОЖЕ да върне легитимен-изглеждащ `errors:[],
+              // results:0, response:[]` временно, дори докато реално има live
+              // мачове. `results:0` е структурно НЕРАЗЛИЧИМО от "наистина
+              // няма live мачове в момента" - НЯМА надежден начин да се
+              // различат без heuristic/hindsight (сравнение с предишно
+              // известно състояние), което изрично не въвеждаме. Затова: НЕ
+              // кешираме НИКАКВА нула, независимо от причината - единна,
+              // uniform проверка, не "detection" на anomaly. Иначе 1
+              // transient/anomalous нула би се споделяла към ВСИЧКИ caller-и
+              // за 15s (cache-ът е shared между tabove/устройства), вместо да
+              // си остане изолирана за 1 caller, 1 момент, каквото е pre-
+              // mitigation поведението. Legitimate нула (действително няма
+              // live мачове) просто губи cache защитата - всеки caller пак
+              // прави собствена upstream заявка, точно както преди тая цяла
+              // задача - нулева промяна в коректността, само по-малко
+              // защитено от clustering през тия периоди.
+              const hasLiveMatches = Array.isArray(data && data.response) && data.response.length > 0;
+              if (!hasProviderError && hasLiveMatches) {
+                const toCache = new Response(JSON.stringify(data), {
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "max-age=15"
+                  }
+                });
+                await cache.put(cacheKey, toCache);
+              }
+              return data;
+            } finally {
+              apisportsLiveAllInflightPromise = null;
+            }
+          })();
+        }
+        const data = await apisportsLiveAllInflightPromise;
+        return new Response(JSON.stringify(data), {
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*"
+          }
+        });
+      }
+
       const apiUrl = `https://v3.football.api-sports.io${apiPath}${search}`;
       const response = await fetch(apiUrl, {
         headers: {
