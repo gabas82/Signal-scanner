@@ -6841,7 +6841,27 @@ export default {
               // provider грешка (rateLimit или друга) никога не влиза в
               // cache-а и никога не удължава TTL-а.
               const hasProviderError = !!(data && data.errors && Object.keys(data.errors).length);
-              if (!hasProviderError) {
+              // PRE-MERGE корекция (виж discussion-а "transient/anomalous
+              // zero response caching риск") - production наблюдение (6 live
+              // мача -> 0 -> 0 -> 6 отново, без user interaction) доказа, че
+              // upstream МОЖЕ да върне легитимен-изглеждащ `errors:[],
+              // results:0, response:[]` временно, дори докато реално има live
+              // мачове. `results:0` е структурно НЕРАЗЛИЧИМО от "наистина
+              // няма live мачове в момента" - НЯМА надежден начин да се
+              // различат без heuristic/hindsight (сравнение с предишно
+              // известно състояние), което изрично не въвеждаме. Затова: НЕ
+              // кешираме НИКАКВА нула, независимо от причината - единна,
+              // uniform проверка, не "detection" на anomaly. Иначе 1
+              // transient/anomalous нула би се споделяла към ВСИЧКИ caller-и
+              // за 15s (cache-ът е shared между tabove/устройства), вместо да
+              // си остане изолирана за 1 caller, 1 момент, каквото е pre-
+              // mitigation поведението. Legitimate нула (действително няма
+              // live мачове) просто губи cache защитата - всеки caller пак
+              // прави собствена upstream заявка, точно както преди тая цяла
+              // задача - нулева промяна в коректността, само по-малко
+              // защитено от clustering през тия периоди.
+              const hasLiveMatches = Array.isArray(data && data.response) && data.response.length > 0;
+              if (!hasProviderError && hasLiveMatches) {
                 const toCache = new Response(JSON.stringify(data), {
                   headers: {
                     "Content-Type": "application/json",

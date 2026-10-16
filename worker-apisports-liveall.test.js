@@ -69,7 +69,7 @@ describe('worker.js /apisports/fixtures?live=all - transport mitigation (cache +
   });
 
   it('B) втора live=all заявка в рамките на TTL -> 0 допълнителен upstream fetch', async () => {
-    const fetchMock = vi.fn(() => okFetchResponse({ errors: [], results: 2 }));
+    const fetchMock = vi.fn(() => okFetchResponse({ errors: [], results: 2, response: [{ fixture: { id: 2 } }] }));
     vi.stubGlobal('fetch', fetchMock);
     await worker.fetch(new Request(BASE + '/apisports/fixtures?live=all'), makeEnv());
     fetchMock.mockClear();
@@ -80,7 +80,7 @@ describe('worker.js /apisports/fixtures?live=all - transport mitigation (cache +
   });
 
   it('C) tracking параметри (utm_source) не създават отделен cache entry', async () => {
-    const fetchMock = vi.fn(() => okFetchResponse({ errors: [], results: 3 }));
+    const fetchMock = vi.fn(() => okFetchResponse({ errors: [], results: 3, response: [{ fixture: { id: 3 } }] }));
     vi.stubGlobal('fetch', fetchMock);
     await worker.fetch(new Request(BASE + '/apisports/fixtures?live=all'), makeEnv());
     fetchMock.mockClear();
@@ -93,9 +93,10 @@ describe('worker.js /apisports/fixtures?live=all - transport mitigation (cache +
 
   it('D) след изтичане на 15s TTL -> нов upstream fetch', async () => {
     vi.useFakeTimers();
-    const fetchMock = vi.fn(() => okFetchResponse({ errors: [], results: 4 }));
+    const fetchMock = vi.fn(() => okFetchResponse({ errors: [], results: 4, response: [{ fixture: { id: 4 } }] }));
     vi.stubGlobal('fetch', fetchMock);
     await worker.fetch(new Request(BASE + '/apisports/fixtures?live=all'), makeEnv());
+    expect(mockCache.size()).toBe(1); // потвърждава, че наистина е cache-нато (response.length>0)
     fetchMock.mockClear();
     vi.advanceTimersByTime(15 * 1000 + 1000);
     const res2 = await worker.fetch(new Request(BASE + '/apisports/fixtures?live=all'), makeEnv());
@@ -182,5 +183,36 @@ describe('worker.js /apisports/fixtures?live=all - transport mitigation (cache +
     const res = await worker.fetch(new Request(BASE + '/tv-alert'), { TV_ALERT_TOKEN: 'secret' });
     expect(res.status).toBe(401); // липсващ token - непроменено поведение
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // PRE-MERGE корекция (виж discussion-а "transient/anomalous zero response
+  // caching риск", production наблюдение: 6 live мача -> 0 -> 0 -> 6 отново,
+  // БЕЗ user interaction). `results:0` е структурно неразличимо от "наистина
+  // няма live мачове" - затова НИКАКВА нула не се кешира, uniform, без
+  // heuristic/сравнение с предишно състояние.
+  it('K) errors:[], results:0, response:[] -> response се връща нормално на caller-а, cache остава празен', async () => {
+    const fetchMock = vi.fn(() => okFetchResponse({ errors: [], results: 0, response: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const res = await worker.fetch(new Request(BASE + '/apisports/fixtures?live=all'), makeEnv());
+    const data = await res.json();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(data.results).toBe(0);
+    expect(data.response).toEqual([]);
+    expect(mockCache.size()).toBe(0); // НЕ cache-нато
+  });
+
+  it('L) след zero response следваща заявка пак отива upstream (не се сервира stale нула)', async () => {
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => okFetchResponse({ errors: [], results: 0, response: [] }))
+      .mockImplementationOnce(() => okFetchResponse({ errors: [], results: 6, response: [1, 2, 3, 4, 5, 6].map(id => ({ fixture: { id } })) }));
+    vi.stubGlobal('fetch', fetchMock);
+    const res1 = await worker.fetch(new Request(BASE + '/apisports/fixtures?live=all'), makeEnv());
+    const data1 = await res1.json();
+    expect(data1.results).toBe(0);
+    const res2 = await worker.fetch(new Request(BASE + '/apisports/fixtures?live=all'), makeEnv());
+    const data2 = await res2.json();
+    expect(fetchMock).toHaveBeenCalledTimes(2); // вторият пак е реален upstream fetch, не cache hit
+    expect(data2.results).toBe(6);
+    expect(mockCache.size()).toBe(1); // сега вече кешираме, защото response.length>0
   });
 });
