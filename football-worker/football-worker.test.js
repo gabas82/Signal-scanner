@@ -254,6 +254,152 @@ describe('football-worker/worker.js - CORS', () => {
   });
 });
 
+// Diagnostic logging (репеир план basis - виж discussion-а "root-cause trace -
+// API-Sports/football-data.org rate limit"). Тества: (1) правилните полета се
+// логват за [FD-WORKER-DIAG]/[AS-WORKER-DIAG] в success/provider-error
+// сценарии; (2) explicit 4-header allowlist се чете коректно, когато е
+// налично в upstream response-а; (3) SECURITY BOUNDARY - нито env secret
+// стойностите (FOOTBALL_DATA_TOKEN/APISPORTS_KEY), нито request headers
+// (X-Auth-Token/x-apisports-key имена), нито blanket headers dump се появяват
+// в кой да е console.log извикан от worker-а; (4) response contract-ът
+// (status/body/headers към caller-а) остава byte-for-byte същия с/без
+// diagnostic logging-а активен.
+describe('football-worker/worker.js - diagnostic logging (repair plan basis)', () => {
+  let logSpy;
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  it('[FD-WORKER-DIAG] - успешен отговор логва upstreamStatus/hasMatchesArray/matchesCount коректно', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => okFetchResponse({ matches: [{ id: 1 }, { id: 2 }] })));
+    await worker.fetch(new Request(BASE + '/football/matches?date=2026-10-18'), makeMinimalEnv());
+    const call = logSpy.mock.calls.find(c => c[0] === '[FD-WORKER-DIAG]');
+    expect(call).toBeTruthy();
+    const logged = call[1];
+    expect(logged.path).toBe('/matches?date=2026-10-18');
+    expect(logged.upstreamStatus).toBe(200);
+    expect(logged.providerMessage).toBeNull();
+    expect(logged.providerErrorCode).toBeNull();
+    expect(logged.hasMatchesArray).toBe(true);
+    expect(logged.matchesCount).toBe(2);
+  });
+
+  it('[FD-WORKER-DIAG] - provider error body (message+errorCode) се логва коректно, hasMatchesArray=false', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => okFetchResponse({ message: 'You reached your request limit.', errorCode: 429 })));
+    await worker.fetch(new Request(BASE + '/football/matches'), makeMinimalEnv());
+    const logged = logSpy.mock.calls.find(c => c[0] === '[FD-WORKER-DIAG]')[1];
+    expect(logged.providerMessage).toBe('You reached your request limit.');
+    expect(logged.providerErrorCode).toBe(429);
+    expect(logged.hasMatchesArray).toBe(false);
+    expect(logged.matchesCount).toBeNull();
+  });
+
+  it('[AS-WORKER-DIAG] (generic branch) - успешен отговор логва hasProviderErrors=false, providerErrors от body', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => okFetchResponse({ errors: [], results: 1, response: [{ fixture: { id: 1 } }] })));
+    await worker.fetch(new Request(BASE + '/apisports/fixtures?league=172&season=2026&date=2026-10-18'), makeMinimalEnv());
+    const logged = logSpy.mock.calls.find(c => c[0] === '[AS-WORKER-DIAG]')[1];
+    expect(logged.path).toBe('/fixtures?league=172&season=2026&date=2026-10-18');
+    expect(logged.upstreamStatus).toBe(200);
+    expect(logged.hasProviderErrors).toBe(false);
+  });
+
+  it('[AS-WORKER-DIAG] (generic branch) - provider rateLimit error + explicit 4-header allowlist се четат коректно', async () => {
+    const upstreamHeaders = new Headers({
+      'x-ratelimit-requests-limit': '7500',
+      'x-ratelimit-requests-remaining': '0',
+    });
+    vi.stubGlobal('fetch', vi.fn(() => new Response(
+      JSON.stringify({ errors: { rateLimit: 'Too many requests. You have reached your daily request limit.' }, results: 0, response: [] }),
+      { status: 200, headers: upstreamHeaders }
+    )));
+    await worker.fetch(new Request(BASE + '/apisports/fixtures?league=203&season=2026&date=2026-10-18'), makeMinimalEnv());
+    const logged = logSpy.mock.calls.find(c => c[0] === '[AS-WORKER-DIAG]')[1];
+    expect(logged.hasProviderErrors).toBe(true);
+    expect(logged.providerErrors.rateLimit).toContain('daily request limit');
+    expect(logged.rateLimitRequestsLimit).toBe('7500');
+    expect(logged.rateLimitRequestsRemaining).toBe('0');
+    expect(logged.rateLimitLimit).toBeNull(); // различно header-name - не е подадено в тоя мок
+    expect(logged.rateLimitRemaining).toBeNull();
+  });
+
+  it('[AS-WORKER-DIAG] (generic branch) - case-insensitive header lookup потвърден (различна casing в upstream отговора)', async () => {
+    const upstreamHeaders = new Headers({ 'X-RateLimit-Limit': '300', 'X-RateLimit-Remaining': '5' });
+    vi.stubGlobal('fetch', vi.fn(() => new Response(JSON.stringify({ response: [] }), { status: 200, headers: upstreamHeaders })));
+    await worker.fetch(new Request(BASE + '/apisports/standings?league=172&season=2026'), makeMinimalEnv());
+    const logged = logSpy.mock.calls.find(c => c[0] === '[AS-WORKER-DIAG]')[1];
+    expect(logged.rateLimitLimit).toBe('300');
+    expect(logged.rateLimitRemaining).toBe('5');
+  });
+
+  it('[AS-WORKER-DIAG] (live=all branch) - логва се отделно от cache/single-flight логиката, с правилните полета', async () => {
+    const upstreamHeaders = new Headers({ 'x-ratelimit-requests-limit': '7500', 'x-ratelimit-requests-remaining': '7499' });
+    vi.stubGlobal('fetch', vi.fn(() => new Response(
+      JSON.stringify({ errors: [], results: 1, response: [{ fixture: { id: 1 } }] }),
+      { status: 200, headers: upstreamHeaders }
+    )));
+    await worker.fetch(new Request(BASE + '/apisports/fixtures?live=all'), makeMinimalEnv());
+    const logged = logSpy.mock.calls.find(c => c[0] === '[AS-WORKER-DIAG]')[1];
+    expect(logged.path).toBe('/fixtures?live=all');
+    expect(logged.hasProviderErrors).toBe(false);
+    expect(logged.rateLimitRequestsLimit).toBe('7500');
+    expect(logged.rateLimitRequestsRemaining).toBe('7499');
+  });
+
+  it('SECURITY BOUNDARY - никой console.log извикан от worker-а не съдържа секретните стойности (FOOTBALL_DATA_TOKEN/APISPORTS_KEY)', async () => {
+    vi.stubGlobal('fetch', vi.fn((url, init) => okFetchResponse({ matches: [], response: [] })));
+    await worker.fetch(new Request(BASE + '/football/matches'), makeMinimalEnv());
+    await worker.fetch(new Request(BASE + '/apisports/fixtures?league=172&season=2026'), makeMinimalEnv());
+    const serialized = JSON.stringify(logSpy.mock.calls);
+    expect(serialized).not.toContain('test-fd-token');
+    expect(serialized).not.toContain('test-as-key');
+  });
+
+  it('SECURITY BOUNDARY - никой console.log не съдържа request header имена (X-Auth-Token/x-apisports-key) нито request обекта самия', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => okFetchResponse({ matches: [], response: [] })));
+    await worker.fetch(new Request(BASE + '/football/matches'), makeMinimalEnv());
+    await worker.fetch(new Request(BASE + '/apisports/fixtures?league=172&season=2026'), makeMinimalEnv());
+    const serialized = JSON.stringify(logSpy.mock.calls);
+    expect(serialized).not.toContain('X-Auth-Token');
+    expect(serialized).not.toContain('x-apisports-key');
+  });
+
+  it('SECURITY BOUNDARY - нулев blanket headers dump (логнатите обекти имат точно документираните полета, не произволен headers обект)', async () => {
+    const upstreamHeaders = new Headers({ 'x-ratelimit-requests-limit': '7500', 'some-other-upstream-header': 'irrelevant-value' });
+    vi.stubGlobal('fetch', vi.fn(() => new Response(JSON.stringify({ response: [] }), { status: 200, headers: upstreamHeaders })));
+    await worker.fetch(new Request(BASE + '/apisports/standings?league=172&season=2026'), makeMinimalEnv());
+    const logged = logSpy.mock.calls.find(c => c[0] === '[AS-WORKER-DIAG]')[1];
+    const keys = Object.keys(logged).sort();
+    expect(keys).toEqual(['hasProviderErrors', 'path', 'providerErrors', 'rateLimitLimit', 'rateLimitRemaining', 'rateLimitRequestsLimit', 'rateLimitRequestsRemaining', 'upstreamStatus'].sort());
+    const serialized = JSON.stringify(logSpy.mock.calls);
+    expect(serialized).not.toContain('irrelevant-value'); // non-allowlisted header никога не достига до log-а
+  });
+
+  it('RESPONSE CONTRACT - diagnostic logging-ът НЕ променя body/status/headers на връщания Response (/football/)', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => okFetchResponse({ matches: [{ id: 42 }] })));
+    const res = await worker.fetch(new Request(BASE + '/football/matches'), makeMinimalEnv());
+    const data = await res.json();
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toBe('application/json');
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(data).toEqual({ matches: [{ id: 42 }] });
+    expect(logSpy.mock.calls.some(c => c[0] === '[FD-WORKER-DIAG]')).toBe(true); // логването Е станало
+  });
+
+  it('RESPONSE CONTRACT - diagnostic logging-ът НЕ променя body/status/headers на връщания Response (/apisports/)', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => okFetchResponse({ errors: [], results: 1, response: [{ fixture: { id: 7 } }] })));
+    const res = await worker.fetch(new Request(BASE + '/apisports/fixtures?league=172&season=2026'), makeMinimalEnv());
+    const data = await res.json();
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toBe('application/json');
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(data.response[0].fixture.id).toBe(7);
+    expect(logSpy.mock.calls.some(c => c[0] === '[AS-WORKER-DIAG]')).toBe(true);
+  });
+});
+
 describe('football-worker/worker.js - непознат root route', () => {
   it('path извън /football/ и /apisports/ -> 404 Not found, нулев upstream fetch', async () => {
     const fetchMock = vi.fn();

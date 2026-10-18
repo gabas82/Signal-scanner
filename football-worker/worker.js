@@ -73,6 +73,20 @@ export default {
         }
       });
       const data = await response.json();
+      // Diagnostic basis за repair plan-а (виж discussion-а "root-cause trace -
+      // API-Sports/football-data.org rate limit") - ЧИСТО observability, нулева
+      // промяна в самия response contract по-долу. Логва се САМО upstream
+      // status + малки, безопасни structural/error полета от response BODY-то
+      // (никога request headers, никога env/secret стойности - env.FOOTBALL_DATA_TOKEN
+      // никъде не се чете тук).
+      console.log('[FD-WORKER-DIAG]', {
+        path: footballPath + search,
+        upstreamStatus: response.status,
+        providerMessage: typeof data?.message === 'string' ? data.message : null,
+        providerErrorCode: typeof data?.errorCode === 'number' ? data.errorCode : null,
+        hasMatchesArray: Array.isArray(data?.matches),
+        matchesCount: Array.isArray(data?.matches) ? data.matches.length : null
+      });
       return new Response(JSON.stringify(data), {
         headers: {
           "Content-Type": "application/json",
@@ -139,6 +153,21 @@ export default {
               // задача - нулева промяна в коректността, само по-малко
               // защитено от clustering през тия периоди.
               const hasLiveMatches = Array.isArray(data && data.response) && data.response.length > 0;
+              // Diagnostic basis (виж коментара при [FD-WORKER-DIAG] по-горе) -
+              // explicit 4-header allowlist (НЕ blanket headers dump), никога
+              // request headers/env/secret стойности. Headers.get() е
+              // case-insensitive по спецификация - достатъчен е 1 lookup на
+              // name-variant, не дублиран само за casing.
+              console.log('[AS-WORKER-DIAG]', {
+                path: '/fixtures?live=all',
+                upstreamStatus: response.status,
+                hasProviderErrors: hasProviderError,
+                providerErrors: data?.errors,
+                rateLimitRequestsLimit: response.headers.get('x-ratelimit-requests-limit'),
+                rateLimitRequestsRemaining: response.headers.get('x-ratelimit-requests-remaining'),
+                rateLimitLimit: response.headers.get('x-ratelimit-limit'),
+                rateLimitRemaining: response.headers.get('x-ratelimit-remaining')
+              });
               if (!hasProviderError && hasLiveMatches) {
                 const toCache = new Response(JSON.stringify(data), {
                   headers: {
@@ -171,6 +200,18 @@ export default {
         }
       });
       const data = await response.json();
+      // Diagnostic basis (виж коментара при [FD-WORKER-DIAG] по-горе) - огледален
+      // на /fixtures?live=all branch-а, същия allowlist/safety contract.
+      console.log('[AS-WORKER-DIAG]', {
+        path: apiPath + search,
+        upstreamStatus: response.status,
+        hasProviderErrors: !!(data && data.errors && Object.keys(data.errors).length),
+        providerErrors: data?.errors,
+        rateLimitRequestsLimit: response.headers.get('x-ratelimit-requests-limit'),
+        rateLimitRequestsRemaining: response.headers.get('x-ratelimit-requests-remaining'),
+        rateLimitLimit: response.headers.get('x-ratelimit-limit'),
+        rateLimitRemaining: response.headers.get('x-ratelimit-remaining')
+      });
       return new Response(JSON.stringify(data), {
         headers: {
           "Content-Type": "application/json",
