@@ -3312,18 +3312,37 @@ function buildTcMissingEpisodeIds(setupCreatedRecords, armedCreatedRecords) {
   return missing;
 }
 
-// COHORT COMPLETENESS (PR #141 review fix) - 0-100% conversion не означава
-// автоматично статистически валиден denominator. Ако lifecycle (SETUP/
-// ARMED) или entry evaluation сканирането е truncated, SETUP-и/ARMED
-// episode-и извън скенирания прозорец НЕ могат да бъдат разграничени от
-// такива, които реално никога не са прогресирали - conversionMetrics в тоя
-// случай отразява САМО текущо сканираната кохорта, не цялата история.
-// Никога не реконструира/гадае отвъд наблюдаваното (insufficient_data
-// правило) - само обозначава кога денoминаторът е частичен.
-function buildTcCohortStatus(lifecycleTruncated, telemetryTruncated, setupCreatedRecords, armedCreatedRecords) {
-  if (lifecycleTruncated || telemetryTruncated) return 'partial_truncated_scan_window';
-  if (!setupCreatedRecords.length && !armedCreatedRecords.length) return 'insufficient_data';
-  return 'complete_within_scanned_window';
+// COHORT COMPLETENESS (PR #141 review fix, допълнена по втория review pass
+// - FINAL REVIEW CORRECTION) - 0-100% conversion не означава автоматично
+// статистически валиден denominator, И ПО-ВАЖНО: "KV сканирането е
+// завършено" (list_complete:true) НЕ означава автоматично, че SETUP ->
+// ARMED -> ENTRY връзките са действително проследими. Двете са РАЗЛИЧНИ
+// понятия:
+//
+// SCAN COMPLETENESS - дали KV .list() е изчерпал всички страници
+// (!lifecycleTruncated && !telemetryTruncated). KV може напълно честно да
+// докладва "прочетох всичко, което съществува под тоя prefix в момента" и
+// въпреки това SETUP записът на даден ARMED episode да е изтекъл/изтрит от
+// retention политика по-рано (KV без TTL проблем тук, но структурно
+// възможно при бъдещи промени) - сканирането е "пълно", но lineage-ът НЕ е.
+//
+// LINEAGE COMPLETENESS - дали SETUP -> ARMED -> ENTRY връзките, видими В
+// ТЕКУЩО сканираните записи, се затварят коректно - 0 missingEpisodeIds, 0
+// unmatchedEvaluationCount, 0 nullEpisodeIdCount. Ако някое от тях е >0,
+// cohortStatus НЕ бива да твърди "complete", дори при scanComplete:true.
+//
+// Връща {status, scanComplete, lineageComplete} - status е удобен единичен
+// consumer-facing флаг, но scanComplete/lineageComplete по-долу остават
+// явно разграничени (никога не се сливат в едно булево).
+function buildTcCohortStatus({ scanTruncated, setupCreatedRecords, armedCreatedRecords, missingEpisodeIds, unmatchedEvaluationCount, nullEpisodeIdCount }) {
+  const scanComplete = !scanTruncated;
+  const lineageComplete = missingEpisodeIds.length === 0 && unmatchedEvaluationCount === 0 && nullEpisodeIdCount === 0;
+  let status;
+  if (!scanComplete) status = 'partial_truncated_scan_window';
+  else if (!setupCreatedRecords.length && !armedCreatedRecords.length) status = 'insufficient_data';
+  else if (!lineageComplete) status = 'scan_complete_lineage_incomplete';
+  else status = 'complete_within_scanned_window';
+  return { status, scanComplete, lineageComplete };
 }
 
 // KV PAGINATED LIST С ЧЕСТНА TRUNCATION ПРОВЕРКА (PR #141 review fix -
@@ -3435,6 +3454,17 @@ const TC_LIFECYCLE_AGGREGATION_POPULATION = {
 function buildTcIntegrityDiagnostics(lifecycleRecords, tcEntryRecords, lifecycleTruncated, telemetryTruncated) {
   const setupCreatedRecords = lifecycleRecords.filter((r) => r.kind === 'setup_created');
   const armedCreatedRecords = lifecycleRecords.filter((r) => r.kind === 'armed_created');
+  // Смятани ЕДИН път тук, после реюзвани И от buildTcCohortStatus, И от
+  // върнатия обект по-долу - избягва разминаване между "какво решава
+  // cohortStatus" и "какво вижда consumer-ът" (FINAL REVIEW CORRECTION).
+  const nullEpisodeIdCount = tcEntryRecords.filter((r) => r.episodeId == null).length;
+  const missingEpisodeIds = buildTcMissingEpisodeIds(setupCreatedRecords, armedCreatedRecords);
+  const unmatchedEvaluationCount = countUnmatchedEvaluations(armedCreatedRecords, tcEntryRecords);
+  const cohort = buildTcCohortStatus({
+    scanTruncated: !!lifecycleTruncated || !!telemetryTruncated,
+    setupCreatedRecords, armedCreatedRecords,
+    missingEpisodeIds, unmatchedEvaluationCount, nullEpisodeIdCount,
+  });
   return {
     recordsReturned: lifecycleRecords.length,
     // KV .list() не дава надежден общ брой отвъд вече сканираното - не се
@@ -3445,14 +3475,18 @@ function buildTcIntegrityDiagnostics(lifecycleRecords, tcEntryRecords, lifecycle
     // conversionMetrics по-долу остава ВЯРНО смятан дори при truncation
     // (composite keys, не inflated event ratio), но денoминаторът може да е
     // частичен - cohortStatus прави това явно, вместо да подвежда consumer-а
-    // да приема partial window като "цялата история".
-    cohortStatus: buildTcCohortStatus(lifecycleTruncated, telemetryTruncated, setupCreatedRecords, armedCreatedRecords),
+    // да приема partial window като "цялата история". cohortScanComplete/
+    // cohortLineageComplete стоят РАЗГРАНИЧЕНИ (FINAL REVIEW CORRECTION) -
+    // scan завършен ≠ lineage проследим.
+    cohortStatus: cohort.status,
+    cohortScanComplete: cohort.scanComplete,
+    cohortLineageComplete: cohort.lineageComplete,
     ...buildCoverageRange(lifecycleRecords),
-    nullEpisodeIdCount: tcEntryRecords.filter((r) => r.episodeId == null).length,
-    missingEpisodeIds: buildTcMissingEpisodeIds(setupCreatedRecords, armedCreatedRecords),
+    nullEpisodeIdCount,
+    missingEpisodeIds,
     duplicateEventCount: countPossibleDuplicateEvents(lifecycleRecords),
     missingLatencyCount: countMissingLatency(tcEntryRecords),
-    unmatchedEvaluationCount: countUnmatchedEvaluations(armedCreatedRecords, tcEntryRecords),
+    unmatchedEvaluationCount,
     aggregationPopulation: TC_LIFECYCLE_AGGREGATION_POPULATION,
     conversionMetrics: buildTcConversionMetrics(setupCreatedRecords, armedCreatedRecords, tcEntryRecords),
   };

@@ -297,19 +297,72 @@ describe('PR #141 review fix - buildTcMissingEpisodeIds() (lineage gap detection
   });
 });
 
+// FINAL REVIEW CORRECTION - buildTcCohortStatus() вече приема ЕДИН options
+// обект и връща {status, scanComplete, lineageComplete} (не само string) -
+// SCAN completeness (KV list_complete) и LINEAGE completeness (SETUP->
+// ARMED->ENTRY връзките действително проследими) са ЯВНО разграничени,
+// никога слети в едно булево.
+function cohortArgs(overrides = {}) {
+  return {
+    scanTruncated: false, setupCreatedRecords: [], armedCreatedRecords: [],
+    missingEpisodeIds: [], unmatchedEvaluationCount: 0, nullEpisodeIdCount: 0,
+    ...overrides,
+  };
+}
+
 describe('PR #141 review fix 4 - INCOMPLETE COHORT WARNINGS (buildTcCohortStatus)', () => {
-  it('нито lifecycle, нито telemetry truncated, с данни -> complete_within_scanned_window', () => {
+  it('scan complete + lineage complete + с данни -> complete_within_scanned_window', () => {
     const setupCreated = [lifecycleRecord({ kind: 'setup_created', at: 1000 })];
-    expect(buildTcCohortStatus(false, false, setupCreated, [])).toBe('complete_within_scanned_window');
+    const r = buildTcCohortStatus(cohortArgs({ setupCreatedRecords: setupCreated }));
+    expect(r.status).toBe('complete_within_scanned_window');
+    expect(r.scanComplete).toBe(true);
+    expect(r.lineageComplete).toBe(true);
   });
-  it('lifecycle truncated -> partial_truncated_scan_window (независимо от telemetry)', () => {
-    expect(buildTcCohortStatus(true, false, [], [])).toBe('partial_truncated_scan_window');
+
+  it('scan truncated -> partial_truncated_scan_window, scanComplete:false', () => {
+    const r = buildTcCohortStatus(cohortArgs({ scanTruncated: true }));
+    expect(r.status).toBe('partial_truncated_scan_window');
+    expect(r.scanComplete).toBe(false);
   });
-  it('telemetry truncated -> partial_truncated_scan_window', () => {
-    expect(buildTcCohortStatus(false, true, [], [])).toBe('partial_truncated_scan_window');
+
+  it('scan complete, без никакви SETUP/ARMED записи -> insufficient_data', () => {
+    const r = buildTcCohortStatus(cohortArgs());
+    expect(r.status).toBe('insufficient_data');
   });
-  it('без truncation, но без никакви SETUP/ARMED записи -> insufficient_data', () => {
-    expect(buildTcCohortStatus(false, false, [], [])).toBe('insufficient_data');
+
+  // FINAL REVIEW CORRECTION - точно сценарият от review-то: KV сканирането е
+  // ЗАВЪРШЕНО (scanTruncated:false), ИМА валидни SETUP/ARMED записи, но
+  // lineage-ът е нарушен (missingEpisodeIds непразен) -> status трябва да
+  // отрази LINEAGE проблема, не "complete", само защото скенирането приключи.
+  it('scan complete, НО lineage incomplete (missingEpisodeIds непразен) -> scan_complete_lineage_incomplete, НЕ complete', () => {
+    const setupCreated = [lifecycleRecord({ kind: 'setup_created', at: 1000 })];
+    const r = buildTcCohortStatus(cohortArgs({
+      setupCreatedRecords: setupCreated,
+      missingEpisodeIds: ['BTCUSDT_trend_continuation_long_5000'],
+    }));
+    expect(r.status).toBe('scan_complete_lineage_incomplete');
+    expect(r.scanComplete).toBe(true);
+    expect(r.lineageComplete).toBe(false);
+  });
+
+  it('scan complete, НО unmatchedEvaluationCount > 0 -> lineage incomplete', () => {
+    const setupCreated = [lifecycleRecord({ kind: 'setup_created', at: 1000 })];
+    const r = buildTcCohortStatus(cohortArgs({ setupCreatedRecords: setupCreated, unmatchedEvaluationCount: 2 }));
+    expect(r.status).toBe('scan_complete_lineage_incomplete');
+    expect(r.lineageComplete).toBe(false);
+  });
+
+  it('scan complete, НО nullEpisodeIdCount > 0 -> lineage incomplete', () => {
+    const setupCreated = [lifecycleRecord({ kind: 'setup_created', at: 1000 })];
+    const r = buildTcCohortStatus(cohortArgs({ setupCreatedRecords: setupCreated, nullEpisodeIdCount: 3 }));
+    expect(r.status).toBe('scan_complete_lineage_incomplete');
+    expect(r.lineageComplete).toBe(false);
+  });
+
+  it('scan truncated НАДВИШАВА lineage проблема в status-а (partial_truncated_scan_window, не scan_complete_lineage_incomplete)', () => {
+    const r = buildTcCohortStatus(cohortArgs({ scanTruncated: true, missingEpisodeIds: ['x'] }));
+    expect(r.status).toBe('partial_truncated_scan_window');
+    expect(r.lineageComplete).toBe(false); // все пак вярно отразено, дори не е primary статус
   });
 });
 
@@ -325,6 +378,8 @@ describe('buildTcIntegrityDiagnostics() - композитен отговор', 
     expect(d.recordsAvailable).toBeNull(); // insufficient_data - никога не се измисля
     expect(d.isTruncated).toEqual({ lifecycle: false, entryEvaluation: false });
     expect(d.cohortStatus).toBe('complete_within_scanned_window');
+    expect(d.cohortScanComplete).toBe(true);
+    expect(d.cohortLineageComplete).toBe(true);
     expect(d.coverageStart).toBe(1000);
     expect(d.coverageEnd).toBe(1100);
     expect(d.missingEpisodeIds).toEqual([]);
@@ -339,6 +394,34 @@ describe('buildTcIntegrityDiagnostics() - композитен отговор', 
     const lifecycle = [lifecycleRecord({ kind: 'setup_created', at: 1000 })];
     const d = buildTcIntegrityDiagnostics(lifecycle, [], true, false);
     expect(d.cohortStatus).toBe('partial_truncated_scan_window');
+    expect(d.cohortScanComplete).toBe(false);
+  });
+
+  // FINAL REVIEW CORRECTION - точно регресионния случай, изискан в review-то:
+  // "KV scan е завършен. Има валиден SETUP. Има ARMED от друг SETUP, който
+  // липсва в прочетените записи. Очакване: Scan complete, но lineage
+  // incomplete." Изграден на ниво ПЪЛЕН buildTcIntegrityDiagnostics() отговор
+  // (не само изолираната buildTcCohortStatus()), за да покрие реалния
+  // composite wiring (missingEpisodeIds -> cohortStatus).
+  it('scan complete + валиден SETUP + ARMED от ДРУГ, липсващ SETUP -> scan complete, lineage incomplete', () => {
+    const lifecycle = [
+      // Валиден, напълно проследим episode: BTCUSDT SETUP@1000 -> ARMED@1100.
+      lifecycleRecord({ kind: 'setup_created', symbol: 'BTCUSDT', direction: 'long', at: 1000 }),
+      lifecycleRecord({ kind: 'armed_created', symbol: 'BTCUSDT', direction: 'long', at: 1100, setupAt: 1000 }),
+      // ARMED от ДРУГ SETUP (setupAt: 5000), чийто setup_created запис липсва
+      // от текущо сканираните lifecycle записи (напр. retention/pagination
+      // граница) - lineage gap, въпреки че KV сканирането самò по себе си е
+      // напълно завършено (lifecycleTruncated/telemetryTruncated = false по-долу).
+      lifecycleRecord({ kind: 'armed_created', symbol: 'ETHUSDT', direction: 'long', at: 5100, setupAt: 5000 }),
+    ];
+    const entries = [tcEntryRecord({ symbol: 'BTCUSDT', armedAt: 1100, setupAt: 1000, decision: 'confirmed' })];
+
+    const d = buildTcIntegrityDiagnostics(lifecycle, entries, /* lifecycleTruncated */ false, /* telemetryTruncated */ false);
+
+    expect(d.cohortScanComplete).toBe(true); // KV сканирането самò по себе си Е завършено
+    expect(d.missingEpisodeIds).toEqual(['ETHUSDT_trend_continuation_long_5000']); // lineage gap-ът е видим
+    expect(d.cohortLineageComplete).toBe(false); // ... и затова lineage НЕ е пълен
+    expect(d.cohortStatus).toBe('scan_complete_lineage_incomplete'); // НЕ "complete_within_scanned_window"
   });
 });
 
@@ -369,14 +452,22 @@ describe('buildTcLifecycleSummary() - schema compatibility (старите по�
   });
 });
 
-// PR #141 review fix 3 - TRUNCATION DETECTION. Mock KV, контролиращ точно
-// list_complete/cursor поведението, за да покрие 4-те гранични случая,
-// изискани в review-то.
+// PR #141 review fix 3 - TRUNCATION DETECTION, PR #141 FINAL REVIEW
+// CORRECTION - реалистични KV страници. Mock KV, който ХВЪРЛЯ ако поискана
+// страница съдържа повече ключове от production `limit` (1000) -
+// гарантира, че фикстурите отразяват истинското Cloudflare KV .list()
+// поведение (никога повече от `limit` ключа на страница), не произволно
+// голяма единична "страница" от 1999/2000/2500 ключа наведнъж (каквото
+// реално KV никога не би върнало за limit:1000 заявка).
 function makeMockKv(pages) {
   let call = 0;
   return {
-    list: async () => {
+    callCount: () => call,
+    list: async ({ limit }) => {
       const page = pages[Math.min(call, pages.length - 1)];
+      if (page.keys.length > limit) {
+        throw new Error(`mock KV page violates realistic limit: ${page.keys.length} > ${limit}`);
+      }
       call++;
       return page;
     },
@@ -386,36 +477,59 @@ function makeKeys(n, offset = 0) {
   return Array.from({ length: n }, (_, i) => ({ name: `k${offset + i}` }));
 }
 
-describe('listKvKeysWithTruncation() - честна truncation проверка (PR #141 review fix 3)', () => {
-  it('1999 keys, list_complete:true -> truncated:false (пълен dataset, под лимита)', async () => {
-    const kv = makeMockKv([{ keys: makeKeys(1999), list_complete: true, cursor: undefined }]);
+describe('listKvKeysWithTruncation() - честна truncation проверка (PR #141 review fix 3, реалистични ≤1000-key страници)', () => {
+  it('1999 keys през 2 реалистични страници (1000+999), list_complete:true на последната -> truncated:false', async () => {
+    const kv = makeMockKv([
+      { keys: makeKeys(1000), list_complete: false, cursor: 'page2' },
+      { keys: makeKeys(999, 1000), list_complete: true, cursor: undefined },
+    ]);
     const { keys, truncated } = await listKvKeysWithTruncation(kv, 'prefix:', 2000);
     expect(keys.length).toBe(1999);
     expect(truncated).toBe(false);
   });
 
-  it('точно 2000 keys, list_complete:true -> truncated:false (пълен dataset, точно на лимита)', async () => {
-    const kv = makeMockKv([{ keys: makeKeys(2000), list_complete: true, cursor: undefined }]);
+  it('точно 2000 keys през 2 реалистични страници (1000+1000), list_complete:true на последната -> truncated:false (пълен dataset, точно на лимита)', async () => {
+    const kv = makeMockKv([
+      { keys: makeKeys(1000), list_complete: false, cursor: 'page2' },
+      { keys: makeKeys(1000, 1000), list_complete: true, cursor: undefined },
+    ]);
     const { keys, truncated } = await listKvKeysWithTruncation(kv, 'prefix:', 2000);
     expect(keys.length).toBe(2000);
     expect(truncated).toBe(false);
   });
 
-  it('точно 2000 keys, НО list_complete:false (още страници чакат) -> truncated:true (БЕШЕ false преди фикса - именно бъгът от review-то)', async () => {
-    const kv = makeMockKv([{ keys: makeKeys(2000), list_complete: false, cursor: 'more' }]);
+  it('точно 2000 keys през 2 реалистични страници (1000+1000), НО list_complete:false на последната (още страници чакат) -> truncated:true (БЕШЕ false преди фикса - именно бъгът от review-то)', async () => {
+    const kv = makeMockKv([
+      { keys: makeKeys(1000), list_complete: false, cursor: 'page2' },
+      { keys: makeKeys(1000, 1000), list_complete: false, cursor: 'page3' },
+    ]);
     const { keys, truncated } = await listKvKeysWithTruncation(kv, 'prefix:', 2000);
     expect(keys.length).toBe(2000);
     expect(truncated).toBe(true);
   });
 
-  it('повече от 2000 keys (2 страници от 1000+1500) -> truncated:true, keys slice-нати до 2000', async () => {
+  it('данни отвъд лимита - 3-тата реалистична страница НИКОГА не се извлича заради MAX_KEYS_SCANNED таванa -> truncated:true, keys капнати до 2000, само 2 заявки направени', async () => {
     const kv = makeMockKv([
       { keys: makeKeys(1000), list_complete: false, cursor: 'page2' },
-      { keys: makeKeys(1500, 1000), list_complete: false, cursor: 'page3' },
+      { keys: makeKeys(1000, 1000), list_complete: false, cursor: 'page3' },
+      { keys: makeKeys(500, 2000), list_complete: true, cursor: undefined }, // НИКОГА не се достига
     ]);
     const { keys, truncated } = await listKvKeysWithTruncation(kv, 'prefix:', 2000);
     expect(keys.length).toBe(2000); // капнато, не 2500
     expect(truncated).toBe(true);
+    expect(kv.callCount()).toBe(2); // 3-тата страница НИКОГА не е извлечена - MAX_KEYS_SCANNED капва заявките, не само крайния резултат
+  });
+
+  it('единична реалистична 1000-key страница (точен production page size), list_complete:true -> truncated:false', async () => {
+    const kv = makeMockKv([{ keys: makeKeys(1000), list_complete: true, cursor: undefined }]);
+    const { keys, truncated } = await listKvKeysWithTruncation(kv, 'prefix:', 2000);
+    expect(keys.length).toBe(1000);
+    expect(truncated).toBe(false);
+  });
+
+  it('mock-ът хвърля при НЕреалистична страница (>1000 ключа) - доказва, че фикстурите по-горе никога не нарушават production limit-а', async () => {
+    const kv = makeMockKv([{ keys: makeKeys(1500), list_complete: true, cursor: undefined }]);
+    await expect(listKvKeysWithTruncation(kv, 'prefix:', 2000)).rejects.toThrow(/realistic limit/);
   });
 });
 
