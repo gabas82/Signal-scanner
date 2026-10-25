@@ -2263,16 +2263,27 @@ function pctExcursionToAtrRatio(pct, entryPrice, atr) {
 // байт-идентични - виж wiring-а в scanSymbolSignals). Собствен KV namespace
 // (tclifecycle:), никога не се чете обратно от ARMED/ENTRY логиката - чист
 // append-only recorder.
-function buildTcSetupCreatedRecord({ symbol, direction, price, setupScore, confidenceMajority }) {
+// `at` параметър (PR #141 review fix - TIMESTAMP IDENTITY): по подразбиране
+// Date.now() (стар behavior, запазен за backward compatibility), но
+// caller-ът в scanSymbolSignals подава ИЗРИЧНО state.trendSetup.at/
+// state.trendArmed.at - СЪЩАТА стойност, вече записана в state обекта
+// секунди по-рано в тоя тик - вместо да позволи тук да се извика ВТОРИ,
+// независим Date.now(). Преди фикса двете извиквания (едно в
+// markTrendSetupFired/ARMED assignment-а, едно тук) можеха теоретично да
+// върнат различни milliseconds, което чупеше identity-matching-а в новите
+// conversion/diagnostic функции по-долу (виж tcSetupKey/tcArmedKey). Нулева
+// промяна в кога реално се случва SETUP/ARMED решението - само ГАРАНТИРА,
+// че lifecycle записът и state обектът записват ЕДНА И СЪЩА стойност.
+function buildTcSetupCreatedRecord({ symbol, direction, price, setupScore, confidenceMajority, at }) {
   return {
-    kind: 'setup_created', symbol, direction, at: Date.now(),
+    kind: 'setup_created', symbol, direction, at: at ?? Date.now(),
     price: price ?? null, setupScore: setupScore ?? null,
     confidenceMajority: confidenceMajority ?? null,
   };
 }
-function buildTcArmedCreatedRecord({ symbol, direction, priceAtArm, structuralReference, atrAtArm, setupAt }) {
+function buildTcArmedCreatedRecord({ symbol, direction, priceAtArm, structuralReference, atrAtArm, setupAt, at }) {
   return {
-    kind: 'armed_created', symbol, direction, at: Date.now(),
+    kind: 'armed_created', symbol, direction, at: at ?? Date.now(),
     priceAtArm: priceAtArm ?? null, structuralReference: structuralReference ?? null,
     atrAtArm: (atrAtArm > 0) ? atrAtArm : null, setupAt: setupAt ?? null,
   };
@@ -2281,14 +2292,18 @@ function buildTcArmedCreatedRecord({ symbol, direction, priceAtArm, structuralRe
 // 'entry_missed' - виж discussion-а защо точно тия 5 (единствените реални
 // клонове, при които state.trendArmed се нулира в кода). pctMoveFromArm/
 // atrMoveFromArm реюзват СЪЩАТА calcOutcomePct/pctExcursionToAtrRatio формула
-// като MFE/MAE (PR #103) - без нова математика.
-function buildTcArmedResetRecord({ symbol, direction, armedAt, priceAtArm, reason, price, atrAtArm }) {
-  const at = Date.now();
-  const armedDurationMin = (armedAt != null) ? (at - armedAt) / 60000 : null;
+// като MFE/MAE (PR #103) - без нова математика. `at` опционален параметър
+// (symmetric с SETUP/ARMED builders по-горе, за тестируемост) - armed_reset
+// събитието е сам по себе си "моментът на reset", няма по-ранен canonical
+// state timestamp, с който да се синхронизира, затова Date.now() тук остава
+// коректен fallback, не bug.
+function buildTcArmedResetRecord({ symbol, direction, armedAt, priceAtArm, reason, price, atrAtArm, at }) {
+  const resolvedAt = at ?? Date.now();
+  const armedDurationMin = (armedAt != null) ? (resolvedAt - armedAt) / 60000 : null;
   const pctMoveFromArm = calcOutcomePct(direction, priceAtArm, price);
   const atrMoveFromArm = pctExcursionToAtrRatio(pctMoveFromArm, priceAtArm, atrAtArm);
   return {
-    kind: 'armed_reset', symbol, direction, at, armedAt: armedAt ?? null, reason,
+    kind: 'armed_reset', symbol, direction, at: resolvedAt, armedAt: armedAt ?? null, reason,
     price: price ?? null, armedDurationMin, pctMoveFromArm, atrMoveFromArm,
   };
 }
@@ -3179,6 +3194,314 @@ function buildTcLifecycleSummary(lifecycleRecords, tcEntryRecords) {
       armedToVetoEpisodePct: pct(episodesWithVeto, armedCreatedCount),
     },
     latencyBuckets: buildTcLatencyBuckets(tcEntryRecords),
+  };
+}
+
+// ═══ ENTRY TELEMETRY INTEGRITY AUDIT (ЕТАП 1, diagnostic-only) ═══════════════
+// Разграничава три различни "conversion" понятия, вместо едно event ratio,
+// което може да надвиши 100% (виж discussion-а "setupToArmedPct: 607.9%").
+// СТАРИТЕ conversionPct полета в buildTcLifecycleSummary по-горе остават
+// byte-идентични - тук САМО се добавят нови, ясно именувани полета. Никое
+// съществуващо поле не се премахва/преименува/променя смислово.
+//
+// EVENT RATIO (вече съществува като conversionPct.* по-горе) - брой събития
+// / брой други събития, БЕЗ dedup по episode - МОЖЕ да надвиши 100%, защото
+// един SETUP може да произведе много ARMED събития (re-arm, виж
+// buildTcReArmStats). Полезен за "колко често се случва X спрямо Y", НЕ за
+// "какъв дял от уникалните SETUP-и стигат до ARMED".
+//
+// COMPOSITE KEY HELPERS (PR #141 review fix) - предишната версия ключуваше
+// SETUP/ARMED samo по `at`, без symbol/direction. Две различни монети (или
+// LONG+SHORT на СЪЩАТА монета), случили се на идентичен millisecond
+// timestamp, щяха технически да се слеят в един "unique SETUP"/episode.
+// Малко вероятно, но напълно възможно (35-symbol watchlist, споделен cron
+// tick) - composite ключ премахва риска напълно, без да променя смисъла при
+// нормални (не-колизионни) данни.
+function tcSetupKey(symbol, direction, at) { return `${symbol}|${direction}|${at}`; }
+function tcArmedKey(symbol, direction, at) { return `${symbol}|${direction}|${at}`; }
+// Огледално на episodeId конвенцията в buildTelemetryRecord по-горе
+// (`${symbol}_${setupMode}_${direction}_${setupAt}`) - тук setupMode е
+// ВИНАГИ 'trend_continuation', защото lifecycleRecords/armedCreatedRecords
+// идват изключително от tclifecycle: namespace-а (виж
+// TC_LIFECYCLE_AGGREGATION_POPULATION по-долу).
+function tcEpisodeKey(symbol, direction, setupAt) { return `${symbol}_trend_continuation_${direction}_${setupAt}`; }
+
+// UNIQUE CONVERSION - брой уникални SETUP моменти (по symbol+direction+at),
+// достигнали поне едно ARMED (свързано чрез armed_created.setupAt), делено
+// на общия брой уникални SETUP моменти. Винаги 0-100%.
+//
+// PR #141 review fix: разчита на това, че `at` на SETUP CREATED lifecycle
+// записа е КАНОНИЧНИЯТ state.trendSetup.at (виж buildTcSetupCreatedRecord/
+// markTrendSetupFired wiring-а в scanSymbolSignals - подаден изрично като
+// `at` параметър, НЕ отделен Date.now() извикване) - затова съвпада byte-by-
+// byte с armed_created.setupAt (копие на СЪЩАТА state.trendSetup.at
+// стойност), вместо да разчита на две независими Date.now() извиквания да
+// върнат идентичен millisecond (ненадеждно).
+function buildTcUniqueConversion(setupCreatedRecords, armedCreatedRecords) {
+  const uniqueSetupKeys = new Set(setupCreatedRecords.map((r) => tcSetupKey(r.symbol, r.direction, r.at)));
+  const armedSetupKeys = new Set(
+    armedCreatedRecords
+      .filter((r) => r.setupAt != null)
+      .map((r) => tcSetupKey(r.symbol, r.direction, r.setupAt))
+  );
+  let reachedArmed = 0;
+  for (const key of uniqueSetupKeys) { if (armedSetupKeys.has(key)) reachedArmed++; }
+  return {
+    uniqueSetupCount: uniqueSetupKeys.size,
+    uniqueSetupReachedArmedCount: reachedArmed,
+    uniqueSetupToArmedPct: uniqueSetupKeys.size ? (reachedArmed / uniqueSetupKeys.size) * 100 : null,
+  };
+}
+
+// EPISODE CONVERSION - брой ARMED episode-и (уникални по symbol+direction+
+// setupAt, точната episodeId конвенция от buildTelemetryRecord), стигнали
+// поне 1 CONFIRMED evaluation, делено на общия брой допустими ARMED
+// episode-и (с поне 1 ARMED CREATED и известен setupAt). Винаги 0-100%.
+//
+// PR #141 review fix: вместо да свързва CONFIRMED evaluation обратно към
+// своя ARMED episode чрез `armedAt === armed_created.at` (крехко - две
+// независими Date.now() извиквания), ползва директно ВЕЧЕ коректно
+// построеното `episodeId` поле на самия entry record (buildTelemetryRecord
+// го смята от setupAt/direction/symbol/setupMode - виж по-горе), сравнено
+// срещу eligible episode ключове, построени по СЪЩАТА конвенция от ARMED
+// CREATED записите. Нулева зависимост от timestamp identity между две
+// отделни builder извиквания.
+function buildTcEpisodeConversion(armedCreatedRecords, tcEntryRecords) {
+  const eligibleEpisodes = new Set();
+  for (const r of armedCreatedRecords) {
+    if (r.setupAt == null) continue;
+    eligibleEpisodes.add(tcEpisodeKey(r.symbol, r.direction, r.setupAt));
+  }
+  const confirmedEpisodes = new Set();
+  for (const r of tcEntryRecords) {
+    if (r.decision !== 'confirmed') continue;
+    if (r.episodeId == null) continue;
+    if (eligibleEpisodes.has(r.episodeId)) confirmedEpisodes.add(r.episodeId);
+  }
+  return {
+    eligibleEpisodeCount: eligibleEpisodes.size,
+    confirmedEpisodeCount: confirmedEpisodes.size,
+    episodeConfirmedPct: eligibleEpisodes.size ? (confirmedEpisodes.size / eligibleEpisodes.size) * 100 : null,
+  };
+}
+function buildTcConversionMetrics(setupCreatedRecords, armedCreatedRecords, tcEntryRecords) {
+  return {
+    unique: buildTcUniqueConversion(setupCreatedRecords, armedCreatedRecords),
+    episode: buildTcEpisodeConversion(armedCreatedRecords, tcEntryRecords),
+  };
+}
+
+// MISSING EPISODE IDS (PR #141 review fix, изискано в оригиналната задача,
+// пропуснато в първата версия) - episodeId-та на ARMED episode-и, чийто
+// SETUP CREATED запис НЕ присъства в текущо сканирания lifecycle прозорец
+// (truncation/retention граница) - lineage пропуск, различен от
+// nullEpisodeIdCount (който мери ENTRY EVALUATION записи без episodeId).
+// Дедупликирано, bounded от самия MAX_KEYS_SCANNED таван на caller-а.
+function buildTcMissingEpisodeIds(setupCreatedRecords, armedCreatedRecords) {
+  const knownSetupKeys = new Set(setupCreatedRecords.map((r) => tcSetupKey(r.symbol, r.direction, r.at)));
+  const missing = [];
+  const seen = new Set();
+  for (const r of armedCreatedRecords) {
+    if (r.setupAt == null) continue;
+    if (knownSetupKeys.has(tcSetupKey(r.symbol, r.direction, r.setupAt))) continue;
+    const episodeId = tcEpisodeKey(r.symbol, r.direction, r.setupAt);
+    if (seen.has(episodeId)) continue;
+    seen.add(episodeId);
+    missing.push(episodeId);
+  }
+  return missing;
+}
+
+// COHORT COMPLETENESS (PR #141 review fix, допълнена по втория review pass
+// - FINAL REVIEW CORRECTION) - 0-100% conversion не означава автоматично
+// статистически валиден denominator, И ПО-ВАЖНО: "KV сканирането е
+// завършено" (list_complete:true) НЕ означава автоматично, че SETUP ->
+// ARMED -> ENTRY връзките са действително проследими. Двете са РАЗЛИЧНИ
+// понятия:
+//
+// SCAN COMPLETENESS - дали KV .list() е изчерпал всички страници
+// (!lifecycleTruncated && !telemetryTruncated). KV може напълно честно да
+// докладва "прочетох всичко, което съществува под тоя prefix в момента" и
+// въпреки това SETUP записът на даден ARMED episode да е изтекъл/изтрит от
+// retention политика по-рано (KV без TTL проблем тук, но структурно
+// възможно при бъдещи промени) - сканирането е "пълно", но lineage-ът НЕ е.
+//
+// LINEAGE COMPLETENESS - дали SETUP -> ARMED -> ENTRY връзките, видими В
+// ТЕКУЩО сканираните записи, се затварят коректно - 0 missingEpisodeIds, 0
+// unmatchedEvaluationCount, 0 nullEpisodeIdCount. Ако някое от тях е >0,
+// cohortStatus НЕ бива да твърди "complete", дори при scanComplete:true.
+//
+// Връща {status, scanComplete, lineageComplete} - status е удобен единичен
+// consumer-facing флаг, но scanComplete/lineageComplete по-долу остават
+// явно разграничени (никога не се сливат в едно булево).
+function buildTcCohortStatus({ scanTruncated, setupCreatedRecords, armedCreatedRecords, missingEpisodeIds, unmatchedEvaluationCount, nullEpisodeIdCount }) {
+  const scanComplete = !scanTruncated;
+  const lineageComplete = missingEpisodeIds.length === 0 && unmatchedEvaluationCount === 0 && nullEpisodeIdCount === 0;
+  let status;
+  if (!scanComplete) status = 'partial_truncated_scan_window';
+  else if (!setupCreatedRecords.length && !armedCreatedRecords.length) status = 'insufficient_data';
+  else if (!lineageComplete) status = 'scan_complete_lineage_incomplete';
+  else status = 'complete_within_scanned_window';
+  return { status, scanComplete, lineageComplete };
+}
+
+// KV PAGINATED LIST С ЧЕСТНА TRUNCATION ПРОВЕРКА (PR #141 review fix -
+// TRUNCATION DETECTION). Старата inline логика на всеки debug ендпойнт
+// смяташе `truncated = keys.length > maxKeysScanned` - при ТОЧНО
+// maxKeysScanned прочетени ключа, докато KV.list() твърди list_complete:
+// false (т.е. реално има още страници), тая проверка връщаше `false`
+// (подвеждащо "dataset е пълен"). Коректната проверка е дали КV никога не е
+// докладвал list_complete:true - честно отразява "има ли ОЩЕ данни отвъд
+// прочетеното", не само "колко сме прочели". Използвана само от /telemetry
+// и /tc-lifecycle (ЕТАП 1 обхват) - другите debug ендпойнти (discovery-*)
+// остават с предишната inline логика, извън обхвата на тоя одит.
+async function listKvKeysWithTruncation(kv, prefix, maxKeysScanned) {
+  let keys = [];
+  let cursor;
+  let listComplete = false;
+  do {
+    const listResult = await kv.list({ prefix, cursor, limit: 1000 });
+    keys.push(...listResult.keys);
+    listComplete = !!listResult.list_complete;
+    cursor = listComplete ? undefined : listResult.cursor;
+  } while (cursor && keys.length < maxKeysScanned);
+  const truncated = !listComplete || keys.length > maxKeysScanned;
+  return { keys: keys.slice(0, maxKeysScanned), truncated };
+}
+
+// COVERAGE RANGE - най-ранния/най-късния `at` timestamp сред сканираните
+// записи. Чисто observational - показва какъв времеви прозорец реално
+// покрива текущата (евентуално truncated) извадка.
+function buildCoverageRange(records) {
+  if (!records.length) return { coverageStart: null, coverageEnd: null };
+  let min = records[0].at, max = records[0].at;
+  for (const r of records) {
+    if (r.at < min) min = r.at;
+    if (r.at > max) max = r.at;
+  }
+  return { coverageStart: min, coverageEnd: max };
+}
+
+// POSSIBLE DUPLICATE EVENT DETECTION (diagnostic-only, НЕ dedup/merge логика -
+// re-arm качеството е отделна бъдеща задача) - флагира lifecycle събития за
+// СЪЩИЯ symbol+direction+kind, случили се подозрително близо едно до друго
+// (под прага по-долу). Технически МОЖЕ да е реален бърз re-arm, но е толкова
+// близо до нормалния cron tick интервал, че overlapping/retried invocation е
+// поне толкова вероятно обяснение (виж discussion-а "1000PEPEUSDT
+// concentration" - наблюдавани gaps от части от секундата). Не премахва и не
+// слива записи - само брои ги за видимост.
+const DUPLICATE_EVENT_GAP_MS = 5000;
+function countPossibleDuplicateEvents(lifecycleRecords, thresholdMs = DUPLICATE_EVENT_GAP_MS) {
+  const byKey = {};
+  for (const r of lifecycleRecords) {
+    const key = `${r.symbol}|${r.direction}|${r.kind}`;
+    if (!byKey[key]) byKey[key] = [];
+    byKey[key].push(r.at);
+  }
+  let count = 0;
+  for (const key of Object.keys(byKey)) {
+    const times = byKey[key].slice().sort((a, b) => a - b);
+    for (let i = 1; i < times.length; i++) {
+      if (times[i] - times[i - 1] < thresholdMs) count++;
+    }
+  }
+  return count;
+}
+
+// UNMATCHED EVALUATION COUNT - ENTRY EVALUATION записи (tcEntryRecords), чийто
+// symbol+direction+armedAt НЕ съвпада с symbol+direction+`at` на нито един
+// ARMED CREATED запис в ТЕКУЩО сканирания прозорец. Директно обяснява защо
+// armedToAnyEvaluationPct (виж buildTcLifecycleSummary по-горе) може да
+// надвиши 100%: двете KV namespaces (tclifecycle:/telemetry:) се сканират
+// НЕЗАВИСИМО, всяка със собствен MAX_KEYS_SCANNED таван - evaluation за
+// ARMED епизод, чийто armed_created попадне извън единия прозорец (но не и
+// другия), се брои тук.
+//
+// PR #141 review fix: composite key (symbol+direction+at), не само `at` -
+// избягва cross-symbol/cross-direction колизии при идентичен millisecond
+// timestamp. Разчита на канонично синхронизирания state.trendArmed.at (виж
+// tcSetupKey/buildTcUniqueConversion коментара по-горе за same fix класа).
+function countUnmatchedEvaluations(armedCreatedRecords, tcEntryRecords) {
+  const knownArmedKeys = new Set(armedCreatedRecords.map((r) => tcArmedKey(r.symbol, r.direction, r.at)));
+  let count = 0;
+  for (const r of tcEntryRecords) {
+    if (r.armedAt == null) continue;
+    if (!knownArmedKeys.has(tcArmedKey(r.symbol, r.direction, r.armedAt))) count++;
+  }
+  return count;
+}
+
+// MISSING LATENCY COUNT - ENTRY EVALUATION записи, изключени от ВСИЧКИ latency
+// bucket-и (виж buildTcLatencyBuckets по-горе), защото timeFromArmMin е null -
+// легаси записи отпреди PR #105 деплоя (виж коментара при
+// TC_ARM_TO_ENTRY_LATENCY_BUCKETS по-горе: "не се реконструира"). Директно
+// обяснява "982 observations от 1026 evaluations" разликата.
+function countMissingLatency(tcEntryRecords) {
+  return tcEntryRecords.filter((r) => r.timeFromArmMin == null).length;
+}
+
+// AGGREGATION POPULATION - чиста документация-като-данни (виж discussion-а:
+// лесно се чете /tc-lifecycle резултата като "целия Entry Engine", докато той
+// е ИЗКЛЮЧИТЕЛНО TREND CONTINUATION - MEAN REVERSION живее само в /telemetry,
+// разпознаваем по setupMode:'mean_reversion'). Нулева логика, само описание
+// за consumer-а на JSON отговора.
+const TC_LIFECYCLE_AGGREGATION_POPULATION = {
+  lifecycle: "trend_continuation ONLY (tclifecycle: namespace) - mean_reversion SETUP/ARMED/RESET не се записва тук",
+  entryEvaluation: "trend_continuation ONLY (telemetry: записи, филтрирани по ':trend_continuation' суфикс)",
+  note: 'За mean_reversion виж /telemetry endpoint-а директно (setupMode==="mean_reversion")',
+};
+
+function buildTcIntegrityDiagnostics(lifecycleRecords, tcEntryRecords, lifecycleTruncated, telemetryTruncated) {
+  const setupCreatedRecords = lifecycleRecords.filter((r) => r.kind === 'setup_created');
+  const armedCreatedRecords = lifecycleRecords.filter((r) => r.kind === 'armed_created');
+  // Смятани ЕДИН път тук, после реюзвани И от buildTcCohortStatus, И от
+  // върнатия обект по-долу - избягва разминаване между "какво решава
+  // cohortStatus" и "какво вижда consumer-ът" (FINAL REVIEW CORRECTION).
+  const nullEpisodeIdCount = tcEntryRecords.filter((r) => r.episodeId == null).length;
+  const missingEpisodeIds = buildTcMissingEpisodeIds(setupCreatedRecords, armedCreatedRecords);
+  const unmatchedEvaluationCount = countUnmatchedEvaluations(armedCreatedRecords, tcEntryRecords);
+  const cohort = buildTcCohortStatus({
+    scanTruncated: !!lifecycleTruncated || !!telemetryTruncated,
+    setupCreatedRecords, armedCreatedRecords,
+    missingEpisodeIds, unmatchedEvaluationCount, nullEpisodeIdCount,
+  });
+  return {
+    recordsReturned: lifecycleRecords.length,
+    // KV .list() не дава надежден общ брой отвъд вече сканираното - не се
+    // измисля стойност (insufficient_data правило).
+    recordsAvailable: null,
+    isTruncated: { lifecycle: !!lifecycleTruncated, entryEvaluation: !!telemetryTruncated },
+    // PR #141 review fix - виж buildTcCohortStatus по-горе: 0-100%
+    // conversionMetrics по-долу остава ВЯРНО смятан дори при truncation
+    // (composite keys, не inflated event ratio), но денoминаторът може да е
+    // частичен - cohortStatus прави това явно, вместо да подвежда consumer-а
+    // да приема partial window като "цялата история". cohortScanComplete/
+    // cohortLineageComplete стоят РАЗГРАНИЧЕНИ (FINAL REVIEW CORRECTION) -
+    // scan завършен ≠ lineage проследим.
+    cohortStatus: cohort.status,
+    cohortScanComplete: cohort.scanComplete,
+    cohortLineageComplete: cohort.lineageComplete,
+    ...buildCoverageRange(lifecycleRecords),
+    nullEpisodeIdCount,
+    missingEpisodeIds,
+    duplicateEventCount: countPossibleDuplicateEvents(lifecycleRecords),
+    missingLatencyCount: countMissingLatency(tcEntryRecords),
+    unmatchedEvaluationCount,
+    aggregationPopulation: TC_LIFECYCLE_AGGREGATION_POPULATION,
+    conversionMetrics: buildTcConversionMetrics(setupCreatedRecords, armedCreatedRecords, tcEntryRecords),
+  };
+}
+
+// /telemetry sibling на buildTcIntegrityDiagnostics по-горе (ЕТАП 1) - покрива
+// ВСИЧКИ decision записи (mean_reversion + trend_continuation + veto), не само
+// TC. setupModeMissingCount - записи с непознато/липсващо setupMode (нито
+// 'mean_reversion', нито 'trend_continuation') - легаси записи отпреди
+// setupMode полето, виж discussion-а.
+function buildTelemetryIntegrityDiagnostics(records, truncated) {
+  return {
+    ...buildCoverageRange(records),
+    isTruncated: !!truncated,
+    setupModeMissingCount: records.filter((r) => r.setupMode !== 'mean_reversion' && r.setupMode !== 'trend_continuation').length,
   };
 }
 
@@ -4604,6 +4927,10 @@ async function scanSymbolSignals(env, symbol) {
     const tcSetupRecord = buildTcSetupCreatedRecord({
       symbol, direction: trendSetupState.direction, price,
       setupScore: trendSetupState.score, confidenceMajority: confidence.majority,
+      // PR #141 review fix (TIMESTAMP IDENTITY) - канoничният timestamp,
+      // вече записан в state.trendSetup.at от markTrendSetupFired() 1 ред
+      // по-горе, НЕ нов независим Date.now() извикване.
+      at: state.trendSetup ? state.trendSetup.at : null,
     });
     await env.ALERT_STATE.put(`tclifecycle:${symbol}:${tcSetupRecord.at}:setup_created`, JSON.stringify(tcSetupRecord));
   }
@@ -4659,9 +4986,23 @@ async function scanSymbolSignals(env, symbol) {
       const structuralReferenceAtArm = trendArmedDirectionCandidate === 'short'
         ? (state.swingStruct.lastSwingLow ? state.swingStruct.lastSwingLow.price : null)
         : (state.swingStruct.lastSwingHigh ? state.swingStruct.lastSwingHigh.price : null);
+      // TELEMETRY INTEGRITY FIX (виж "ENTRY TELEMETRY INTEGRITY" одита) -
+      // state.trendArmed.setupAt липсваше тук, въпреки че СЪЩАТА стойност
+      // (state.trendSetup.at) вече се подаваше коректно на
+      // buildTcArmedCreatedRecord() 2 реда по-долу за tclifecycle: записа.
+      // Резултат: редът, който чете state.trendArmed.setupAt при ENTRY
+      // EVALUATION (виж "setupAt: state.trendArmed.setupAt" по-долу в тоя
+      // файл), винаги четеше undefined -> episodeId винаги null за ВСИЧКИ
+      // trend_continuation telemetry записи (потвърдено с production
+      // /telemetry данни: unknownEpisode.count доминиран от TC записи).
+      // Чисто diagnostic поле - НЕ се чете от никоя SETUP/ARMED/ENTRY gate
+      // логика (state.trendArmed.setupAt не участва в calcArmedTrigger/
+      // calcEntryTrigger/trendArmedResetReason по-долу) - нулева промяна в
+      // ENTRY ENGINE решенията.
       state.trendArmed = {
         direction: trendArmedDirectionCandidate, at: Date.now(), priceAtArm: price,
         atrAtArm: (atr5mAtArm > 0) ? atr5mAtArm : null, // PR #105 - чисто информационен, виж коментара по-горе
+        setupAt: state.trendSetup ? state.trendSetup.at : null,
       };
       trendArmedFired = true;
       if (env.ALERT_STATE) {
@@ -4669,6 +5010,11 @@ async function scanSymbolSignals(env, symbol) {
           symbol, direction: trendArmedDirectionCandidate, priceAtArm: price,
           structuralReference: structuralReferenceAtArm, atrAtArm: atr5mAtArm,
           setupAt: state.trendSetup ? state.trendSetup.at : null,
+          // PR #141 review fix (TIMESTAMP IDENTITY) - канoничният timestamp,
+          // вече записан в state.trendArmed.at няколко реда по-горе, НЕ нов
+          // независим Date.now() извикване (виж коментара по-горе за
+          // пълния root cause).
+          at: state.trendArmed.at,
         });
         await env.ALERT_STATE.put(`tclifecycle:${symbol}:${armedRecord.at}:armed_created`, JSON.stringify(armedRecord));
       }
@@ -6728,6 +7074,17 @@ function buildFlowWarmingSummary(records) {
 export {
   calcDCALevels, checkDcaLevels, checkPriceLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals, checkMacroSqueeze,
   updateDiscoverySnapshotState, runDiscoveryFullAnalysis,
+  // ЕТАП 1 - ENTRY TELEMETRY INTEGRITY AUDIT - изложени само за unit тестове
+  // (виж worker-entry-telemetry-integrity.test.js), НЕ се ползват от друг
+  // производствен код извън worker.js самия.
+  buildTelemetryRecord, buildTcSetupCreatedRecord, buildTcArmedCreatedRecord, buildTcArmedResetRecord,
+  buildTcLifecycleSummary, buildTcReArmStats, buildTcLatencyBuckets, buildTcResetByReason,
+  buildTelemetrySummary, buildEpisodeSummary,
+  buildTcConversionMetrics, buildCoverageRange, countPossibleDuplicateEvents,
+  countUnmatchedEvaluations, countMissingLatency, buildTcIntegrityDiagnostics,
+  buildTelemetryIntegrityDiagnostics,
+  // PR #141 review fix - изложени само за unit тестове.
+  buildTcMissingEpisodeIds, buildTcCohortStatus, listKvKeysWithTruncation,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
@@ -6963,15 +7320,10 @@ export default {
       const MAX_KEYS_SCANNED = 2000; // безопасен таван - предпазва от прекалено скъпа заявка
 
       const prefix = symbolFilter ? `telemetry:${symbolFilter}:` : "telemetry:";
-      let allKeys = [];
-      let cursor;
-      do {
-        const listResult = await env.ALERT_STATE.list({ prefix, cursor, limit: 1000 });
-        allKeys.push(...listResult.keys);
-        cursor = listResult.list_complete ? undefined : listResult.cursor;
-      } while (cursor && allKeys.length < MAX_KEYS_SCANNED);
-      const truncated = allKeys.length > MAX_KEYS_SCANNED;
-      allKeys = allKeys.slice(0, MAX_KEYS_SCANNED);
+      // PR #141 review fix (TRUNCATION DETECTION) - виж listKvKeysWithTruncation
+      // по-горе за защо `keys.length > MAX_KEYS_SCANNED` самостоятелно не е
+      // достатъчно.
+      const { keys: allKeys, truncated } = await listKvKeysWithTruncation(env.ALERT_STATE, prefix, MAX_KEYS_SCANNED);
 
       const records = [];
       for (const k of allKeys) {
@@ -7005,6 +7357,9 @@ export default {
         // ДОПЪЛНИТЕЛЕН изглед, не заменя summary по-горе.
         episodeSummary: buildEpisodeSummary(records, truncated),
         stageDirectionCounts,
+        // ЕТАП 1 - ENTRY TELEMETRY INTEGRITY AUDIT (diagnostic-only) -
+        // ДОПЪЛНИТЕЛЕН изглед, не заменя/променя summary/episodeSummary по-горе.
+        diagnostics: buildTelemetryIntegrityDiagnostics(records, truncated),
       }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
     }
 
@@ -7034,15 +7389,10 @@ export default {
       const MAX_KEYS_SCANNED = 2000;
 
       const lifecyclePrefix = symbolFilter ? `tclifecycle:${symbolFilter}:` : "tclifecycle:";
-      let lifecycleKeys = [];
-      let lcCursor;
-      do {
-        const listResult = await env.ALERT_STATE.list({ prefix: lifecyclePrefix, cursor: lcCursor, limit: 1000 });
-        lifecycleKeys.push(...listResult.keys);
-        lcCursor = listResult.list_complete ? undefined : listResult.cursor;
-      } while (lcCursor && lifecycleKeys.length < MAX_KEYS_SCANNED);
-      const lifecycleTruncated = lifecycleKeys.length > MAX_KEYS_SCANNED;
-      lifecycleKeys = lifecycleKeys.slice(0, MAX_KEYS_SCANNED);
+      // PR #141 review fix (TRUNCATION DETECTION) - виж listKvKeysWithTruncation
+      // по-горе.
+      const { keys: lifecycleKeys, truncated: lifecycleTruncated } =
+        await listKvKeysWithTruncation(env.ALERT_STATE, lifecyclePrefix, MAX_KEYS_SCANNED);
       const lifecycleRecords = [];
       for (const k of lifecycleKeys) {
         const raw = await env.ALERT_STATE.get(k.name);
@@ -7057,15 +7407,10 @@ export default {
       // trend_continuation - без duplicate storage на CONFIRMED/MISSED/VETO
       // данните, които вече живеят в /telemetry.
       const telemetryPrefix = symbolFilter ? `telemetry:${symbolFilter}:` : "telemetry:";
-      let telemetryKeys = [];
-      let tCursor;
-      do {
-        const listResult = await env.ALERT_STATE.list({ prefix: telemetryPrefix, cursor: tCursor, limit: 1000 });
-        telemetryKeys.push(...listResult.keys);
-        tCursor = listResult.list_complete ? undefined : listResult.cursor;
-      } while (tCursor && telemetryKeys.length < MAX_KEYS_SCANNED);
-      const telemetryTruncated = telemetryKeys.length > MAX_KEYS_SCANNED;
-      telemetryKeys = telemetryKeys.slice(0, MAX_KEYS_SCANNED);
+      // PR #141 review fix (TRUNCATION DETECTION) - виж listKvKeysWithTruncation
+      // по-горе.
+      const { keys: telemetryKeys, truncated: telemetryTruncated } =
+        await listKvKeysWithTruncation(env.ALERT_STATE, telemetryPrefix, MAX_KEYS_SCANNED);
       const tcEntryRecords = [];
       for (const k of telemetryKeys) {
         if (!k.name.endsWith(':trend_continuation')) continue;
@@ -7081,6 +7426,10 @@ export default {
         entryEvaluationCount: tcEntryRecords.length, telemetryTruncated,
         records: lifecycleRecords.slice(0, limit),
         summary: buildTcLifecycleSummary(lifecycleRecords, tcEntryRecords),
+        // ЕТАП 1 - ENTRY TELEMETRY INTEGRITY AUDIT (diagnostic-only, виж
+        // buildTcIntegrityDiagnostics по-горе) - ДОПЪЛНИТЕЛЕН изглед, не
+        // заменя/променя summary по-горе.
+        diagnostics: buildTcIntegrityDiagnostics(lifecycleRecords, tcEntryRecords, lifecycleTruncated, telemetryTruncated),
       }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
     }
 
