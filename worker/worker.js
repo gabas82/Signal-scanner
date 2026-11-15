@@ -3734,6 +3734,331 @@ function markLiqGravityFired(state, key, direction) {
   state.liqGravityFired = { key, direction, at: Date.now() };
 }
 
+// ═══ COINGLASS LIQUIDATION DIAGNOSTICS (SHADOW, diagnostic-only) ════════════════
+// Диагностика на `/futures/liquidation/order` интеграцията (виж доклада
+// "CoinGlass liquidation/order - symbol diagnostics"). ПРИНЦИПИ:
+// (1) ИЗКЛЮЧЕНО по подразбиране - нищо не се изпълнява, освен ако
+//     env.LIQ_DIAG_ENABLED === '1' (Cloudflare var). Deploy без този var =
+//     нулева промяна в поведението.
+// (2) НЕ пипа legacy пътя: fetchLiquidationOrdersWorker/calcLiquidationCascade/
+//     accumulateLiquidationGravity и техните входове/изходи към PHASE CYCLE и
+//     LIQUIDATION GRAVITY известието остават byte-identical. Shadow gravity
+//     профилът живее в ОТДЕЛЕН обект, никога в state.liqGravity.
+// (3) НЕ влияе на SETUP/ARMED/ENTRY, PHASE CYCLE score-а, нито праща известия.
+// (4) Пише САМО в собствен KV prefix `liqdiag:` (отделен от `sigstate:` и
+//     `telemetry:`), чете се единствено от /liq-diagnostics ендпойнта.
+// (5) API ключът НИКОГА не се записва/връща - пазим само code/msg/count/coin.
+const LIQ_DIAG_KV_PREFIX = 'liqdiag:';
+const LIQ_DIAG_LOOKBACK_MS = 20 * 60000; // 15-мин CASCADE прозорец + запас за cron jitter
+const LIQ_DIAG_MAX_EVENTS = 200;
+const LIQ_DIAG_MAX_TIMELINE = 288; // ~24ч при 5-мин cron - за time-join с /telemetry записите
+// Хистограма на 15-мин сумите (USD) - за калибриране на LIQUIDATION_CASCADE_USD_MIN.
+const LIQ_DIAG_USD_BINS = [0, 10000, 50000, 100000, 250000, 500000, 1000000, 2500000, 5000000];
+// Символи, при които махането на "USDT" НЕ дава CoinGlass монетата. НЕПОТВЪРДЕНО
+// с реален отговор - затова toCoinGlassCoin() връща verified:false за тях и
+// диагностиката ги отчита отделно, докато не се види реален `base_asset`.
+const LIQ_DIAG_COIN_OVERRIDES = { '1000PEPEUSDT': 'PEPE' };
+
+function isLiqDiagEnabled(env) {
+  return String(env?.LIQ_DIAG_ENABLED ?? '').trim() === '1';
+}
+
+// Binance USDT-M pair -> CoinGlass coin (`symbol` параметърът на
+// /liquidation/order е монета, напр. BTC; двойка BTCUSDT връща празен масив).
+function toCoinGlassCoin(symbol) {
+  const s = String(symbol || '').toUpperCase();
+  if (LIQ_DIAG_COIN_OVERRIDES[s]) return { coin: LIQ_DIAG_COIN_OVERRIDES[s], verified: false, rule: 'override' };
+  if (/^\d+[A-Z]+USDT$/.test(s)) return { coin: s.replace(/USDT$/, '').replace(/^\d+/, ''), verified: false, rule: 'numeric_prefix' };
+  if (s.endsWith('USDT') && s.length > 4) return { coin: s.slice(0, -4), verified: true, rule: 'strip_usdt' };
+  return { coin: s, verified: false, rule: 'passthrough' };
+}
+
+// Класифицира CoinGlass отговор. CoinGlass връща HTTP 200 и при грешки -
+// реалният статус е в json.code ("0" = успех). Legacy кодът гледа само r.ok
+// и Array.isArray(json.data), затова 'empty', 'api_error', 'bad_shape' и
+// 'network'/'timeout' там се сливат в [] или null.
+function classifyCoinGlassLiqResponse({ httpStatus = null, json = undefined, error = null, hasKey = true } = {}) {
+  if (!hasKey) return { status: 'no_key', code: null, msg: null, count: 0 };
+  if (error) {
+    const isTimeout = error.name === 'AbortError' || /abort|timeout/i.test(String(error.message || ''));
+    return { status: isTimeout ? 'timeout' : 'network', code: null, msg: String(error.message || error.name || 'error').slice(0, 200), count: 0 };
+  }
+  if (httpStatus != null && (httpStatus < 200 || httpStatus >= 300)) {
+    return { status: 'http_error', code: json?.code != null ? String(json.code) : null, msg: json?.msg ? String(json.msg).slice(0, 200) : null, count: 0, httpStatus };
+  }
+  if (json === undefined || json === null || typeof json !== 'object') return { status: 'parse_error', code: null, msg: null, count: 0, httpStatus };
+  const code = json.code != null ? String(json.code) : null;
+  const msg = json.msg != null ? String(json.msg).slice(0, 200) : null;
+  if (code !== '0') return { status: 'api_error', code, msg, count: 0, httpStatus };
+  if (!Array.isArray(json.data)) return { status: 'bad_shape', code, msg, count: 0, httpStatus };
+  return { status: json.data.length ? 'ok' : 'empty', code, msg, count: json.data.length, httpStatus };
+}
+
+// Същата нормализация като legacy fetchLiquidationOrdersWorker + pair/exchange
+// за диагностика (при symbol=BTC отговорът може да включва и други BTC двойки
+// на Binance, напр. USDC/COIN-M - отчита се в pairCounts).
+function normalizeLiqDiagOrders(data) {
+  if (!Array.isArray(data)) return [];
+  return data
+    .map(d => ({ side: Number(d.side), usdValue: parseFloat(d.usd_value), time: Number(d.time), price: parseFloat(d.price), pair: d.symbol != null ? String(d.symbol) : null, baseAsset: d.base_asset != null ? String(d.base_asset) : null }))
+    .filter(d => isFinite(d.usdValue) && isFinite(d.time));
+}
+
+function buildLiqDiagUrl(coin, { startTime, minAmount = 1, exchange = 'Binance' } = {}) {
+  const p = new URLSearchParams({ symbol: coin, exchange, min_liquidation_amount: String(minAmount) });
+  if (startTime != null) p.set('start_time', String(startTime));
+  return `https://open-api-v4.coinglass.com/api/futures/liquidation/order?${p.toString()}`;
+}
+
+// Един shadow fetch с ПРАВИЛНИЯ coin символ и ограничен прозорец (start_time) -
+// legacy заявката не подава start_time и при правилен символ би теглила 7 дни.
+async function fetchLiquidationOrdersDiag(env, symbol, { now = Date.now(), lookbackMs = LIQ_DIAG_LOOKBACK_MS, minAmount = 1, coinOverride = null, fetchImpl = null } = {}) {
+  const mapping = coinOverride ? { coin: coinOverride, verified: false, rule: 'probe_override' } : toCoinGlassCoin(symbol);
+  const startTime = lookbackMs != null ? now - lookbackMs : null;
+  const meta = { symbol, coin: mapping.coin, coinVerified: mapping.verified, coinRule: mapping.rule, startTime, minAmount, at: now };
+  if (!env?.CG_API_KEY) return { ...meta, ...classifyCoinGlassLiqResponse({ hasKey: false }), orders: [], latencyMs: 0 };
+  const t0 = Date.now();
+  try {
+    const doFetch = fetchImpl || fetchWithTimeout;
+    const r = await doFetch(buildLiqDiagUrl(mapping.coin, { startTime, minAmount }), { headers: { 'CG-API-KEY': env.CG_API_KEY } });
+    let json;
+    try { json = await r.json(); } catch (e) { json = undefined; }
+    const cls = classifyCoinGlassLiqResponse({ httpStatus: r.status, json });
+    const orders = cls.status === 'ok' ? normalizeLiqDiagOrders(json.data) : [];
+    return { ...meta, ...cls, orders, latencyMs: Date.now() - t0 };
+  } catch (error) {
+    return { ...meta, ...classifyCoinGlassLiqResponse({ error }), orders: [], latencyMs: Date.now() - t0 };
+  }
+}
+
+// ─── BINANCE forceOrder ПРЕЗ RELAY (shadow източник, заместител на CoinGlass) ───
+// relay/liquidation-collector.js държи 1 WebSocket към Binance !forceOrder@arr
+// и сервира /liquidations?symbol=&since=&token= (RELAY_TOKEN, като /klines).
+// Символът е директно Binance двойката (без coin карта); `side` е в същата
+// конвенция като legacy calcLiquidationCascade (1 = принудително BUY = SHORT
+// ликвидирани, 2 = принудително SELL = LONG ликвидирани). `coverage` казва дали
+// relay-ят е бил свързан през целия поискан прозорец (gaps/рестарт).
+// Връща същата форма като fetchLiquidationOrdersDiag -> applyLiqShadowStep.
+async function fetchLiquidationOrdersRelayDiag(env, symbol, { now = Date.now(), lookbackMs = LIQ_DIAG_LOOKBACK_MS, fetchImpl = null } = {}) {
+  const startTime = now - lookbackMs;
+  const meta = { source: 'relay', symbol, coin: symbol, coinVerified: true, coinRule: 'relay_pair', startTime, minAmount: null, at: now };
+  const blank = (status, extra = {}) => ({ ...meta, status, code: null, msg: null, count: 0, orders: [], latencyMs: 0, coverageComplete: null, coverageReasons: [], ...extra });
+  if (!env?.RELAY_URL || !env?.RELAY_TOKEN) return blank('no_relay');
+  const t0 = Date.now();
+  try {
+    const doFetch = fetchImpl || fetchWithTimeout;
+    const r = await doFetch(`${env.RELAY_URL}/liquidations?symbol=${encodeURIComponent(symbol)}&since=${startTime}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    let json;
+    try { json = await r.json(); } catch (e) { json = undefined; }
+    const latencyMs = Date.now() - t0;
+    if (r.status === 503) return blank('source_disabled', { httpStatus: 503, msg: json?.reason ? String(json.reason).slice(0, 200) : null, latencyMs });
+    if (r.status < 200 || r.status >= 300) return blank('http_error', { httpStatus: r.status, msg: json?.error ? String(json.error).slice(0, 200) : null, latencyMs });
+    if (!json || typeof json !== 'object') return blank('parse_error', { httpStatus: r.status, latencyMs });
+    if (!Array.isArray(json.events)) return blank('bad_shape', { httpStatus: r.status, latencyMs });
+    const orders = json.events
+      .map(e => ({ side: Number(e.side), usdValue: parseFloat(e.usdValue), time: Number(e.time), price: parseFloat(e.price), pair: symbol, baseAsset: null }))
+      .filter(d => (d.side === 1 || d.side === 2) && isFinite(d.usdValue) && isFinite(d.time));
+    const cov = json.coverage && typeof json.coverage === 'object' ? json.coverage : null;
+    return {
+      ...meta, status: orders.length ? 'ok' : 'empty', code: null, msg: null, httpStatus: r.status,
+      count: orders.length, orders, latencyMs, relayTruncated: !!json.truncated,
+      coverageComplete: cov ? cov.complete === true : null,
+      coverageReasons: cov && Array.isArray(cov.reasons) ? cov.reasons.slice(0, 10).map(String) : [],
+    };
+  } catch (error) {
+    const isTimeout = error?.name === 'AbortError' || /abort|timeout/i.test(String(error?.message || ''));
+    return blank(isTimeout ? 'timeout' : 'network', { msg: String(error?.message || error?.name || 'error').slice(0, 200), latencyMs: Date.now() - t0 });
+  }
+}
+
+// Shadow източник: env.LIQ_DIAG_SOURCE = 'relay' (по подразбиране - CoinGlass
+// абонаментът е изтекъл) | 'coinglass'. Важи САМО при LIQ_DIAG_ENABLED=1.
+function getLiqDiagSource(env) {
+  const s = String(env?.LIQ_DIAG_SOURCE ?? '').trim().toLowerCase();
+  return s === 'coinglass' ? 'coinglass' : 'relay';
+}
+function fetchLiquidationOrdersShadow(env, symbol, opts = {}) {
+  return getLiqDiagSource(env) === 'coinglass'
+    ? fetchLiquidationOrdersDiag(env, symbol, opts)
+    : fetchLiquidationOrdersRelayDiag(env, symbol, opts);
+}
+
+function liqDiagUsdBin(usd) {
+  let idx = 0;
+  for (let i = 0; i < LIQ_DIAG_USD_BINS.length; i++) if (usd >= LIQ_DIAG_USD_BINS[i]) idx = i;
+  return String(LIQ_DIAG_USD_BINS[idx]);
+}
+
+// Детекция на вероятно отрязан отговор: много записи, а най-старият е
+// значително по-нов от start_time (т.е. API-то не е върнало целия прозорец).
+function detectLiqDiagTruncation(orders, startTime) {
+  if (!orders.length || startTime == null) return false;
+  let oldest = Infinity;
+  for (const o of orders) if (o.time < oldest) oldest = o.time;
+  return orders.length >= 200 && oldest > startTime + 60000;
+}
+
+function emptyLiqDiagState() {
+  return {
+    v: 1, createdAt: null, updatedAt: null,
+    counts: {}, last: null, lastOkAt: null, maxCount: 0, truncatedSuspectCount: 0,
+    pairCounts: {}, baseAssets: {},
+    shadowGravity: { buckets: {}, lastSeenTime: 0 },
+    coverageIncompleteCount: 0, coverageReasons: {}, sources: {},
+    cascadeHist: { buy: {}, sell: {} },
+    cascadeMax: { buy: 0, sell: 0 },
+    prevShadow: { cascadeBull: false, cascadeBear: false, gravityKey: 'none' },
+    events: [], timeline: [],
+  };
+}
+
+// Чиста (без I/O) shadow стъпка: взема предишния diag state + резултата от
+// fetchLiquidationOrdersDiag + пазарния контекст и връща НОВ diag state.
+// Реизползва СЪЩИТЕ production функции/прагове (calcLiquidationCascade,
+// accumulateLiquidationGravity, findNearestLiquidationCluster,
+// calcLiquidationGravityScore, getLiquidationGravityTier), така че показва
+// точно какво БИ направил production при реални данни - но само го записва.
+function applyLiqShadowStep(prevDiag, fetchResult, { price = null, oiDeltaPct = null, takerDelta = null, volAccel = null, legacyBuyUsd = 0, legacySellUsd = 0 } = {}) {
+  const d = prevDiag && prevDiag.v === 1 ? JSON.parse(JSON.stringify(prevDiag)) : emptyLiqDiagState();
+  const now = fetchResult.at ?? Date.now();
+  if (!d.createdAt) d.createdAt = now;
+  d.updatedAt = now;
+  d.counts[fetchResult.status] = (d.counts[fetchResult.status] || 0) + 1;
+  const truncatedSuspect = fetchResult.relayTruncated === true || (fetchResult.status === 'ok' && fetchResult.source !== 'relay' && detectLiqDiagTruncation(fetchResult.orders, fetchResult.startTime));
+  if (truncatedSuspect) d.truncatedSuspectCount++;
+  const source = fetchResult.source || 'coinglass';
+  if (!d.sources) d.sources = {};
+  d.sources[source] = (d.sources[source] || 0) + 1;
+  const coverageComplete = fetchResult.coverageComplete ?? null;
+  if (coverageComplete === false) {
+    d.coverageIncompleteCount = (d.coverageIncompleteCount || 0) + 1;
+    if (!d.coverageReasons) d.coverageReasons = {};
+    for (const r of fetchResult.coverageReasons || []) d.coverageReasons[r] = (d.coverageReasons[r] || 0) + 1;
+  }
+  d.last = {
+    at: now, status: fetchResult.status, code: fetchResult.code ?? null, msg: fetchResult.msg ?? null,
+    httpStatus: fetchResult.httpStatus ?? null, count: fetchResult.count ?? 0, coin: fetchResult.coin,
+    coinVerified: !!fetchResult.coinVerified, coinRule: fetchResult.coinRule, latencyMs: fetchResult.latencyMs ?? null, truncatedSuspect,
+    source, coverageComplete, coverageReasons: fetchResult.coverageReasons || [],
+  };
+  if (fetchResult.status === 'ok') d.lastOkAt = now;
+  if ((fetchResult.count || 0) > d.maxCount) d.maxCount = fetchResult.count;
+  const orders = fetchResult.orders || [];
+  for (const o of orders) {
+    if (o.pair) d.pairCounts[o.pair] = (d.pairCounts[o.pair] || 0) + 1;
+    if (o.baseAsset) d.baseAssets[o.baseAsset] = (d.baseAssets[o.baseAsset] || 0) + 1;
+  }
+
+  // Shadow CASCADE - същата функция и праг като production.
+  const usable = fetchResult.status === 'ok' || fetchResult.status === 'empty';
+  const cascade = calcLiquidationCascade(orders);
+  if (usable) {
+    const bb = liqDiagUsdBin(cascade.buySumUsd), sb = liqDiagUsdBin(cascade.sellSumUsd);
+    d.cascadeHist.buy[bb] = (d.cascadeHist.buy[bb] || 0) + 1;
+    d.cascadeHist.sell[sb] = (d.cascadeHist.sell[sb] || 0) + 1;
+    if (cascade.buySumUsd > d.cascadeMax.buy) d.cascadeMax.buy = cascade.buySumUsd;
+    if (cascade.sellSumUsd > d.cascadeMax.sell) d.cascadeMax.sell = cascade.sellSumUsd;
+  }
+
+  // Shadow GRAVITY - в ОТДЕЛЕН wrapper обект, никога в реалния state.
+  const shadowWrap = { liqGravity: d.shadowGravity };
+  if (usable) accumulateLiquidationGravity(shadowWrap, orders);
+  d.shadowGravity = shadowWrap.liqGravity;
+  const cluster = findNearestLiquidationCluster(shadowWrap, price);
+  const gScore = calcLiquidationGravityScore({ price, cluster, oiDeltaPct, takerDelta, volAccel });
+  const gDir = gScore.longScore >= gScore.shortScore ? 'long' : 'short';
+  const gMax = Math.max(gScore.longScore, gScore.shortScore);
+  const gHard = gDir === 'long' ? gScore.hasHardFactorLong : gScore.hasHardFactorShort;
+  const gTier = getLiquidationGravityTier(gMax, gHard);
+  const gKey = gTier !== 'none' ? `${gDir}:${gTier}` : 'none';
+
+  // "Would-fire" събития - само при преход (rising edge), за измерване на
+  // качеството по-късно (forward return от `price`), БЕЗ известия.
+  const pushEvent = (ev) => { d.events.push(ev); if (d.events.length > LIQ_DIAG_MAX_EVENTS) d.events.splice(0, d.events.length - LIQ_DIAG_MAX_EVENTS); };
+  if (usable && cascade.bullish && !d.prevShadow.cascadeBull) pushEvent({ at: now, kind: 'cascade', direction: 'long', price, side1Usd: cascade.buySumUsd, side2Usd: cascade.sellSumUsd });
+  if (usable && cascade.bearish && !d.prevShadow.cascadeBear) pushEvent({ at: now, kind: 'cascade', direction: 'short', price, side1Usd: cascade.buySumUsd, side2Usd: cascade.sellSumUsd });
+  if (gKey !== 'none' && gKey !== d.prevShadow.gravityKey) pushEvent({ at: now, kind: 'gravity', direction: gDir, tier: gTier, score: gMax, price, clusterPrice: gScore.clusterPrice, clusterUsd: gScore.clusterUsd, distancePct: gScore.distancePct });
+  d.prevShadow = { cascadeBull: usable ? cascade.bullish : d.prevShadow.cascadeBull, cascadeBear: usable ? cascade.bearish : d.prevShadow.cascadeBear, gravityKey: gKey };
+
+  d.timeline.push({
+    at: now, status: fetchResult.status, source, coverageComplete, price,
+    side1Usd15m: usable ? Math.round(cascade.buySumUsd) : null, side2Usd15m: usable ? Math.round(cascade.sellSumUsd) : null,
+    legacySide1Usd15m: Math.round(legacyBuyUsd || 0), legacySide2Usd15m: Math.round(legacySellUsd || 0),
+    gravityTier: gTier, gravityDistancePct: gScore.distancePct != null ? Math.round(gScore.distancePct * 100) / 100 : null,
+  });
+  if (d.timeline.length > LIQ_DIAG_MAX_TIMELINE) d.timeline.splice(0, d.timeline.length - LIQ_DIAG_MAX_TIMELINE);
+
+  return { diag: d, shadow: { cascade, gravity: { tier: gTier, direction: gDir, score: gMax, cluster } } };
+}
+
+async function loadLiqDiagState(env, symbol) {
+  if (!env?.ALERT_STATE) return null;
+  const raw = await env.ALERT_STATE.get(`${LIQ_DIAG_KV_PREFIX}${symbol}`);
+  return raw ? JSON.parse(raw) : null;
+}
+async function saveLiqDiagState(env, symbol, diag) {
+  if (!env?.ALERT_STATE) return;
+  await env.ALERT_STATE.put(`${LIQ_DIAG_KV_PREFIX}${symbol}`, JSON.stringify(diag));
+}
+
+// Целият shadow цикъл за един символ. НИКОГА не хвърля - диагностиката не
+// може да прекъсне scanSymbolSignals.
+async function runLiqShadowDiagnostics(env, symbol, fetchPromise, ctx) {
+  try {
+    const fetchResult = await fetchPromise;
+    if (!fetchResult) return null;
+    const prev = await loadLiqDiagState(env, symbol);
+    const { diag } = applyLiqShadowStep(prev, fetchResult, ctx);
+    await saveLiqDiagState(env, symbol, diag);
+    return diag;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Агрегат за /liq-diagnostics - чиста функция (без KV), тества се директно.
+function buildLiqDiagSummary(entries) {
+  const bySymbol = {};
+  const totals = {};
+  const neverOk = [], unverifiedCoins = [], withEvents = [];
+  for (const { symbol, diag } of entries) {
+    if (!diag) { bySymbol[symbol] = null; neverOk.push(symbol); continue; }
+    for (const [k, v] of Object.entries(diag.counts || {})) totals[k] = (totals[k] || 0) + v;
+    if (!diag.lastOkAt) neverOk.push(symbol);
+    if (diag.last && !diag.last.coinVerified) unverifiedCoins.push({ symbol, coin: diag.last.coin, baseAssets: diag.baseAssets });
+    const evCount = (diag.events || []).length;
+    if (evCount) withEvents.push({ symbol, events: evCount });
+    bySymbol[symbol] = {
+      last: diag.last, counts: diag.counts, lastOkAt: diag.lastOkAt, maxCount: diag.maxCount,
+      truncatedSuspectCount: diag.truncatedSuspectCount, pairCounts: diag.pairCounts, baseAssets: diag.baseAssets,
+      sources: diag.sources || {}, coverageIncompleteCount: diag.coverageIncompleteCount || 0, coverageReasons: diag.coverageReasons || {},
+      cascadeMax: diag.cascadeMax, cascadeHist: diag.cascadeHist,
+      gravityBuckets: Object.keys(diag.shadowGravity?.buckets || {}).length,
+      gravityLastSeenTime: diag.shadowGravity?.lastSeenTime ?? 0,
+      events: evCount,
+    };
+  }
+  return { symbols: entries.length, totals, neverOk, unverifiedCoins, withEvents, bySymbol };
+}
+
+// Ръчна проба (само през /liq-diagnostics/probe, с token): сравнява legacy
+// заявката (pair, 1:1 с production) срещу coin заявката за ЕДИН символ.
+// coin пробата е с min_liquidation_amount=100000 (документиран таван 200
+// записа) и 60-мин прозорец - лека. Без ключ в изхода.
+async function runLiqDiagProbe(env, symbol, { coinOverride = null, fetchImpl = null, now = Date.now() } = {}) {
+  const strip = (r) => { const { orders, ...rest } = r; return { ...rest, sample: orders.slice(0, 3) }; };
+  // legacy: pair (BTCUSDT) + min=1 като production; 60-мин прозорец вместо
+  // 7-дневния default, за да е лека дори ако pair-ът неочаквано върне данни.
+  const legacy = await fetchLiquidationOrdersDiag(env, symbol, { now, lookbackMs: 60 * 60000, minAmount: 1, coinOverride: symbol, fetchImpl });
+  const coin = await fetchLiquidationOrdersDiag(env, symbol, { now, lookbackMs: 60 * 60000, minAmount: 100000, coinOverride, fetchImpl });
+  let verdict = 'inconclusive';
+  if (legacy.status === 'empty' && coin.status === 'ok') verdict = 'symbol_format_bug_confirmed';
+  else if (legacy.status === 'api_error' || coin.status === 'api_error') verdict = 'api_error_plan_or_auth';
+  else if (legacy.status === 'ok') verdict = 'legacy_pair_returns_data';
+  else if (legacy.status === 'empty' && coin.status === 'empty') verdict = 'both_empty_quiet_market_or_other';
+  return { symbol, verdict, legacy: strip(legacy), coin: strip(coin) };
+}
+
 // ============================================================================
 // PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
 // HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
@@ -4460,6 +4785,10 @@ async function scanSymbolSignals(env, symbol) {
   // Long-Short/funding - последните две вече се теглят от checkMacroSqueeze за
   // друга цел, тук е отделно извикване, огледално на съществуващия прецедент).
   // НЕ променя по никакъв начин longScore/shortScore/confidence по-горе.
+  // COINGLASS LIQUIDATION DIAGNOSTICS (shadow) - стартира паралелно с
+  // Promise.all по-долу, САМО при env.LIQ_DIAG_ENABLED === '1'. Legacy
+  // liquidationOrders заявката остава непроменена.
+  const liqDiagFetchPromise = isLiqDiagEnabled(env) ? fetchLiquidationOrdersShadow(env, symbol).catch(() => null) : null;
   const [oiHist, wallsRaw, chg24h, longShortCycle, fundingCycle, liquidationOrders, takerHist] = await Promise.all([
     fetchOpenInterestHistWorker(env, symbol, '5m', 13),
     fetchOrderBookWallsWorker(env, symbol, price),
@@ -4737,6 +5066,14 @@ async function scanSymbolSignals(env, symbol) {
   const liqGravityKey = liqGravityTier !== 'none' ? `${liqGravityDirection}:${liqGravityTier}` : 'none';
   const liqGravityFired = liqGravityCanFire(state, liqGravityKey, liqGravityDirection);
   if (liqGravityFired) markLiqGravityFired(state, liqGravityKey, liqGravityDirection);
+  // COINGLASS LIQUIDATION DIAGNOSTICS (shadow) - само записва в `liqdiag:`
+  // KV; не чете/пише `state`, не влияе на никоя стойност в този return.
+  if (liqDiagFetchPromise) {
+    await runLiqShadowDiagnostics(env, symbol, liqDiagFetchPromise, {
+      price, oiDeltaPct, takerDelta: takerFlow.delta5m, volAccel,
+      legacyBuyUsd: liquidationCascade.buySumUsd, legacySellUsd: liquidationCascade.sellSumUsd,
+    });
+  }
 
   // ENTRY ENGINE - ЕТАП 1: "SETUP" (виж calcSetupState по-горе) - реюзва вече
   // изчислените TARGET/VAH/VAL/TRAP/AUCTION/MIGRATION резултати по-горе, БЕЗ
@@ -7085,6 +7422,13 @@ export {
   buildTelemetryIntegrityDiagnostics,
   // PR #141 review fix - изложени само за unit тестове.
   buildTcMissingEpisodeIds, buildTcCohortStatus, listKvKeysWithTruncation,
+  // COINGLASS LIQUIDATION DIAGNOSTICS - изложени само за unit тестове.
+  fetchLiquidationOrdersWorker, calcLiquidationCascade, accumulateLiquidationGravity,
+  findNearestLiquidationCluster, calcLiquidationGravityScore, getLiquidationGravityTier,
+  isLiqDiagEnabled, toCoinGlassCoin, classifyCoinGlassLiqResponse, normalizeLiqDiagOrders,
+  buildLiqDiagUrl, fetchLiquidationOrdersDiag, detectLiqDiagTruncation, applyLiqShadowStep,
+  runLiqShadowDiagnostics, buildLiqDiagSummary, runLiqDiagProbe, WATCHLIST,
+  fetchLiquidationOrdersRelayDiag, getLiqDiagSource, fetchLiquidationOrdersShadow,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
@@ -7298,6 +7642,36 @@ export default {
     // по-горе). Fail-closed token auth (TELEMETRY_TOKEN secret), огледално на
     // /tv-alert по-горе. Чисто READ - никакво управление/промяна на прагове,
     // само извличане на вече натрупаните telemetry: KV записи за анализ.
+    // COINGLASS LIQUIDATION DIAGNOSTICS - read-only (KV `liqdiag:`), + ръчна
+    // проба за ЕДИН символ от WATCHLIST. Същата TELEMETRY_TOKEN защита.
+    // API ключът никога не се връща.
+    if ((path === "/liq-diagnostics" || path === "/liq-diagnostics/probe") && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+      if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
+      const watch = WATCHLIST.map(w => w.symbol);
+      const symbolParam = (url.searchParams.get("symbol") || "").trim().toUpperCase();
+      if (symbolParam && !watch.includes(symbolParam)) return json({ error: "symbol not in WATCHLIST" }, 400);
+      if (path === "/liq-diagnostics/probe") {
+        if (!symbolParam) return json({ error: "symbol required" }, 400);
+        if ((url.searchParams.get("source") || "").trim().toLowerCase() === "relay") {
+          const { orders, ...rest } = await fetchLiquidationOrdersRelayDiag(env, symbolParam);
+          return json({ symbol: symbolParam, source: "relay", ...rest, sample: orders.slice(0, 3) });
+        }
+        const coinParam = (url.searchParams.get("coin") || "").trim().toUpperCase();
+        if (coinParam && !/^[A-Z0-9]{1,20}$/.test(coinParam)) return json({ error: "invalid coin" }, 400);
+        return json(await runLiqDiagProbe(env, symbolParam, { coinOverride: coinParam || null }));
+      }
+      if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
+      const symbols = symbolParam ? [symbolParam] : watch;
+      const entries = await Promise.all(symbols.map(async symbol => ({ symbol, diag: await loadLiqDiagState(env, symbol) })));
+      const summary = buildLiqDiagSummary(entries);
+      summary.enabled = isLiqDiagEnabled(env);
+      summary.source = getLiqDiagSource(env);
+      if (url.searchParams.get("full") === "1") summary.raw = Object.fromEntries(entries.map(e => [e.symbol, e.diag]));
+      return json(summary);
+    }
     if (path === "/telemetry" && request.method === "GET") {
       const suppliedToken = (url.searchParams.get("token") || "").trim();
       const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
