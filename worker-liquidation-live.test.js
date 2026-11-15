@@ -26,8 +26,10 @@ import path from 'path';
 import { pathToFileURL } from 'url';
 import {
   isLiqLiveEnabled, fetchLiquidationOrdersLive, liqConfirmStatus, LIQ_CONFIRM_LABELS,
-  buildTelemetryRecord, scanSymbolSignals,
+  buildTelemetryRecord, scanSymbolSignals, buildLiqConfirmLine,
+  calcLiquidationCascade, accumulateLiquidationGravity,
 } from './worker/worker.js';
+const workerSrc = fs.readFileSync('./worker/worker.js', 'utf8');
 
 const realFetch = globalThis.fetch;
 const realNow = Date.now;
@@ -280,5 +282,234 @@ describe('(E) END-TO-END scanSymbolSignals - LIQ_LIVE_ENABLED', () => {
       const sig = JSON.parse(kv.m.get('sigstate:BTCUSDT'));
       expect(sig.liqGravity.buckets['1']).toBe(100); // непипнато - reset-ът е еднократен и вече е станал
     });
+  });
+});
+
+describe('(F) buildLiqConfirmLine - WhatsApp ред (ARMED + ENTRY NOW CONFIRMED, MR и TC)', () => {
+  const bullish = { bullish: true, bearish: false };
+  const bearish = { bullish: false, bearish: true };
+  it('флаг изключен -> винаги null, независимо от cascade/hasData (съобщението остава без ред)', () => {
+    expect(buildLiqConfirmLine(false, bullish, true, 'long')).toBeNull();
+    expect(buildLiqConfirmLine(false, null, false, 'short')).toBeNull();
+  });
+  it('флаг включен -> точният label, съответстващ на liqConfirmStatus за 4-те състояния', () => {
+    expect(buildLiqConfirmLine(true, bullish, true, 'long')).toBe(LIQ_CONFIRM_LABELS.confirm);
+    expect(buildLiqConfirmLine(true, bearish, true, 'long')).toBe(LIQ_CONFIRM_LABELS.against);
+    expect(buildLiqConfirmLine(true, { bullish: false, bearish: false }, true, 'long')).toBe(LIQ_CONFIRM_LABELS.neutral);
+    expect(buildLiqConfirmLine(true, bullish, false, 'long')).toBe(LIQ_CONFIRM_LABELS.no_data);
+  });
+
+  // Структурна проверка на wiring-а в РЕАЛНИЯ изходен код (не само функцията
+  // изолирано) - доказва, че и четирите WhatsApp блока (ARMED MR/TC, ENTRY
+  // CONFIRMED MR/TC) реално викат buildLiqConfirmLine с правилната посока, и
+  // че редът е conditional (никога безусловен push) - запазва байт-
+  // идентичността на старите съобщения при изключен флаг.
+  it('ARMED (MR) вика buildLiqConfirmLine(liqLiveEnabled, liquidationCascade, liquidationHasData, armedDirection) СЛЕД предупредителния ред', () => {
+    const warnIdx = workerSrc.indexOf('⚠️ Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3)`,\n        ];');
+    const liqCallIdx = workerSrc.indexOf('buildLiqConfirmLine(liqLiveEnabled, liquidationCascade, liquidationHasData, armedDirection)');
+    expect(warnIdx).toBeGreaterThan(-1);
+    expect(liqCallIdx).toBeGreaterThan(warnIdx);
+    expect(liqCallIdx).toBeLessThan(warnIdx + 400); // веднага след, не произволно по-долу във файла
+  });
+  it('ARMED (TC) вика buildLiqConfirmLine с trendArmedDirection', () => {
+    expect(workerSrc).toContain('buildLiqConfirmLine(liqLiveEnabled, liquidationCascade, liquidationHasData, trendArmedDirection)');
+  });
+  it('ENTRY NOW - CONFIRMED (MR) - entryLiqLine (от entryResult.direction) е позициониран МЕЖДУ HTF CONTEXT и BOTH QUALITY в съобщението', () => {
+    expect(workerSrc).toContain('buildLiqConfirmLine(liqLiveEnabled, liquidationCascade, liquidationHasData, entryResult.direction)');
+    const htfIdx = workerSrc.indexOf('`HTF CONTEXT: ${entryResult.htfAligned ? \'✓\' : \'—\'}`,');
+    const usageIdxAll = [...workerSrc.matchAll(/\.\.\.\(entryLiqLine \? \[entryLiqLine\] : \[\]\),/g)].map(m => m.index);
+    const bothQualityIdx = workerSrc.indexOf('BOTH QUALITY (виж classifyBothQuality по-горе) -\n            // маркиране за ВСЯКА TC+MR same-tick');
+    expect(htfIdx).toBeGreaterThan(-1);
+    expect(usageIdxAll).toHaveLength(2); // MR + TC
+    const mrUsageIdx = usageIdxAll.find(i => i > htfIdx);
+    expect(mrUsageIdx).toBeGreaterThan(htfIdx);
+    expect(bothQualityIdx).toBeGreaterThan(mrUsageIdx);
+  });
+  it('ENTRY NOW - CONFIRMED (TC) вика buildLiqConfirmLine с trendEntryResult.direction', () => {
+    expect(workerSrc).toContain('buildLiqConfirmLine(liqLiveEnabled, liquidationCascade, liquidationHasData, trendEntryResult.direction)');
+  });
+  it('и четирите call site-а подават реда УСЛОВНО (spread/if), никога безусловен push - старите съобщения остават непроменени при изключен флаг', () => {
+    expect((workerSrc.match(/buildLiqConfirmLine\(liqLiveEnabled, liquidationCascade, liquidationHasData, \w+(\.\w+)?\)/g) || [])).toHaveLength(4);
+    expect(workerSrc).toContain('if (armedLiqLine) armedLines.push(armedLiqLine);');
+    expect(workerSrc).toContain('if (trendArmedLiqLine) trendArmedLines.push(trendArmedLiqLine);');
+    expect((workerSrc.match(/\.\.\.\(entryLiqLine \? \[entryLiqLine\] : \[\]\),/g) || [])).toHaveLength(2); // MR + TC ENTRY блокове
+  });
+});
+
+describe('(G) PHASE CYCLE - правилна интерпретация на Binance BUY/SELL посоката', () => {
+  const FIXED_NOW = 1800000000000;
+  const IV = { '5m': 300000, '15m': 900000, '1h': 3600000, '4h': 14400000, '1d': 86400000 };
+  function klines(interval, limit) {
+    const step = IV[interval] || 60000;
+    const out = [];
+    for (let i = limit - 1; i >= 0; i--) {
+      const t = FIXED_NOW - (i + 1) * step;
+      const base = 100000 + Math.sin((limit - i) / 7) * 2000 + (limit - i) * 3;
+      out.push([t, String(base), String(base * 1.004), String(base * 0.996), String(base * 1.001), '1234.5', t + step - 1, '123450000', 1000, '600', '60000000', '0']);
+    }
+    return out;
+  }
+  function makeKv() {
+    const m = new Map();
+    return { m, get: async (k) => (m.has(k) ? m.get(k) : null), put: async (k, v) => { m.set(k, v); }, delete: async (k) => { m.delete(k); }, list: async () => ({ keys: [], list_complete: true }) };
+  }
+  // fundingRate=0.001 -> funding=0.1 >= TOP_WATCH_FUNDING_MIN (0.06) - форсира
+  // isTopWatch()=true, за да се изчисли cycleShortScore (иначе е gate-нат зад
+  // TOP WATCH и винаги би бил 0, независимо от bearish каскадата).
+  function router({ relayEvents = [], forceTopWatch = false } = {}) {
+    return async (url) => {
+      const s = String(url);
+      if (s.includes('/liquidations?')) {
+        return new Response(JSON.stringify({ symbol: 'BTCUSDT', count: relayEvents.length, truncated: false, events: relayEvents, coverage: { complete: true, reasons: [], gaps: [], connected: true } }), { status: 200 });
+      }
+      if (s.includes('/klines')) {
+        const u = new URL(s);
+        return new Response(JSON.stringify(klines(u.searchParams.get('interval'), Number(u.searchParams.get('limit')))), { status: 200 });
+      }
+      if (forceTopWatch && s.includes('/funding')) {
+        return new Response(JSON.stringify([{ fundingRate: '0.001' }]), { status: 200 });
+      }
+      return new Response(JSON.stringify({ code: -1, msg: 'mock unavailable' }), { status: 503 });
+    };
+  }
+  function env(extra = {}) {
+    return { RELAY_URL: 'https://relay.mock', RELAY_TOKEN: 'relay-secret-xyz', LIQ_LIVE_ENABLED: '1', ...extra };
+  }
+
+  it("Binance BUY (side=1, принудително затворен SHORT -> бичи натиск) -> cascade.bullish=true -> cycleLongScore с +1 кредит спрямо baseline без ликвидация", async () => {
+    Date.now = () => FIXED_NOW;
+    globalThis.fetch = router({ relayEvents: [] });
+    const baseline = await scanSymbolSignals(env({ ALERT_STATE: makeKv() }), 'BTCUSDT');
+
+    Date.now = () => FIXED_NOW;
+    globalThis.fetch = router({ relayEvents: [{ side: 1, usdValue: 600000, time: FIXED_NOW - 30000, price: 99500 }] });
+    const withBuy = await scanSymbolSignals(env({ ALERT_STATE: makeKv() }), 'BTCUSDT');
+
+    expect(withBuy.liquidationCascade.bullish).toBe(true);
+    expect(withBuy.liquidationCascade.bearish).toBe(false);
+    expect(withBuy.cycleLongScore).toBe(baseline.cycleLongScore + 1);
+  });
+
+  it("Binance SELL (side=2, принудително затворен LONG -> мечи натиск) -> cascade.bearish=true -> cycleShortScore с +1 кредит спрямо baseline (TOP WATCH форсиран)", async () => {
+    Date.now = () => FIXED_NOW;
+    globalThis.fetch = router({ relayEvents: [], forceTopWatch: true });
+    const baseline = await scanSymbolSignals(env({ ALERT_STATE: makeKv() }), 'BTCUSDT');
+    expect(baseline.cyclePhase).toBeDefined(); // sanity - топ watch път реално се изпълнява
+
+    Date.now = () => FIXED_NOW;
+    globalThis.fetch = router({ relayEvents: [{ side: 2, usdValue: 600000, time: FIXED_NOW - 30000, price: 100500 }], forceTopWatch: true });
+    const withSell = await scanSymbolSignals(env({ ALERT_STATE: makeKv() }), 'BTCUSDT');
+
+    expect(withSell.liquidationCascade.bearish).toBe(true);
+    expect(withSell.liquidationCascade.bullish).toBe(false);
+    expect(withSell.cycleShortScore).toBe(baseline.cycleShortScore + 1);
+  });
+
+  it('BUY каскада НЕ дава кредит на cycleShortScore, SELL каскада НЕ дава кредит на cycleLongScore (посоката не се разменя/разлива в грешния score)', async () => {
+    Date.now = () => FIXED_NOW;
+    globalThis.fetch = router({ relayEvents: [], forceTopWatch: true });
+    const baseline = await scanSymbolSignals(env({ ALERT_STATE: makeKv() }), 'BTCUSDT');
+
+    Date.now = () => FIXED_NOW;
+    globalThis.fetch = router({ relayEvents: [{ side: 1, usdValue: 600000, time: FIXED_NOW - 30000, price: 99500 }], forceTopWatch: true });
+    const withBuy = await scanSymbolSignals(env({ ALERT_STATE: makeKv() }), 'BTCUSDT');
+    expect(withBuy.cycleShortScore).toBe(baseline.cycleShortScore); // непроменен - BUY не е bearish
+
+    Date.now = () => FIXED_NOW;
+    globalThis.fetch = router({ relayEvents: [{ side: 2, usdValue: 600000, time: FIXED_NOW - 30000, price: 100500 }] });
+    const withSell = await scanSymbolSignals(env({ ALERT_STATE: makeKv() }), 'BTCUSDT');
+    const baselineNoTopWatch = await (async () => {
+      Date.now = () => FIXED_NOW;
+      globalThis.fetch = router({ relayEvents: [] });
+      return scanSymbolSignals(env({ ALERT_STATE: makeKv() }), 'BTCUSDT');
+    })();
+    expect(withSell.cycleLongScore).toBe(baselineNoTopWatch.cycleLongScore); // непроменен - SELL не е bullish
+  });
+
+  it('под прага (LIQUIDATION_CASCADE_USD_MIN=500хил.) -> нито bullish, нито bearish, независимо от side', async () => {
+    Date.now = () => FIXED_NOW;
+    globalThis.fetch = router({ relayEvents: [{ side: 1, usdValue: 100000, time: FIXED_NOW - 30000, price: 99500 }] });
+    const r1 = await scanSymbolSignals(env({ ALERT_STATE: makeKv() }), 'BTCUSDT');
+    expect(r1.liquidationCascade).toEqual({ bullish: false, bearish: false, buySumUsd: 100000, sellSumUsd: 0 });
+
+    Date.now = () => FIXED_NOW;
+    globalThis.fetch = router({ relayEvents: [{ side: 2, usdValue: 100000, time: FIXED_NOW - 30000, price: 100500 }] });
+    const r2 = await scanSymbolSignals(env({ ALERT_STATE: makeKv() }), 'BTCUSDT');
+    expect(r2.liquidationCascade).toEqual({ bullish: false, bearish: false, buySumUsd: 0, sellSumUsd: 100000 });
+  });
+});
+
+describe('(H) Остарели/непълни данни - НИКОГА фалшиво потвърждение', () => {
+  const env = { RELAY_URL: 'https://relay.mock', RELAY_TOKEN: 'relay-secret-xyz' };
+  it('relay връща реални bullish събития, НО coverage.complete=false (gap по време на прозореца) -> hasData=false, liqConfirmStatus НИКОГА confirm', async () => {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      events: [{ side: 1, usdValue: 900000, time: Date.now(), price: 100 }],
+      coverage: { complete: false, reasons: ['gap'], gaps: [{ from: 1, to: 2, reason: 'ws_disconnect' }], connected: true },
+    }), { status: 200 });
+    const r = await fetchLiquidationOrdersLive(env, 'BTCUSDT');
+    expect(r.hasData).toBe(false);
+    expect(r.orders).toHaveLength(1); // данните се подават на CASCADE/GRAVITY (частично по-добре от нищо)
+    // Дори със съдържание, което БИ дало bullish=true, confirm статусът остава no_data.
+    const cascade = calcLiquidationCascade(r.orders);
+    expect(cascade.bullish).toBe(true);
+    expect(liqConfirmStatus(cascade, r.hasData, 'long')).toBe('no_data'); // НИКОГА 'confirm'
+  });
+  it('relay не е свързан (connected:false) въпреки complete:true по текст - все пак третираме стриктно само по coverage.complete', async () => {
+    // defensive doc-тест: ако бъдещ relay вариант някога изпрати противоречиви
+    // полета, hasData зависи ИЗРИЧНО от coverage.complete===true, не от connected.
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      events: [{ side: 1, usdValue: 900000, time: Date.now(), price: 100 }],
+      coverage: { complete: true, reasons: [], gaps: [], connected: false },
+    }), { status: 200 });
+    const r = await fetchLiquidationOrdersLive(env, 'BTCUSDT');
+    expect(r.hasData).toBe(true); // complete:true е единственият критерий, както е документирано
+  });
+  it('липсващо coverage поле изцяло (непознат relay формат) -> coverageComplete=null -> hasData=false, НЕ се приема за надеждно', async () => {
+    globalThis.fetch = async () => new Response(JSON.stringify({ events: [{ side: 1, usdValue: 900000, time: Date.now(), price: 100 }] }), { status: 200 });
+    const r = await fetchLiquidationOrdersLive(env, 'BTCUSDT');
+    expect(r.hasData).toBe(false);
+  });
+});
+
+describe('(I) LIQUIDATION GRAVITY - акумулацията е коректна независимо от BUY/SELL side', () => {
+  it('BUY и SELL поръчки в СЪЩОТО ценово кошче се натрупват заедно (клъстерната "сила" е по USD обем, не по посока - direction-ът идва от разстоянието цена/клъстер, не от side)', () => {
+    const state = {};
+    accumulateLiquidationGravity(state, [
+      { side: 1, usdValue: 300000, time: 1000, price: 100 },
+      { side: 2, usdValue: 200000, time: 2000, price: 100.001 }, // почти същата цена -> същото log-bucket
+    ]);
+    const buckets = Object.values(state.liqGravity.buckets);
+    expect(buckets).toHaveLength(1);
+    expect(buckets[0]).toBe(500000); // и двете посоки допринасят за силата на клъстера
+  });
+  it('lastSeenTime напредва само напред, независимо от side на последната обработена поръчка', () => {
+    const state = {};
+    accumulateLiquidationGravity(state, [{ side: 2, usdValue: 100000, time: 5000, price: 50 }]);
+    expect(state.liqGravity.lastSeenTime).toBe(5000);
+    accumulateLiquidationGravity(state, [{ side: 1, usdValue: 100000, time: 3000, price: 50 }]); // по-стара от lastSeenTime
+    expect(state.liqGravity.lastSeenTime).toBe(5000); // непроменено - вече обработена/по-стара поръчка, без двойно броене
+    const buckets = Object.values(state.liqGravity.buckets);
+    expect(buckets[0]).toBe(100000); // по-старата поръчка НЕ е добавена повторно
+  });
+});
+
+describe('(J) calcLiquidationCascade - директна проверка на side -> посока конвенцията (изолирано от целия pipeline)', () => {
+  it('side=1 (Binance BUY, форсирано затворен SHORT) -> bullish=true, bearish=false', () => {
+    const r = calcLiquidationCascade([{ side: 1, usdValue: 600000, time: Date.now(), price: 100 }]);
+    expect(r).toEqual({ bullish: true, bearish: false, buySumUsd: 600000, sellSumUsd: 0 });
+  });
+  it('side=2 (Binance SELL, форсирано затворен LONG) -> bearish=true, bullish=false', () => {
+    const r = calcLiquidationCascade([{ side: 2, usdValue: 600000, time: Date.now(), price: 100 }]);
+    expect(r).toEqual({ bullish: false, bearish: true, buySumUsd: 0, sellSumUsd: 600000 });
+  });
+  it('смесени side в прозореца - сумите се броят отделно по side, каскадата е bullish И bearish едновременно ако и двете минат прага', () => {
+    const r = calcLiquidationCascade([
+      { side: 1, usdValue: 550000, time: Date.now(), price: 100 },
+      { side: 2, usdValue: 520000, time: Date.now(), price: 100 },
+    ]);
+    expect(r.bullish).toBe(true);
+    expect(r.bearish).toBe(true);
+    expect(r.buySumUsd).toBe(550000);
+    expect(r.sellSumUsd).toBe(520000);
   });
 });

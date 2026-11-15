@@ -3907,12 +3907,21 @@ function isLiqLiveEnabled(env) {
 // Реюзва fetchLiquidationOrdersRelayDiag (вече тествана shadow функция) -
 // идентична {side,usdValue,time,price} форма, side конвенция 1=Buy/2=Sell
 // огледална на CoinGlass (виж relay/liquidation-collector.js). hasData
-// разграничава "relay недостъпен/грешка" (status != ok/empty) от "данни
-// получени, но прозорецът е празен" (status === empty, легитимен нулев
-// резултат) - вижда се в caller-а чрез liqConfirmStatus по-долу.
+// разграничава "relay недостъпен/грешка/остарели данни" от "данни получени,
+// надеждни, прозорецът може просто да е празен" - вижда се в caller-а чрез
+// liqConfirmStatus по-долу. СТРОГО изискване: освен status ok/empty, трябва
+// И coverageComplete === true (не false, не null/непознато) - непълно
+// покритие (relay gap/прекъсване точно по време на заявения прозорец, виж
+// relay/liquidation-collector.js:coverage()) означава, че реални ликвидации
+// може да липсват от отговора - НИКОГА не го третираме като надеждна основа
+// за confirm/against (виж изискването "остарели данни не водят до фалшиво
+// потвърждение"). orders се подават на calcLiquidationCascade/
+// accumulateLiquidationGravity НЕЗАВИСИМО от hasData - частични данни остават
+// по-добри от нищо за самото натрупване/score, огледално на legacy
+// поведението (CoinGlass никога не е имало concept за "coverage" изобщо).
 async function fetchLiquidationOrdersLive(env, symbol) {
   const result = await fetchLiquidationOrdersRelayDiag(env, symbol);
-  const hasData = result.status === 'ok' || result.status === 'empty';
+  const hasData = (result.status === 'ok' || result.status === 'empty') && result.coverageComplete === true;
   return { orders: result.orders, hasData };
 }
 
@@ -3937,6 +3946,15 @@ const LIQ_CONFIRM_LABELS = {
   neutral: 'LIQ: — неутрално',
   no_data: 'LIQ: — няма данни',
 };
+
+// Единствената точка, от която ARMED/ENTRY WhatsApp съобщенията (и MR, и TC
+// варианта - виж 4-те call site-а в processWatchlistSymbol) вземат новия LIQ
+// ред - връща null при изключен флаг (caller-ът НЕ добавя ред, съобщението
+// остава байт-идентично на старото), иначе точно един от 4-те label-а по-горе.
+function buildLiqConfirmLine(liqLiveEnabled, cascade, hasData, direction) {
+  if (!liqLiveEnabled) return null;
+  return LIQ_CONFIRM_LABELS[liqConfirmStatus(cascade, hasData, direction)];
+}
 
 function liqDiagUsdBin(usd) {
   let idx = 0;
@@ -5832,7 +5850,8 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
         // BINANCE LIQUIDATION LIVE - само информативно (виж liqConfirmStatus
         // по-горе), НЕ влияе на ARMED решението. liqLiveEnabled=false ->
         // редът не се добавя изобщо, съобщението остава байт-идентично.
-        if (liqLiveEnabled) armedLines.push(LIQ_CONFIRM_LABELS[liqConfirmStatus(liquidationCascade, liquidationHasData, armedDirection)]);
+        const armedLiqLine = buildLiqConfirmLine(liqLiveEnabled, liquidationCascade, liquidationHasData, armedDirection);
+        if (armedLiqLine) armedLines.push(armedLiqLine);
         batch.push(armedLines.join('\n'));
       }
       // ENTRY ENGINE - ЕТАП 3: "ENTRY TRIGGER" (виж calcEntryTrigger по-горе) -
@@ -5848,6 +5867,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
           // WhatsApp известия (SETUP/ARMED/PHASE CYCLE и т.н.), защото това е
           // единственият момент с конкретна входна цена за forward тестване.
           // Данните вътре са same - само визуалният layout е нов.
+          const entryLiqLine = buildLiqConfirmLine(liqLiveEnabled, liquidationCascade, liquidationHasData, entryResult.direction);
           const entryLines = [
             `🚨🚨🚨 ENTRY NOW — CONFIRMED 🚨🚨🚨`,
             ``,
@@ -5866,7 +5886,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
             // BINANCE LIQUIDATION LIVE - само информативно (виж
             // liqConfirmStatus по-горе), НЕ влияе на ENTRY SCORE/QUALITY TIER
             // в тази стъпка. liqLiveEnabled=false -> редът липсва изцяло.
-            ...(liqLiveEnabled ? [LIQ_CONFIRM_LABELS[liqConfirmStatus(liquidationCascade, liquidationHasData, entryResult.direction)]] : []),
+            ...(entryLiqLine ? [entryLiqLine] : []),
             // PR #104/#119 - BOTH QUALITY (виж classifyBothQuality по-горе) -
             // маркиране за ВСЯКА TC+MR same-tick BOTH комбинация (не само
             // tc3_mr3) - данните показват, че всички both комбинации
@@ -5923,7 +5943,8 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
           `⚡ ARMED ${trendArmedDirection === 'long' ? 'LONG' : 'SHORT'} ${symbolNoUsdt} (TREND CONTINUATION)`,
           `⚠️ Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3)`,
         ];
-        if (liqLiveEnabled) trendArmedLines.push(LIQ_CONFIRM_LABELS[liqConfirmStatus(liquidationCascade, liquidationHasData, trendArmedDirection)]);
+        const trendArmedLiqLine = buildLiqConfirmLine(liqLiveEnabled, liquidationCascade, liquidationHasData, trendArmedDirection);
+        if (trendArmedLiqLine) trendArmedLines.push(trendArmedLiqLine);
         batch.push(trendArmedLines.join('\n'));
       }
       if (trendEntryResult.status === 'entry' || trendEntryResult.status === 'missed') {
@@ -5932,6 +5953,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
         if (trendEntryResult.status === 'entry') {
           // Козметично форматиране (виж бележката при mean_reversion ENTRY
           // CONFIRMED по-горе) - огледално, само MODE-редът е различен.
+          const entryLiqLine = buildLiqConfirmLine(liqLiveEnabled, liquidationCascade, liquidationHasData, trendEntryResult.direction);
           const entryLines = [
             `🚨🚨🚨 ENTRY NOW — CONFIRMED 🚨🚨🚨`,
             ``,
@@ -5948,7 +5970,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
             `FLOW: ${trendEntryResult.flowBoost ? '✓' : '—'}`,
             `HTF CONTEXT: ${trendEntryResult.htfAligned ? '✓' : '—'}`,
             // BINANCE LIQUIDATION LIVE - виж бележката при mean_reversion ENTRY по-горе.
-            ...(liqLiveEnabled ? [LIQ_CONFIRM_LABELS[liqConfirmStatus(liquidationCascade, liquidationHasData, trendEntryResult.direction)]] : []),
+            ...(entryLiqLine ? [entryLiqLine] : []),
             // PR #104/#119 - BOTH QUALITY (виж classifyBothQuality по-горе) -
             // маркиране за ВСЯКА TC+MR same-tick BOTH комбинация (не само
             // tc3_mr3) - данните показват, че всички both комбинации
@@ -7528,6 +7550,7 @@ export {
   fetchLiquidationOrdersRelayDiag, getLiqDiagSource, fetchLiquidationOrdersShadow,
   // BINANCE LIQUIDATION LIVE - изложени само за unit тестове.
   isLiqLiveEnabled, fetchLiquidationOrdersLive, liqConfirmStatus, LIQ_CONFIRM_LABELS,
+  buildLiqConfirmLine,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
