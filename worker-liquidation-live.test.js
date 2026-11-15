@@ -12,16 +12,15 @@
 //     (по подразбиране null, когато LIQ_LIVE е изключен).
 // (E) END-TO-END scanSymbolSignals:
 //     - LIQ_LIVE_ENABLED ИЗКЛЮЧЕН (default) -> резултат/sigstate БАЙТ-
-//       ИДЕНТИЧНИ с оригиналния worker.js (преди тази промяна, origin/main) -
-//       доказва нулева регресия за всички съществуващи потребители на флага.
+//       ИДЕНТИЧНИ с оригиналния worker.js (статичен snapshot отпреди тази
+//       PR, виж test-fixtures/) - доказва нулева регресия за всички
+//       съществуващи потребители на флага.
 //     - ВКЛЮЧЕН -> calcLiquidationCascade/accumulateLiquidationGravity се
 //       захранват от реални Binance relay данни; еднократен reset на
 //       liqGravity при първо активиране; relay грешка/изключване НИКОГА не
 //       се чете като потвърждение (hasData=false -> cascade неутрален).
 import { describe, it, expect, afterEach, beforeAll } from 'vitest';
-import { execSync } from 'child_process';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { pathToFileURL } from 'url';
 import {
@@ -184,15 +183,17 @@ describe('(E) END-TO-END scanSymbolSignals - LIQ_LIVE_ENABLED', () => {
   describe('флаг ИЗКЛЮЧЕН (default) - нулева регресия спрямо оригиналния worker.js', () => {
     let originalScanSymbolSignals;
     beforeAll(async () => {
-      // Дъмпва ТОЧНО кода от origin/main (преди тази PR) във временен файл и
-      // го импортира динамично - "байт-идентично" сравнение срещу РЕАЛНИЯ
-      // стар код, не срещу предположения за старото му поведение.
-      const originalSrc = execSync('git show origin/main:worker/worker.js', { cwd: process.cwd(), maxBuffer: 1024 * 1024 * 50 }).toString();
-      const tmpFile = path.join(os.tmpdir(), `worker-original-${Date.now()}.mjs`);
-      fs.writeFileSync(tmpFile, originalSrc);
-      const mod = await import(pathToFileURL(tmpFile).href);
+      // Статичен snapshot на worker.js ТОЧНО както е бил в origin/main преди
+      // тази PR (commit 47a07dc, md5 ef59bf6f... - същият код, който е
+      // реално качен в production версия 101/102 на Cloudflare). Умишлено
+      // НЕ използваме `git show origin/main:...` тук - CI checkout (actions/
+      // checkout@v4) по подразбиране е плитък (fetch-depth: 1) и НЕ носи
+      // branch/ref история, само последния commit на PR главата - "origin/
+      // main" там не съществува изобщо ("fatal: invalid object name"). Статичен
+      // файл прави теста hermetic - работи еднакво локално и в CI, независимо
+      // от дълбочината на checkout-а.
+      const mod = await import(pathToFileURL(path.resolve('test-fixtures/worker-pre-liquidation-live.mjs')).href);
       originalScanSymbolSignals = mod.scanSymbolSignals;
-      fs.unlinkSync(tmpFile);
     });
 
     it('без LIQ_LIVE_ENABLED - резултат и sigstate са БАЙТ-ИДЕНТИЧНИ с origin/main', async () => {

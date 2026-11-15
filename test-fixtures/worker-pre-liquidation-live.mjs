@@ -1,0 +1,8040 @@
+// ============================================================================
+// Cloudflare Worker: orange-grass-d809
+// ============================================================================
+// 1) HTTP proxy (fetch handler) - непроменена функционалност спрямо оригинала,
+//    само ключовете вече се четат от Worker Secrets (env.*), не са hardcoded в
+//    кода. Signal-scanner/football.html го викат за Yahoo/football-data.org/
+//    api-sports.io/CoinGlass, за да не са ключовете видими в клиентския JS.
+// 2) Cron известия (scheduled handler) - следи личен watchlist за DCA нива и
+//    праща WhatsApp съобщение през CallMeBot (безплатно, без Twilio/Meta акаунт)
+//    когато цената пресече ниво. Виж README.md в тази папка за setup стъпките
+//    (secrets, KV binding, Cron Trigger, CallMeBot активация).
+// ============================================================================
+
+// ---- Личен watchlist -------------------------------------------------------
+// symbol винаги е нужен (Binance формат, напр. 'BTCUSDT'). ВСЕКИ запис се следи
+// за пазарни сигнали (WARMING/HOT/SUPER, MM LONG/SHORT/x25, FLUSH/BASE/SQUEEZE/
+// SHIFT/IMPULSE) - за това entryPrice/side НЕ са нужни. Добавяш ги само ако
+// искаш и DCA известия за конкретна твоя позиция в тази монета.
+const WATCHLIST = [
+  { symbol: 'BTCUSDT' },
+  { symbol: 'ETHUSDT' },
+  { symbol: 'SOLUSDT' },
+  { symbol: 'LTCUSDT' },
+  { symbol: 'SUIUSDT' },
+  { symbol: 'APTUSDT' },
+  { symbol: 'INJUSDT' },
+  { symbol: 'HYPEUSDT' },
+  { symbol: 'RIVERUSDT' },
+  { symbol: 'TAOUSDT' },
+  { symbol: 'ZECUSDT' },
+  { symbol: 'ONDOUSDT' },
+  { symbol: 'WLDUSDT' },
+  { symbol: 'OPUSDT' },
+  { symbol: 'ARKMUSDT' },
+  { symbol: 'BNBUSDT' },
+  { symbol: 'XRPUSDT' },
+  { symbol: 'LINKUSDT' },
+  { symbol: 'NEARUSDT' },
+  { symbol: 'ETCUSDT' },
+  { symbol: 'AAVEUSDT' },
+  { symbol: 'RENDERUSDT' },
+  { symbol: 'ALGOUSDT' },
+  { symbol: 'SEIUSDT' },
+  { symbol: 'ARBUSDT' },
+  { symbol: 'JUPUSDT' },
+  { symbol: 'ENAUSDT' },
+  { symbol: 'PENDLEUSDT' },
+  { symbol: 'WIFUSDT' },
+  { symbol: '1000PEPEUSDT' }, // Binance Futures няма 'PEPEUSDT' - цената на PEPE е твърде малка, борсата търгува контракт за 1000 token-а наведнъж
+  { symbol: 'DOGEUSDT' },
+  { symbol: 'AVAXUSDT' },
+  { symbol: 'FETUSDT' },
+  { symbol: 'UBUSDT' },
+  { symbol: 'KASUSDT' },
+];
+
+const DCA_ALERT_COOLDOWN_MS = 24 * 3600000; // не повтаря едно и също DCA ниво по-често от 24ч
+
+// Ръчно зададени ценови зони за наблюдение - "RECLAIM/REJECTION" известие,
+// когато 15м свещ или затвори НАД зоната (reclaim - бичи сигнал, зоната е
+// "превзета" отгоре), или цената я тества (докосва high >= levelLow), но
+// свещта пак затваря ПОД нея (rejection - мечи сигнал, зоната отблъсква).
+// За разлика от WATCHLIST (следи ВСИЧКИ пазарни сигнали автоматично за всяка
+// монета), тук ти сам решаваш кое ниво те интересува В МОМЕНТА - добавяш/
+// махаш редове тук при нужда (label е само за четимост в известието).
+const PRICE_LEVELS_WATCHLIST = [
+  { symbol: 'ALGOUSDT', levelLow: 0.1038, levelHigh: 0.1042, label: 'ключова зона' },
+];
+
+// ---- DCA логика - byte-identical копие от signal-logic.js -----------------
+// (calcDCALevels и директните му зависимости; Worker-ът е single-file dashboard
+// проект, затова не internal import-ва signal-logic.js директно - ако promptнеш
+// DCA формулата в signal-logic.js, огледай промяната и тук.)
+const DCA_LEVERAGE = 3;
+const DCA_ENTRY = 10;
+const MAJOR_COINS = new Set(['BTC','ETH','SOL','BNB','XRP','DOGE','LTC']);
+const SEMI_MAJOR_COINS = new Set(['ADA','AVAX','LINK','DOT','UNI','ATOM','NEAR','SUI','APT','AAVE','ARB','TON','ETC']);
+const MAINTENANCE_RATE_MAJOR = 0.004;
+const MAINTENANCE_RATE_SEMI = 0.0065;
+const MAINTENANCE_RATE_MINOR = 0.01;
+
+function getMaintenanceRate(symbol) {
+  if (MAJOR_COINS.has(symbol)) return MAINTENANCE_RATE_MAJOR;
+  if (SEMI_MAJOR_COINS.has(symbol)) return MAINTENANCE_RATE_SEMI;
+  return MAINTENANCE_RATE_MINOR;
+}
+
+function calcLiquidationPrice(entryPrice, avgPrice, totalSize, leverage, side, maintenanceRate) {
+  return side==='long' ? avgPrice*(1-(1/leverage)+maintenanceRate) : avgPrice*(1+(1/leverage)-maintenanceRate);
+}
+
+function calcDCALevels(entryPrice, side, symbol) {
+  const maintenanceRate = getMaintenanceRate(symbol);
+  const steps = [];
+  const entryLiq = calcLiquidationPrice(entryPrice, entryPrice, DCA_ENTRY, DCA_LEVERAGE, side, maintenanceRate);
+  steps.push({step:0,label:'ВХОД',addAmount:DCA_ENTRY,totalUSDT:DCA_ENTRY,levelPrice:entryPrice,avgPrice:entryPrice,liqPrice:entryLiq,safeOrder:null,pctFromEntry:0});
+  let totalUSDT=DCA_ENTRY, totalQty=DCA_ENTRY/entryPrice;
+  let dca2LevelPrice = null;
+  [0.24,0.40].forEach((drop,i) => {
+    const addAmount=DCA_ENTRY*Math.pow(2,i+1);
+    const levelPrice=side==='long'?entryPrice*(1-drop):entryPrice*(1+drop);
+    if (i===1) dca2LevelPrice = levelPrice;
+    totalUSDT+=addAmount; totalQty+=addAmount/levelPrice;
+    const avgPrice=totalUSDT/totalQty;
+    const liqPrice=calcLiquidationPrice(entryPrice,avgPrice,totalUSDT,DCA_LEVERAGE,side,maintenanceRate);
+    steps.push({step:i+1,label:`DCA ${i+1}`,addAmount,totalUSDT,levelPrice,avgPrice,liqPrice,safeOrder:side==='long'?liqPrice*1.02:liqPrice*0.98,pctFromEntry:drop*100});
+  });
+  const dca3Amount=DCA_ENTRY*8;
+  const dca3Price=side==='long'?dca2LevelPrice*(1-0.35):dca2LevelPrice*(1+0.35);
+  totalUSDT+=dca3Amount; totalQty+=dca3Amount/dca3Price;
+  const dca3Avg=totalUSDT/totalQty;
+  const dca3Liq=calcLiquidationPrice(entryPrice,dca3Avg,totalUSDT,DCA_LEVERAGE,side,maintenanceRate);
+  steps.push({step:3,label:'DCA 3 · ПОСЛЕДЕН БУФЕР (-35% от DCA 2)',addAmount:dca3Amount,totalUSDT,levelPrice:dca3Price,avgPrice:dca3Avg,liqPrice:dca3Liq,safeOrder:side==='long'?dca3Liq*1.02:dca3Liq*0.98,pctFromEntry:Math.abs((dca3Price-entryPrice)/entryPrice*100)});
+  return steps;
+}
+
+// ---- TextMeBot WhatsApp helper ----------------------------------------------
+// Заменя CallMeBot (виж git history) - CallMeBot изчерпа безплатния си лимит
+// съобщения ("0 messages left") и оттогава сайтът/плащанията им бяха постоянно
+// счупени (сървърна MySQL грешка), затова минаваме на TextMeBot. env.CALLMEBOT_PHONE
+// пази старото си име нарочно (същият номер, само за да не се дублира secret-а
+// с ново име) - вижда се и в TEXTMEBOT_APIKEY, единственият нов secret тук.
+// Връща диагностика (ok/status/body) вместо да гълта резултата.
+// Логването на неуспешен HTTP отговор (добавено по-рано - виж git history)
+// разкри реалната причина зад известия, които просто не пристигаха: TextMeBot
+// отговаря с HTTP 403 "There is currently a limit of 1 messages per 5 seconds
+// to prevent a ban from whatsapp".
+const WHATSAPP_MIN_INTERVAL_MS = 12000; // буфер над обявения лимит от 5 сек (вдигнат от 6000 - Observability показа системни 403 на ВСЕКИ първи опит, на ~12с интервали: lastWhatsAppSendAt се обновява и на неуспешни опити, retry-ят с +6с обикновено успяваше тихо, но следващото съобщение пак стартираше само с 6с буфер и пак падаше - 6с явно не стигаше като margin)
+const WHATSAPP_RATE_LIMIT_RETRY_MS = 6000; // допълнително изчакване преди retry при HTTP 403 rate-limit (вместо да губим съобщението тихо)
+const WHATSAPP_MAX_RATE_LIMIT_RETRIES = 2; // до 2 допълнителни опита при повторен 403 rate-limit
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Потвърдено от Cloudflare логовете: scheduled() изпълнения увисват до
+// "exceededWallTime" (~15 мин), защото нито едно fetch() в целия файл нямаше
+// timeout - ако един external API (relay/TextMeBot/CoinGlass) не отговори,
+// целият cron run виси безкрайно вместо да продължи към следващия символ.
+const FETCH_TIMEOUT_MS = 15000;
+async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// РЕАЛЕН БЪГ, потвърден директно от Cloudflare логовете (две HTTP 403 грешки
+// със ЕДИН и същ requestId - значи от ЕДНА и съща scheduled() инвокация):
+// първият опит за throttle ("прочети lastWhatsAppSendAt -> изчакай -> запиши
+// lastWhatsAppSendAt") НЕ е атомарен. scheduled() пуска checkDcaLevels/
+// checkMarketSignals/checkMacroSqueeze ПАРАЛЕЛНО (Promise.all) - всеки може
+// да вика sendWhatsApp независимо. Две паралелни извиквания можеха да
+// прочетат СЪЩИЯ стар timestamp, преди което и да е от тях да го обнови,
+// да изчакат еднакво, и да пратят почти едновременно въпреки "throttle-а".
+// Поправка: sendWhatsApp СИНХРОННО се "закача" към единна module-scope
+// опашка (whatsAppChain) веднага при извикване, ПРЕДИ какъвто и да е await -
+// JS е single-threaded, затова четенето+презаписването на whatsAppChain в
+// една синхронна стъпка е атомарно дори при "паралелни" (Promise.all)
+// извиквания, гарантирайки истинска сериализация на ВСИЧКИ изпращания,
+// независимо от кой от трите извикващи потока идват.
+let lastWhatsAppSendAt = 0;
+let whatsAppChain = Promise.resolve();
+function sendWhatsApp(env, text) {
+  const p = whatsAppChain.then(() => sendWhatsAppSerialized(env, text));
+  // .catch тук пази опашката жива - грешка на едно съобщение не бива да
+  // блокира/чупи чакащите след него в опашката.
+  whatsAppChain = p.catch(() => {});
+  return p;
+}
+
+async function sendWhatsAppSerialized(env, text) {
+  if (!env.CALLMEBOT_PHONE || !env.TEXTMEBOT_APIKEY) {
+    console.error('TextMeBot secrets not set - skipping notification');
+    return { ok: false, error: 'CALLMEBOT_PHONE/TEXTMEBOT_APIKEY not set' };
+  }
+  const waitMs = WHATSAPP_MIN_INTERVAL_MS - (Date.now() - lastWhatsAppSendAt);
+  if (waitMs > 0) await sleep(waitMs);
+  const url = `https://api.textmebot.com/send.php?recipient=${encodeURIComponent(env.CALLMEBOT_PHONE)}&apikey=${encodeURIComponent(env.TEXTMEBOT_APIKEY)}&text=${encodeURIComponent(text)}`;
+  // Ретрай за HTTP 403 "limit of 1 messages per 5 seconds", HTTP 409 (recipient
+  // conflict - виж по-долу) и мрежови/timeout изключения - потвърдено от
+  // Observability логовете (02:58:06-39 бърст): AbortError (FETCH_TIMEOUT_MS
+  // изтекъл client-side) последван от HTTP 409 "Recipient's Phone number
+  // conflict" на следващото съобщение - timeout-ът при НАС не значи, че
+  // TextMeBot също е прекъснал заявката; тя вероятно продължава да се
+  // обработва при тях, и следващият опит към СЪЩИЯ recipient се удря в
+  // "вече в процес на обработка" конфликт. Преди просто губехме съобщението
+  // тихо (само console.error, без retry за нито един от трите случая).
+  for (let attempt = 0; attempt <= WHATSAPP_MAX_RATE_LIMIT_RETRIES; attempt++) {
+    lastWhatsAppSendAt = Date.now();
+    try {
+      const r = await fetchWithTimeout(url);
+      const body = await r.text();
+      if (r.ok) return { ok: true, status: r.status, body: body.slice(0, 500) };
+      // Досега неуспешен HTTP отговор от TextMeBot (напр. изчерпан лимит, невалиден
+      // recipient, изтекла връзка) минаваше напълно тихо - връщаше се {ok:false,...},
+      // но НИКЪДЕ не се логваше, за разлика от мрежово изключение (catch по-долу).
+      console.error(`TextMeBot non-OK response: HTTP ${r.status}: ${body.slice(0, 300)}`);
+      const isRateLimit = r.status === 403 && /limit of \d+ messages? per \d+ seconds?/i.test(body);
+      const isConflict = r.status === 409;
+      if ((isRateLimit || isConflict) && attempt < WHATSAPP_MAX_RATE_LIMIT_RETRIES) {
+        await sleep(WHATSAPP_RATE_LIMIT_RETRY_MS);
+        continue;
+      }
+      return { ok: false, status: r.status, body: body.slice(0, 500) };
+    } catch (e) {
+      console.error('TextMeBot send error:', e);
+      if (attempt < WHATSAPP_MAX_RATE_LIMIT_RETRIES) {
+        await sleep(WHATSAPP_RATE_LIMIT_RETRY_MS);
+        continue;
+      }
+      return { ok: false, error: e.message };
+    }
+  }
+}
+
+// Observability потвърди 160 TextMeBot 403 "rate limit" грешки за 1 час, явно
+// обемен проблем (не само мрежов jitter) - при волатилен пазар processWatchlistSymbol
+// (виж по-долу) може да натрупа 15+ отделни известия от различни символи в
+// ЕДИН тик. Вместо всеки сигнал да праща отделно HTTP извикване (дори
+// коректно сериализирани на 6с едно от друго), ги групираме в по-малко,
+// по-големи съобщения - точно каквото TextMeBot сам предлага в грешката си
+// ("group them into one message"). batch е ЛОКАЛЕН масив (подаден от
+// извикващия, не module-scope) - виж бележката при checkMarketSignals защо.
+const WHATSAPP_BATCH_MAX_CHARS = 3000; // запас под типичния WhatsApp/TextMeBot лимит за дължина на съобщение
+const WHATSAPP_BATCH_MAX_SIGNALS = 2; // макс. сигнала в едно комбинирано съобщение, за да остане четимо
+const WHATSAPP_BATCH_SEPARATOR = '\n\n━━━━━━━━━━\n\n';
+async function flushWhatsAppBatch(env, batch) {
+  if (batch.length === 0) return;
+  const chunks = [];
+  let current = '';
+  let currentCount = 0;
+  for (const text of batch) {
+    const candidate = current ? current + WHATSAPP_BATCH_SEPARATOR + text : text;
+    const wouldOverflow = current
+      && (candidate.length > WHATSAPP_BATCH_MAX_CHARS || currentCount >= WHATSAPP_BATCH_MAX_SIGNALS);
+    if (wouldOverflow) {
+      chunks.push(current);
+      current = text;
+      currentCount = 1;
+    } else {
+      current = candidate;
+      currentCount += 1;
+    }
+  }
+  if (current) chunks.push(current);
+  for (const chunk of chunks) {
+    await sendWhatsApp(env, chunk);
+  }
+}
+
+// ============================================================================
+// Пазарни сигнали (без нужда от твоя позиция) - byte-identical копия на
+// съответните pure функции от signal-logic.js: Capitulation Suite (FLUSH/BASE/
+// SQUEEZE/SHIFT/IMPULSE) + WARMING Gate (WARM/HOT/SUPER + 4Ч обем + Dump
+// Cascade) + MM WARMING→IMPULSE + MM x25. Виж бележката при DCA секцията по-горе
+// за причината за дублиране вместо import.
+// ============================================================================
+function calcSMA(closes, period) {
+  if (closes.length < period) return null;
+  return closes.slice(-period).reduce((a,b) => a+b, 0) / period;
+}
+
+// Wilder RMA изглаждане (alpha = 1/period), не обикновена SMA на последните
+// `period` разлики - TradingView ta.rsi() ползва точно тази смяна и носи
+// напред цялата история с експоненциално затихващо тегло, докато старата
+// версия гледаше само последния прозорец без памет отвъд него (реален пример:
+// Worker RSI 28.8 vs TradingView RSI 30.3 на един и същ момент). За масив с
+// точно period+1 стойности резултатът е идентичен на старата SMA версия
+// (само seed стъпката, без допълнително изглаждане). Byte-identical копие на
+// същата промяна в signal-logic.js.
+function calcRSI(closes, period) {
+  const n = closes.length;
+  if (n < period + 1) return null;
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) avgGain += diff; else avgLoss += Math.abs(diff);
+  }
+  avgGain /= period; avgLoss /= period;
+  for (let i = period + 1; i < n; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? Math.abs(diff) : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
+  if (avgLoss === 0) return 100;
+  return 100 - (100 / (1 + avgGain / avgLoss));
+}
+
+// PRIORITY 4 от финалния анализ - линейна O(n) версия вместо предишната
+// O(n^2): старата имплементация викаше calcRSI(closes.slice(0, i + 1), period)
+// за ВСЯКА позиция, което означава пълно преизчисляване на Wilder RMA
+// изглаждането от началото на масива на всеки индекс (нарастващо quadratic
+// с по-голямата история от PRIORITY 3/т.8 - 200-500 свещи вместо 20-60).
+// Тук seed стъпката (avgGain/avgLoss от closes[1..period]) се прави ВЕДНЪЖ,
+// после Wilder RMA се пренася напред инкрементално - същата рекурсия като
+// calcRSI по-горе, само изчислена веднъж, не преповторена за всеки индекс.
+// Резултатът е byte-identical на старата версия (проверено с === сравнение
+// на всеки индекс за няколко дължини/периода в отделен sanity скрипт) -
+// самата Wilder формула не е променена, само начинът на изчисление.
+function calcRSISeries(closes, period) {
+  const n = closes.length;
+  const series = new Array(n).fill(null);
+  if (n < period + 1) return series;
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) avgGain += diff; else avgLoss += Math.abs(diff);
+  }
+  avgGain /= period; avgLoss /= period;
+  series[period] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+  for (let i = period + 1; i < n; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? Math.abs(diff) : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    series[i] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+  }
+  return series;
+}
+
+function calcEMASeries(closes, period) {
+  if (closes.length < period) return new Array(closes.length).fill(null);
+  const series = new Array(closes.length).fill(null);
+  const k = 2 / (period + 1);
+  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  series[period - 1] = ema;
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+    series[i] = ema;
+  }
+  return series;
+}
+
+function calcFlushSignal(candles, htfExtreme, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, rsiFlushLevel = opts.rsiFlushLevel ?? 25;
+  const volLen = opts.volLen ?? 20, volFlushMult = opts.volFlushMult ?? 2.5;
+  const rangeLen = opts.rangeLen ?? 20, rangeMult = opts.rangeMult ?? 2.0;
+  const useHTFFilter = opts.useHTFFilter ?? true;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen, rangeLen) + 1) return false;
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  if (rsi == null || volMA == null || rangeMA == null) return false;
+  const last = candles[n - 1];
+  const volSpike = last.volume > volMA * volFlushMult;
+  const rangeSpike = (last.high - last.low) > rangeMA * rangeMult;
+  const bearCandle = last.close < last.open;
+  const htfFilter = useHTFFilter ? htfExtreme : true;
+  return rsi < rsiFlushLevel && volSpike && rangeSpike && bearCandle && htfFilter;
+}
+
+function calcBlowoffSignal(candles, htfOverbought, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, rsiBlowoffLevel = opts.rsiBlowoffLevel ?? 75;
+  const volLen = opts.volLen ?? 20, volFlushMult = opts.volFlushMult ?? 2.5;
+  const rangeLen = opts.rangeLen ?? 20, rangeMult = opts.rangeMult ?? 2.0;
+  const useHTFFilter = opts.useHTFFilter ?? true;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen, rangeLen) + 1) return false;
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  if (rsi == null || volMA == null || rangeMA == null) return false;
+  const last = candles[n - 1];
+  const volSpike = last.volume > volMA * volFlushMult;
+  const rangeSpike = (last.high - last.low) > rangeMA * rangeMult;
+  const bullCandle = last.close > last.open;
+  const htfFilter = useHTFFilter ? htfOverbought : true;
+  return rsi > rsiBlowoffLevel && volSpike && rangeSpike && bullCandle && htfFilter;
+}
+
+function calcBaseSignal(candles, htfExtreme, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, rsiBaseLevel = opts.rsiBaseLevel ?? 35;
+  const volLen = opts.volLen ?? 20, volDryMult = opts.volDryMult ?? 0.8;
+  const rangeLen = opts.rangeLen ?? 20;
+  const useHTFFilter = opts.useHTFFilter ?? true;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen, rangeLen) + 11) return false;
+  const closes = candles.map(c => c.close);
+  const lows = candles.map(c => c.low);
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const rsiSeries = calcRSISeries(closes, rsiLen);
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  const rsi = rsiSeries[n - 1], rsi5 = rsiSeries[n - 6], rsi10 = rsiSeries[n - 11];
+  if (rsi == null || rsi5 == null || rsi10 == null || volMA == null || rangeMA == null) return false;
+  const priceLowerLow = lows[n - 1] < lows[n - 6] && lows[n - 6] < lows[n - 11];
+  const rsiHigherLow = rsi > rsi5 && rsi5 > rsi10;
+  const bullDiv = priceLowerLow && rsiHigherLow;
+  const last = candles[n - 1];
+  const volDry = last.volume < volMA * volDryMult;
+  const smallRange = (last.high - last.low) < rangeMA;
+  const rsiRecover = rsi > rsiBaseLevel;
+  const htfFilter = useHTFFilter ? htfExtreme : true;
+  return bullDiv && volDry && smallRange && rsiRecover && htfFilter;
+}
+
+function calcDistributionSignal(candles, htfOverbought, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, rsiTopLevel = opts.rsiTopLevel ?? 65;
+  const volLen = opts.volLen ?? 20, volDryMult = opts.volDryMult ?? 0.8;
+  const rangeLen = opts.rangeLen ?? 20;
+  const useHTFFilter = opts.useHTFFilter ?? true;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen, rangeLen) + 11) return false;
+  const closes = candles.map(c => c.close);
+  const highs = candles.map(c => c.high);
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const rsiSeries = calcRSISeries(closes, rsiLen);
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  const rsi = rsiSeries[n - 1], rsi5 = rsiSeries[n - 6], rsi10 = rsiSeries[n - 11];
+  if (rsi == null || rsi5 == null || rsi10 == null || volMA == null || rangeMA == null) return false;
+  const priceHigherHigh = highs[n - 1] > highs[n - 6] && highs[n - 6] > highs[n - 11];
+  const rsiLowerHigh = rsi < rsi5 && rsi5 < rsi10;
+  const bearDiv = priceHigherHigh && rsiLowerHigh;
+  const last = candles[n - 1];
+  const volDry = last.volume < volMA * volDryMult;
+  const smallRange = (last.high - last.low) < rangeMA;
+  const rsiRetreat = rsi < rsiTopLevel;
+  const htfFilter = useHTFFilter ? htfOverbought : true;
+  return bearDiv && volDry && smallRange && rsiRetreat && htfFilter;
+}
+
+function calcSqueezeSignal(candles, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, volLen = opts.volLen ?? 20, volFlushMult = opts.volFlushMult ?? 2.5;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen) + 1) return false;
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const volMA = calcSMA(volumes, volLen);
+  if (rsi == null || volMA == null) return false;
+  const last = candles[n - 1];
+  const bullCandle = last.close > last.open;
+  const volSpike = last.volume > volMA * volFlushMult;
+  return bullCandle && volSpike && rsi > 40;
+}
+
+function calcDumpSqueezeSignal(candles, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, volLen = opts.volLen ?? 20, volFlushMult = opts.volFlushMult ?? 2.5;
+  const n = candles.length;
+  if (n < Math.max(rsiLen, volLen) + 1) return false;
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const volMA = calcSMA(volumes, volLen);
+  if (rsi == null || volMA == null) return false;
+  const last = candles[n - 1];
+  const bearCandle = last.close < last.open;
+  const volSpike = last.volume > volMA * volFlushMult;
+  return bearCandle && volSpike && rsi < 60;
+}
+
+function calcShiftSignal(candles, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
+  const n = candles.length;
+  if (n < emaSlowLen + 1) return false;
+  const closes = candles.map(c => c.close);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const emaFastSeries = calcEMASeries(closes, emaFastLen);
+  const emaSlowSeries = calcEMASeries(closes, emaSlowLen);
+  const fNow = emaFastSeries[n - 1], fPrev = emaFastSeries[n - 2];
+  const sNow = emaSlowSeries[n - 1], sPrev = emaSlowSeries[n - 2];
+  if (rsi == null || fNow == null || fPrev == null || sNow == null || sPrev == null) return false;
+  const crossover = fPrev <= sPrev && fNow > sNow;
+  return crossover && rsi > 45;
+}
+
+function calcShiftDownSignal(candles, opts = {}) {
+  const rsiLen = opts.rsiLen ?? 14, emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
+  const n = candles.length;
+  if (n < emaSlowLen + 1) return false;
+  const closes = candles.map(c => c.close);
+  const rsi = calcRSISeries(closes, rsiLen)[n - 1];
+  const emaFastSeries = calcEMASeries(closes, emaFastLen);
+  const emaSlowSeries = calcEMASeries(closes, emaSlowLen);
+  const fNow = emaFastSeries[n - 1], fPrev = emaFastSeries[n - 2];
+  const sNow = emaSlowSeries[n - 1], sPrev = emaSlowSeries[n - 2];
+  if (rsi == null || fNow == null || fPrev == null || sNow == null || sPrev == null) return false;
+  const crossunder = fPrev >= sPrev && fNow < sNow;
+  return crossunder && rsi < 55;
+}
+
+function calcImpulseSignal(candles, flushActive, opts = {}) {
+  const volLen = opts.volLen ?? 20, volImpulseMult = opts.volImpulseMult ?? 1.8;
+  const rangeLen = opts.rangeLen ?? 20;
+  const n = candles.length;
+  if (n < Math.max(volLen, rangeLen, 10) + 2) return { long: false, short: false };
+  const volumes = candles.map(c => c.volume);
+  const ranges = candles.map(c => c.high - c.low);
+  const volMA = calcSMA(volumes, volLen);
+  const rangeMA = calcSMA(ranges, rangeLen);
+  if (volMA == null || rangeMA == null) return { long: false, short: false };
+  const prev = candles[n - 2], last = candles[n - 1];
+  const tightRangePrev = (prev.high - prev.low) < rangeMA * 0.7;
+  const volBuild = last.volume > volMA * volImpulseMult;
+  const window = candles.slice(n - 11, n - 1);
+  const highest10 = Math.max(...window.map(c => c.high));
+  const lowest10 = Math.min(...window.map(c => c.low));
+  const breakHigh = last.close > highest10;
+  const breakLow = last.close < lowest10;
+  return {
+    long: tightRangePrev && volBuild && breakHigh && !flushActive,
+    short: tightRangePrev && volBuild && breakLow && !flushActive,
+  };
+}
+
+function calcTrueRangeSeries(candles) {
+  return candles.map((c, i) => {
+    if (i === 0) return c.high - c.low;
+    const prevClose = candles[i - 1].close;
+    return Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose));
+  });
+}
+// Wilder RMA на True Range (същото изглаждане като calcRSI по-горе, а не
+// плъзгаща SMA само на последния прозорец) - за да съвпада с TradingView
+// ta.atr(). При масив с точно `period` TR стойности резултатът е идентичен
+// на старата SMA версия (само seed, без допълнително изглаждане). Byte-identical
+// копие на същата промяна в signal-logic.js.
+function calcATR(candles, period) {
+  const tr = calcTrueRangeSeries(candles);
+  const n = tr.length;
+  if (n < period) return null;
+  let atr = tr.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < n; i++) {
+    atr = (atr * (period - 1) + tr[i]) / period;
+  }
+  return atr;
+}
+
+function calcWarmingTier(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, atrLen = opts.atrLen ?? 20;
+  const atrPctMax = opts.atrPctMax ?? 0.75;
+  const useCompression = opts.useCompression ?? true;
+  const easeFactor = opts.easeFactor ?? 1;
+  const warm1 = (opts.warm1x ?? 1.5) * easeFactor;
+  const warm2 = (opts.warm2x ?? 2.0) * easeFactor;
+  const warm3 = (opts.warm3x ?? 3.0) * easeFactor;
+  const n = candles.length;
+  if (n < Math.max(volLen, atrLen) + 1) return { tier: 'none', volX: null, atrPct: null, direction: 'flat' };
+  const volumes = candles.map(c => c.volume);
+  const volMA = calcSMA(volumes, volLen);
+  const atr = calcATR(candles, atrLen);
+  const last = candles[n - 1];
+  if (volMA == null || atr == null) return { tier: 'none', volX: null, atrPct: null, direction: 'flat' };
+  const volX = volMA > 0 ? last.volume / volMA : 0;
+  const atrPct = (atr / last.close) * 100;
+  const compressOK = !useCompression || atrPct <= atrPctMax;
+  const direction = last.close > last.open ? 'up' : last.close < last.open ? 'down' : 'flat';
+  let tier = 'none';
+  if (compressOK && direction !== 'flat') {
+    if (volX >= warm3) tier = 'super';
+    else if (volX >= warm2) tier = 'hot';
+    else if (volX >= warm1) tier = 'warm';
+  }
+  return { tier, volX, atrPct, direction };
+}
+
+function calc4HBigVolume(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, threshold = opts.threshold ?? 2.5;
+  const n = candles.length;
+  if (n < volLen + 1) return { active: false, direction: 'flat', volX: null };
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  if (volMA == null) return { active: false, direction: 'flat', volX: null };
+  const last = candles[n - 1];
+  const volX = volMA > 0 ? last.volume / volMA : 0;
+  const direction = last.close > last.open ? 'up' : last.close < last.open ? 'down' : 'flat';
+  return { active: volX >= threshold && direction !== 'flat', direction, volX };
+}
+
+function calcDumpCascade(candles, opts = {}) {
+  const dumpBars = opts.dumpBars ?? 3, dumpMinCount = opts.dumpMinCount ?? 2;
+  const dumpBodyPctMin = opts.dumpBodyPctMin ?? 60;
+  const n = candles.length;
+  if (n < dumpBars) return { active: false, redCount: 0 };
+  let redCount = 0;
+  for (let i = n - dumpBars; i < n; i++) {
+    const c = candles[i];
+    const range = Math.max(c.high - c.low, 1e-9);
+    const bodyPct = (Math.abs(c.close - c.open) / range) * 100;
+    if (c.close < c.open && bodyPct >= dumpBodyPctMin) redCount++;
+  }
+  return { active: redCount >= dumpMinCount, redCount };
+}
+
+function calcVolumePressure(candles, len) {
+  const n = candles.length;
+  if (n < len) return { press: 0, biasLong: false, biasShort: false };
+  let press = 0;
+  for (let i = n - len; i < n; i++) {
+    const c = candles[i];
+    press += (c.close - c.open) * c.volume;
+  }
+  return { press, biasLong: press > 0, biasShort: press < 0 };
+}
+
+function calcWarmingContext(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, atrLen = opts.atrLen ?? 14;
+  const warmVolX = opts.warmVolX ?? 1.6, warmBars = opts.warmBars ?? 3;
+  const useComp = opts.useComp ?? true, atrPctMax = opts.atrPctMax ?? 1.2;
+  const pressLen = opts.pressLen ?? 6;
+  const n = candles.length;
+  const minLen = Math.max(volLen, atrLen, pressLen) + warmBars + 1;
+  if (n < minLen) return { warming: false, biasLong: false, biasShort: false, volX: null, atrPct: null };
+
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const atr = calcATR(candles, atrLen);
+  const last = candles[n - 1];
+  if (volMA == null || atr == null) return { warming: false, biasLong: false, biasShort: false, volX: null, atrPct: null };
+
+  const volX = volMA > 0 ? last.volume / volMA : 0;
+  const atrPct = (atr / last.close) * 100;
+  const compOK = !useComp || atrPct <= atrPctMax;
+
+  let riseCount = 0;
+  for (let i = 0; i < warmBars; i++) {
+    const cur = candles[n - 1 - i];
+    const prev = candles[n - 2 - i];
+    if (cur.volume > prev.volume) riseCount++;
+  }
+  const volRise = riseCount >= (warmBars - 1);
+
+  const { biasLong, biasShort } = calcVolumePressure(candles, pressLen);
+  const warming = volX >= warmVolX && volRise && compOK;
+  return { warming, biasLong, biasShort, volX, atrPct };
+}
+
+function calcEntryImpulse(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20;
+  const impVolX = opts.impVolX ?? 2.2;
+  const bodyPctMin = opts.bodyPctMin ?? 0.55;
+  const n = candles.length;
+  if (n < volLen + 2) return { impulseUp: false, impulseDn: false, volX: null, bodyPct: null };
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  if (volMA == null) return { impulseUp: false, impulseDn: false, volX: null, bodyPct: null };
+  const last = candles[n - 1], prev = candles[n - 2];
+  const range = Math.max(last.high - last.low, 1e-9);
+  const bodyPct = Math.abs(last.close - last.open) / range;
+  const volX = volMA > 0 ? last.volume / volMA : 0;
+  const impulseVolOK = volX >= impVolX;
+  const impulseBodyOK = bodyPct >= bodyPctMin;
+  const impulseUp = impulseVolOK && impulseBodyOK && last.close > prev.high && last.close > last.open;
+  const impulseDn = impulseVolOK && impulseBodyOK && last.close < prev.low && last.close < last.open;
+  return { impulseUp, impulseDn, volX, bodyPct };
+}
+
+function calcMMx25Entry(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, atrLen = opts.atrLen ?? 14, emaLen = opts.emaLen ?? 20;
+  const proxyVolX = opts.proxyVolX ?? 2.5, proxyATRX = opts.proxyATRX ?? 1.8;
+  const n = candles.length;
+  const minLen = Math.max(volLen, atrLen, emaLen) + 1;
+  if (n < minLen) return { long: false, short: false, ema: null };
+  const emaSeries = calcEMASeries(candles.map(c => c.close), emaLen);
+  const ema = emaSeries[n - 1];
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const atr = calcATR(candles, atrLen);
+  const last = candles[n - 1];
+  if (ema == null || volMA == null || atr == null) return { long: false, short: false, ema: null };
+  const proxyOK = last.volume <= volMA * proxyVolX && (last.high - last.low) <= atr * proxyATRX;
+  return { long: last.close > ema && proxyOK, short: last.close < ema && proxyOK, ema, proxyOK };
+}
+
+// ─── "Mario – Build-Up Detector + EMA Filter" ────────────────────────────
+function calcSmoothedATR(candles, atrLen, lookback) {
+  const n = candles.length;
+  let sum = 0, count = 0;
+  for (let i = 0; i < lookback; i++) {
+    const end = n - i;
+    if (end < atrLen) break;
+    const v = calcATR(candles.slice(0, end), atrLen);
+    if (v != null) { sum += v; count++; }
+  }
+  return count > 0 ? sum / count : null;
+}
+
+function calcBuildUpEarly(candles, opts = {}) {
+  const earlyBars = opts.earlyBars ?? 6, atrLen = opts.atrLen ?? 14, volLen = opts.volLen ?? 20;
+  const atrLooseMult = opts.atrLooseMult ?? 1.3, volStableMult = opts.volStableMult ?? 0.8;
+  const n = candles.length;
+  if (n < Math.max(atrLen, volLen) + earlyBars + 3) return { long: false, short: false };
+  const last = candles.slice(n - earlyBars);
+  let bullCount = 0, bearCount = 0;
+  for (const c of last) { if (c.close > c.open) bullCount++; if (c.close < c.open) bearCount++; }
+  const higherLows = candles[n-1].low > candles[n-2].low || candles[n-2].low > candles[n-3].low;
+  const lowerHighs = candles[n-1].high < candles[n-2].high || candles[n-2].high < candles[n-3].high;
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const volStable = volMA != null && candles[n-1].volume >= volMA * volStableMult;
+  const currentAtr = calcATR(candles, atrLen);
+  const smoothedAtr = calcSmoothedATR(candles, atrLen, earlyBars);
+  const lowVolatility = currentAtr != null && smoothedAtr != null && currentAtr < smoothedAtr * atrLooseMult;
+  const long = bullCount >= earlyBars / 2 && higherLows && lowVolatility && volStable;
+  const short = bearCount >= earlyBars / 2 && lowerHighs && lowVolatility && volStable;
+  return { long, short };
+}
+
+function calcEmaTrendFilter(candles, opts = {}) {
+  const fastLen = opts.fastLen ?? 50, slowLen = opts.slowLen ?? 200;
+  const closes = candles.map(c => c.close);
+  const fastSeries = calcEMASeries(closes, fastLen);
+  const slowSeries = calcEMASeries(closes, slowLen);
+  const n = candles.length;
+  const fNow = fastSeries[n-1], fPrev = fastSeries[n-2], sNow = slowSeries[n-1];
+  if (fNow == null || fPrev == null || sNow == null) return { bull: false, bear: false };
+  return { bull: fNow > sNow && fNow > fPrev, bear: fNow < sNow && fNow < fPrev };
+}
+
+function calc4hTwoBarTrend(candles) {
+  const n = candles.length;
+  if (n < 2) return { bull: false, bear: false };
+  const last = candles[n-1], prev = candles[n-2];
+  return { bull: last.close > last.open && prev.close > prev.open, bear: last.close < last.open && prev.close < prev.open };
+}
+
+function calcATRExpansion(candles, opts = {}) {
+  const atrLen = opts.atrLen ?? 14, lookback = opts.lookback ?? 2;
+  const currentAtr = calcATR(candles, atrLen);
+  const smoothedAtr = calcSmoothedATR(candles, atrLen, lookback);
+  if (currentAtr == null || smoothedAtr == null) return false;
+  return currentAtr > smoothedAtr;
+}
+
+// ─── "Mario – MM-OSC Entry Companion" ────────────────────────────────────
+function calcMMOscValue(candles, opts = {}) {
+  const atrLen = opts.atrLen ?? 14, emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
+  const n = candles.length;
+  if (n < Math.max(atrLen, emaSlowLen) + 2) return null;
+  const closes = candles.map(c => c.close);
+  const emaFast = calcEMASeries(closes, emaFastLen)[n - 1];
+  const atr = calcATR(candles, atrLen);
+  if (emaFast == null || atr == null || atr === 0) return null;
+  const last = candles[n - 1], prev = candles[n - 2];
+  const pressure = (last.close - emaFast) / atr;
+  const momentum = (last.close - prev.close) / atr;
+  const raw = pressure * 0.85 + momentum * 0.85;
+  const osc = 50 + 50 * Math.tanh(raw);
+  return Math.max(0, Math.min(100, osc));
+}
+
+function calcMMOscEntry(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, volMin = opts.volMin ?? 1.2, bodyMin = opts.bodyMin ?? 0.55;
+  const entryUp = opts.entryUp ?? 55, entryDn = opts.entryDn ?? 45;
+  const emaFastLen = opts.emaFastLen ?? 20, emaSlowLen = opts.emaSlowLen ?? 50;
+  const n = candles.length;
+  const oscNow = calcMMOscValue(candles, opts);
+  const oscPrev = n > 1 ? calcMMOscValue(candles.slice(0, n - 1), opts) : null;
+  if (oscNow == null || oscPrev == null) return { long: false, short: false, osc: oscNow };
+  const closes = candles.map(c => c.close);
+  const emaF = calcEMASeries(closes, emaFastLen)[n - 1];
+  const emaS = calcEMASeries(closes, emaSlowLen)[n - 1];
+  if (emaF == null || emaS == null) return { long: false, short: false, osc: oscNow };
+  const regimeUp = emaF > emaS, regimeDown = emaF < emaS;
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const last = candles[n - 1];
+  const volX = volMA != null && volMA > 0 ? last.volume / volMA : 0;
+  const rng = Math.max(last.high - last.low, 1e-9);
+  const bodyPct = Math.abs(last.close - last.open) / rng;
+  const baseOK = volX >= volMin && bodyPct >= bodyMin;
+  const crossover = oscPrev <= entryUp && oscNow > entryUp;
+  const crossunder = oscPrev >= entryDn && oscNow < entryDn;
+  return {
+    long: baseOK && regimeUp && crossover,
+    short: baseOK && regimeDown && crossunder,
+    osc: oscNow,
+  };
+}
+
+function calcMMOscPullbackZone(osc, direction, opts = {}) {
+  const rePullLo = opts.rePullLo ?? 48, rePullHi = opts.rePullHi ?? 55;
+  if (osc == null) return false;
+  if (direction === 1) return osc >= rePullLo && osc <= rePullHi;
+  if (direction === -1) return osc <= (100 - rePullLo) && osc >= (100 - rePullHi);
+  return false;
+}
+
+// ─── "Mario IMPULSE + CONFIRMED + GAP FILTER + BTC.D FILTER" (само IMPULSE и
+// CONFIRMED - Gap/BTC.D филтрите изискват данни, които Binance API не дава) ──
+function calcImpulseAtrSignal(candles, opts = {}) {
+  const volLen = opts.volLen ?? 20, impulseVolMult = opts.impulseVolMult ?? 2.5;
+  const impulseBodyPct = opts.impulseBodyPct ?? 0.6;
+  const atrLen = opts.atrLen ?? 14, atrMinPct = opts.atrMinPct ?? 0.15, atrMaxPct = opts.atrMaxPct ?? 3.0;
+  const n = candles.length;
+  if (n < Math.max(volLen, atrLen) + 2) return { long: false, short: false };
+  const volMA = calcSMA(candles.map(c => c.volume), volLen);
+  const atr = calcATR(candles, atrLen);
+  if (volMA == null || atr == null) return { long: false, short: false };
+  const last = candles[n - 1], prev = candles[n - 2];
+  const atrPct = atr / last.close * 100;
+  const volatilityOK = atrPct >= atrMinPct && atrPct <= atrMaxPct;
+  const rng = Math.max(last.high - last.low, 1e-9);
+  const impulseCandle = Math.abs(last.close - last.open) / rng >= impulseBodyPct;
+  const impulseVol = last.volume >= volMA * impulseVolMult;
+  const gate = impulseCandle && impulseVol && volatilityOK;
+  return { long: gate && last.close > prev.high, short: gate && last.close < prev.low };
+}
+
+function calcConfirmedSignal(candles15, candles1h, opts = {}) {
+  const emaFastLen = opts.emaFastLen ?? 20, emaMidLen = opts.emaMidLen ?? 50;
+  const useHTFRegime = opts.useHTFRegime ?? true;
+  const n15 = candles15.length;
+  if (n15 < emaMidLen + 2) return { long: false, short: false };
+  const closes15 = candles15.map(c => c.close);
+  const ema20Series = calcEMASeries(closes15, emaFastLen);
+  const ema50Series = calcEMASeries(closes15, emaMidLen);
+  const ema20 = ema20Series[n15 - 1], ema20Prev = ema20Series[n15 - 2], ema50 = ema50Series[n15 - 1];
+  const close = closes15[n15 - 1], closePrev = closes15[n15 - 2];
+  if (ema20 == null || ema20Prev == null || ema50 == null) return { long: false, short: false };
+  const crossover = closePrev <= ema20Prev && close > ema20;
+  const crossunder = closePrev >= ema20Prev && close < ema20;
+  const pullbackLong = crossover && ema20 > ema50;
+  const pullbackShort = crossunder && ema20 < ema50;
+  let htfBull = true, htfBear = true;
+  if (useHTFRegime) {
+    const n1h = candles1h.length;
+    if (n1h < emaMidLen + 1) return { long: false, short: false };
+    const closes1h = candles1h.map(c => c.close);
+    const regEma20 = calcEMASeries(closes1h, emaFastLen)[n1h - 1];
+    const regEma50 = calcEMASeries(closes1h, emaMidLen)[n1h - 1];
+    if (regEma20 == null || regEma50 == null) return { long: false, short: false };
+    htfBull = regEma20 > regEma50;
+    htfBear = regEma20 < regEma50;
+  }
+  return { long: pullbackLong && htfBull, short: pullbackShort && htfBear };
+}
+
+function klinesToCandles(klines) {
+  return (klines||[]).map(k => ({ openTime: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]) }));
+}
+
+// ---- Cooldown/ARM state - в браузъра живее в module-scope обекти (survive
+// while the tab is open); тук ВСЯКО cron извикване е нов isolate, затова
+// състоянието се пази в KV между извикванията (по символ, JSON blob).
+const WARMING_COOLDOWN_MIN = { warm: 60, hot: 60, super: 120, superDown: 120 };
+const WARMING_BOOST_HOURS = 4;
+const WARMING_BOOST_PCT = 0.10;
+const WARMING_DUMP_EASE = 0.85;
+const MM_ARM_MINUTES = 90;
+const MM_COOLDOWN_MIN = 30;
+const MM_X25_COOLDOWN_MIN = 30;
+// Минимална % промяна на цената спрямо предходния MM/MM x25 fire, за да се
+// позволи ОБРЪЩАНЕ на посоката преди пълния cooldown да е изтекъл. Без това
+// s.dir !== direction пропускаше flip веднага, независимо от цената - реален
+// случай: MM x25 LONG на SOL @76.11, после MM x25 SHORT @76.06 15 мин по-късно
+// (практически същата цена) - двоен "100% увереност" сигнал в двете посоки
+// насред застоял диапазон (whipsaw), не истинско обръщане на тренда.
+const MM_FLIP_MIN_MOVE_PCT = 0.5;
+// Същата защита, но за WARMING/HOT/SUPER: `warmingTierAllowed` имаше същия
+// корен бъг като старото mmCanFire - `s.dir !== direction` пропускаше
+// cooldown-а при ВСЯКО обръщане на посоката, независимо от движението на
+// цената (напр. WARMING ▲ последвано от WARMING ▼ 5-10 мин по-късно на
+// практически същата цена - двоен подвеждащ сигнал в двете посоки).
+const WARMING_FLIP_MIN_MOVE_PCT = 0.5;
+
+function warmingTierAllowed(state, tier, direction, price) {
+  const s = state.warmingCooldown?.[tier];
+  if (!s) return true;
+  const cooledDown = (Date.now() - s.at) >= WARMING_COOLDOWN_MIN[tier] * 60000;
+  if (cooledDown) return true;
+  if (s.dir === direction) return false;
+  if (s.price == null || price == null) return true;
+  const movePct = Math.abs((price - s.price) / s.price) * 100;
+  return movePct >= WARMING_FLIP_MIN_MOVE_PCT;
+}
+function markWarmingFired(state, tier, direction, price) {
+  if (!state.warmingCooldown) state.warmingCooldown = {};
+  state.warmingCooldown[tier] = { at: Date.now(), dir: direction, price };
+}
+function mmCanFire(state, key, direction, coolMin, price) {
+  const s = state.mmCooldown?.[key];
+  if (!s) return true;
+  const cooledDown = (Date.now() - s.at) >= coolMin * 60000;
+  if (cooledDown) return true;
+  if (s.dir === direction) return false;
+  if (s.price == null || price == null) return true;
+  const movePct = Math.abs((price - s.price) / s.price) * 100;
+  return movePct >= MM_FLIP_MIN_MOVE_PCT;
+}
+function markMMFired(state, key, direction, price) {
+  if (!state.mmCooldown) state.mmCooldown = {};
+  state.mmCooldown[key] = { at: Date.now(), dir: direction, price };
+}
+
+// CONFIRMED/структурните детектори (SHIFT/SHIFT▼/IMPULSE/IMPULSE+ATR/CONFIRMED/
+// BUILD-UP CONFIRMED/PRE-IMPULSE) пазят openTime на затворената свещ, която ги
+// е задействала - "1 сигнал на затворена свещ": ако condition-ът остане верен
+// през целия прозорец и след него на СЪЩАТА свещ, вече не препраща втори път;
+// нова свещ (нов openTime) веднага отключва нов сигнал. tagCanFire/markTagFired
+// се ползват САМО за тези - LIVE детекторите вместо това ползват
+// isNewLiveEvent/markLiveSeen по-долу (виж бележката там).
+const SIGNAL_REPEAT_COOLDOWN_MIN = 20;
+function tagCanFire(state, label, candleOpenTime) {
+  const s = state.tagCooldown?.[label];
+  if (!s) return true;
+  const sAt = typeof s === 'number' ? s : s.at;
+  const sCandleOpenTime = typeof s === 'number' ? undefined : s.candleOpenTime;
+  if (candleOpenTime != null && sCandleOpenTime != null) {
+    return sCandleOpenTime !== candleOpenTime;
+  }
+  return (Date.now() - sAt) >= SIGNAL_REPEAT_COOLDOWN_MIN * 60000;
+}
+function markTagFired(state, label, candleOpenTime) {
+  if (!state.tagCooldown) state.tagCooldown = {};
+  state.tagCooldown[label] = candleOpenTime != null ? { at: Date.now(), candleOpenTime } : Date.now();
+}
+
+// LIVE детектори (FLUSH/BASE/DISTRIBUTION/SQUEEZE/DUMP SQUEEZE/EARLY BUILD-UP/
+// WARMING/HOT/SUPER/SUPER DOWN/MM/MM x25/MM-OSC - всички, които НЕ подават
+// candleOpenTime) преди ползваха същия плосък 20-мин cooldown като по-горе -
+// проблем: ако condition-ът остане непрекъснато вярно повече от 20 мин (напр.
+// SUPER LONG активен 13:00->13:20 без прекъсване), 20-мин таймера просто
+// изтичаше и сигналът се връщаше обратно в newFired, макар нищо ново реално
+// да не се е случило - комбинирано с Active Signal Memory това можеше да
+// прати ВТОРО WhatsApp известие за същото продължаващо състояние (виж
+// PRIORITY 1 от финалния анализ). Сега вместо "мина ли Х минути", следим
+// НЕПРЕКЪСНАТОСТ на присъствието: state.liveSignalState[label].lastSeenAt се
+// опреснява на ВСЕКИ тик, докато condition-ът е верен (за да не изтече
+// паметта на активното доказателство - виж updateActiveSignals по-долу, което
+// вече получава ВСИЧКИ текущо-верни LIVE сигнали, не само новите). Само ако
+// мине повече от LIVE_PRESENCE_GAP_MS (толерира 1 пропуснат/забавен 5-мин cron
+// тик) БЕЗ да е бил виждан, следващото му появяване се брои за NEW EVENT.
+const LIVE_PRESENCE_GAP_MS = 12 * 60000;
+function isNewLiveEvent(state, label, now) {
+  const s = state.liveSignalState?.[label];
+  if (!s) return true;
+  return (now - s.lastSeenAt) > LIVE_PRESENCE_GAP_MS;
+}
+function markLiveSeen(state, label, now) {
+  if (!state.liveSignalState) state.liveSignalState = {};
+  state.liveSignalState[label] = { lastSeenAt: now };
+}
+
+// "Mario – Build-Up Detector + EMA Filter" - Early Build-Up на 1ч отваря 18ч
+// прозорец за 4ч Confirm, а Confirm + разширяващ се ATR дава Pre-Impulse.
+const BUILDUP_MAX_HOURS = 18;
+const BUILDUP_COOLDOWN_HOURS = 5;
+
+function buildUpCanArm(state) {
+  const s = state.buildUpCooldown;
+  if (!s) return true;
+  return (Date.now() - s.at) >= BUILDUP_COOLDOWN_HOURS * 3600000;
+}
+function markBuildUpArmed(state) {
+  state.buildUpCooldown = { at: Date.now() };
+}
+
+// "Mario – MM-OSC Entry Companion" - RE-ENTRY прозорец/cooldown, огледален на
+// mmOscState/mmOscCanFire/markMMOscFired от signal-scanner.html, но върху KV state.
+const MMOSC_REWINDOW_MIN = 90;
+const MMOSC_COOLDOWN_MIN = 100;
+
+function mmOscCanFire(state, dir) {
+  const s = state.mmOscCooldown?.[dir];
+  if (!s) return true;
+  return (Date.now() - s.at) >= MMOSC_COOLDOWN_MIN * 60000;
+}
+function markMMOscFired(state, dir) {
+  if (!state.mmOscCooldown) state.mmOscCooldown = {};
+  state.mmOscCooldown[dir] = { at: Date.now() };
+}
+
+// Binance блокира Cloudflare Workers-ите на ниво WAF (HTTP 403) - затова
+// заявките минават през малкия relay сървър на DigitalOcean (виж relay/README.md),
+// не директно към fapi.binance.com. RELAY_URL/RELAY_TOKEN са Worker Secrets.
+async function fetchKlinesWorker(env, symbol, interval, limit) {
+  const r = await fetchWithTimeout(`${env.RELAY_URL}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+  const bodyText = await r.text();
+  if (!r.ok) {
+    throw new Error(`Relay klines ${symbol} ${interval} -> HTTP ${r.status}: ${bodyText.slice(0, 300)}`);
+  }
+  try {
+    return JSON.parse(bodyText);
+  } catch (e) {
+    throw new Error(`Relay klines ${symbol} ${interval} -> non-JSON response (status ${r.status}): ${bodyText.slice(0, 300)}`);
+  }
+}
+
+// Долен/горен диапазон на последните `lookback` 1ч свещи - проста прокси мярка
+// за близка съпротива/подкрепа (не Fibonacci/pivot точки, само swing high/low).
+function calcSupportResistance(candles, lookback = 20) {
+  if (!candles.length) return { support: null, resistance: null };
+  const window = candles.slice(-lookback);
+  return {
+    resistance: Math.max(...window.map(c => c.high)),
+    support: Math.min(...window.map(c => c.low)),
+  };
+}
+
+// Съотношение дълги/къси позиции (Binance "Top Trader"/"Global" account ratio,
+// 1ч период) - през relay-я по същата причина като klines/ticker. Връща null
+// при грешка/липсващи данни, за да не чупи известието заради спомагателна инфо.
+async function fetchLongShortWorker(env, symbol) {
+  try {
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/longshort?symbol=${symbol}&period=1h&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const entry = Array.isArray(data) ? data[0] : null;
+    if (!entry) return null;
+    const longFrac = parseFloat(entry.longAccount), shortFrac = parseFloat(entry.shortAccount);
+    if (!isFinite(longFrac) || !isFinite(shortFrac)) return null;
+    return { longPct: (longFrac * 100).toFixed(1), shortPct: (shortFrac * 100).toFixed(1) };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Funding rate (Binance USDT-M futures) - през relay-я по същата причина като
+// klines/ticker/longshort. Връща процент (fundingRate*100, напр. 0.075 значи
+// 0.075%), byte-identical единица на coin.funding в signal-scanner.html
+// (`parseFloat(fundR[0].fundingRate)*100`). Връща null при грешка/липсващи
+// данни, за да не чупи checkMacroSqueeze заради спомагателна инфо.
+async function fetchFundingWorker(env, symbol) {
+  try {
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/funding?symbol=${symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const entry = Array.isArray(data) ? data[0] : null;
+    if (!entry) return null;
+    const funding = parseFloat(entry.fundingRate);
+    if (!isFinite(funding)) return null;
+    return funding * 100;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Скорошни ликвидационни каскади (CoinGlass API - вече платен, CG_API_KEY
+// secret вече съществува за проксито в fetch() handler-а по-долу). Пряко
+// извикване, БЕЗ DigitalOcean relay - CoinGlass, за разлика от Binance, не
+// блокира Cloudflare Workers IP-та на ниво WAF (виж съществуващия CoinGlass
+// proxy път в fetch() handler-а - вика се директно, без relay, вече години).
+// "side" в отговора: 1=Buy (SHORT позиции са били принудително ликвидирани ->
+// форсирано купуване -> бичи натиск), 2=Sell (LONG позиции ликвидирани ->
+// форсирана продажба -> мечи натиск) - огледално на CoinGlass конвенцията.
+// ВАЖНО: точните query параметри и имена на полета в отговора са изведени
+// САМО от публичната CoinGlass документация (docs.coinglass.com/reference/
+// liquidation-order) - тази среда няма достъп до външни домейни, за да ги
+// тества на живо. Прагът LIQUIDATION_CASCADE_USD_MIN е първоначална преценка,
+// не калибрирана с реални данни - очаква се наблюдение и евентуална корекция
+// след deploy (вижда се и в PR описанието).
+// ПОПРАВКА (IDEA 08): `min_liquidation_amount` е ЗАДЪЛЖИТЕЛЕН query параметър
+// според документацията, но липсваше досега - добавен с ниска стойност (1
+// USD), за да не филтрира реално нищо, само да удовлетвори изискването.
+// `price` полето вече също се извлича - нужно е за LIQUIDATION GRAVITY
+// (виж по-долу), CASCADE логиката по-долу не го е ползвала и продължава да
+// не го ползва.
+async function fetchLiquidationOrdersWorker(env, symbol) {
+  try {
+    const r = await fetchWithTimeout(`https://open-api-v4.coinglass.com/api/futures/liquidation/order?symbol=${symbol}&exchange=Binance&min_liquidation_amount=1`, {
+      headers: { 'CG-API-KEY': env.CG_API_KEY },
+    });
+    if (!r.ok) return null;
+    const json = await r.json();
+    const data = Array.isArray(json?.data) ? json.data : null;
+    if (!data) return null;
+    return data
+      .map(d => ({ side: Number(d.side), usdValue: parseFloat(d.usd_value), time: Number(d.time), price: parseFloat(d.price) }))
+      .filter(d => isFinite(d.usdValue) && isFinite(d.time));
+  } catch (e) {
+    return null;
+  }
+}
+const LIQUIDATION_LOOKBACK_MIN = 15;
+const LIQUIDATION_CASCADE_USD_MIN = 500000; // 500хил. USD - първоначален праг, нужна калибрация с реални данни
+function calcLiquidationCascade(orders, opts = {}) {
+  const lookbackMin = opts.lookbackMin ?? LIQUIDATION_LOOKBACK_MIN;
+  const usdMin = opts.usdMin ?? LIQUIDATION_CASCADE_USD_MIN;
+  if (!orders || !orders.length) return { bullish: false, bearish: false, buySumUsd: 0, sellSumUsd: 0 };
+  const cutoff = Date.now() - lookbackMin * 60000;
+  let buySumUsd = 0, sellSumUsd = 0;
+  for (const o of orders) {
+    if (o.time < cutoff) continue;
+    if (o.side === 1) buySumUsd += o.usdValue;
+    else if (o.side === 2) sellSumUsd += o.usdValue;
+  }
+  return { bullish: buySumUsd >= usdMin, bearish: sellSumUsd >= usdMin, buySumUsd, sellSumUsd };
+}
+
+// ═══ "SPARK" - ранно откриване ПРЕДИ импулса ═══════════════════════════════
+// ВАЖНО: НЕ е същото като съществуващия "🚀 PRE-IMPULSE" таг по-долу (Etap 3
+// от Build-Up Detector-а) - онзи е ПОСЛЕДНАТА стъпка от вече потвърден 4ч
+// build-up (build-up confirm + ATR expansion), тук говорим за много по-ранен
+// момент - ПРЕДИ дори Early Build-Up да се задейства, докато капиталът/
+// позиционирането тепърва започват да се променят (OI/обем ускоряват,
+// докато цената още не е направила голямо движение). Именуваме го SPARK, за
+// да не се бърка с вече съществуващото значение на PRE-IMPULSE.
+// Byte-identical копие на функциите от signal-logic.js (Scanner UI) - същата
+// конвенция както при цялата останала PHASE CYCLE ENGINE логика по-долу.
+function calcOiMultiDelta(oiHist) {
+  const n = oiHist ? oiHist.length : 0;
+  const deltaAt = (lookback) => {
+    if (n < lookback + 1) return null;
+    const now = oiHist[n - 1].oi, prev = oiHist[n - 1 - lookback].oi;
+    if (!prev) return null;
+    return ((now - prev) / prev) * 100;
+  };
+  return { delta5m: deltaAt(1), delta15m: deltaAt(3), delta1h: deltaAt(12) };
+}
+
+function calcVolAcceleration(candles1h, candles4h, opts = {}) {
+  const avgLen = opts.avgLen ?? 20;
+  if (!candles1h.length || candles4h.length < avgLen) return { ratio: null, tier: 'none' };
+  const vol1h = candles1h[candles1h.length - 1].volume;
+  const vol4hAvg = calcSMA(candles4h.map(c => c.volume), avgLen);
+  if (vol4hAvg == null || vol4hAvg <= 0) return { ratio: null, tier: 'none' };
+  const ratio = vol1h / vol4hAvg;
+  let tier = 'none';
+  if (ratio >= 2.0) tier = 'expansion';
+  else if (ratio >= 1.5) tier = 'strong';
+  else if (ratio >= 1.2) tier = 'buildup';
+  return { ratio, tier };
+}
+
+function calcPriceChangePct(candles, barsBack = 1) {
+  const n = candles.length;
+  if (n < barsBack + 1) return null;
+  const now = candles[n - 1].close, prev = candles[n - 1 - barsBack].close;
+  if (!prev) return null;
+  return ((now - prev) / prev) * 100;
+}
+
+function calcStructureShift(candles, opts = {}) {
+  const emaLen = opts.emaLen ?? 20;
+  const n = candles.length;
+  if (n < emaLen + 4) return { long: false, short: false };
+  const closes = candles.map(c => c.close);
+  const emaSeries = calcEMASeries(closes, emaLen);
+  const emaNow = emaSeries[n - 1], emaPrev = emaSeries[n - 2];
+  if (emaNow == null || emaPrev == null) return { long: false, short: false };
+  const last = candles[n - 1];
+  const reclaim = last.close > emaNow && emaNow > emaPrev;
+  const lose = last.close < emaNow && emaNow < emaPrev;
+  const higherLowsStructure = candles[n-1].low > candles[n-2].low || candles[n-2].low > candles[n-3].low;
+  const lowerHighsStructure = candles[n-1].high < candles[n-2].high || candles[n-2].high < candles[n-3].high;
+  return { long: reclaim && higherLowsStructure, short: lose && lowerHighsStructure };
+}
+
+const SPARK_FUNDING_EXTREME = 0.05;
+function calcSqueezeCondition({ funding, priceUp, oiUp, volUp }) {
+  if (funding == null) return { bullish: false, bearish: false };
+  const bullish = funding <= -SPARK_FUNDING_EXTREME && priceUp && oiUp && volUp;
+  const bearish = funding >= SPARK_FUNDING_EXTREME && !priceUp && oiUp && volUp;
+  return { bullish, bearish };
+}
+
+const SPARK_EXTENSION_1H_PCT = 20;
+const SPARK_EXTENSION_4H_PCT = 35;
+function calcPriceExtension(chg1h, chg4h) {
+  const extendedUp = (chg1h != null && chg1h >= SPARK_EXTENSION_1H_PCT) || (chg4h != null && chg4h >= SPARK_EXTENSION_4H_PCT);
+  const extendedDown = (chg1h != null && chg1h <= -SPARK_EXTENSION_1H_PCT) || (chg4h != null && chg4h <= -SPARK_EXTENSION_4H_PCT);
+  return { extended: extendedUp || extendedDown, extendedUp, extendedDown };
+}
+
+const SPARK_OI_THRESHOLD = { major: 3, semi: 5, minor: 8 };
+const SPARK_VOL_RATIO_THRESHOLD = { major: 1.3, semi: 1.5, minor: 1.8 };
+function getSparkCoinTier(symbol) {
+  if (MAJOR_COINS.has(symbol)) return 'major';
+  if (SEMI_MAJOR_COINS.has(symbol)) return 'semi';
+  return 'minor';
+}
+
+function calcSparkScore({ symbol, oiDelta15m, volAccel, chg1h, structureShift, squeeze, wallBias, htfAligned }) {
+  const tier = getSparkCoinTier(symbol);
+  const oiThreshold = SPARK_OI_THRESHOLD[tier];
+  const volThreshold = SPARK_VOL_RATIO_THRESHOLD[tier];
+  const oiAccelUp = oiDelta15m != null && oiDelta15m >= oiThreshold;
+  const oiAccelDown = oiDelta15m != null && oiDelta15m <= -oiThreshold;
+  const volAccelOK = volAccel != null && volAccel.ratio != null && volAccel.ratio >= volThreshold;
+  const priceCompressed = chg1h != null && Math.abs(chg1h) <= 4;
+  let longScore = 0, shortScore = 0;
+  if (oiAccelUp) longScore++;
+  if (oiAccelDown) shortScore++;
+  if (volAccelOK) { longScore++; shortScore++; }
+  if (priceCompressed) { longScore++; shortScore++; }
+  if (structureShift?.long) longScore++;
+  if (structureShift?.short) shortScore++;
+  if (squeeze?.bullish) longScore++;
+  if (squeeze?.bearish) shortScore++;
+  if (wallBias === 'long') longScore++;
+  if (wallBias === 'short') shortScore++;
+  if (htfAligned === 'long') longScore++;
+  if (htfAligned === 'short') shortScore++;
+
+  // Задължителен "твърд" фактор - реално наблюдавани SPARK известия (виж git
+  // history) достигаха 4/7+ САМО от "меки", direction-neutral фактори
+  // (priceCompressed + структура/wall/HTF), докато OI и обем изобщо не бяха
+  // ускорили - чист шум по време на тих пазар. Сега score-ът се брои
+  // нормално (за диагностика/показване), но getSparkTier по-долу отказва да
+  // класифицира каквото и да е като SPARK, ако нито OI, нито обемното
+  // ускорение реално са се задействали в тази посока.
+  const hasHardFactorLong = oiAccelUp || volAccelOK;
+  const hasHardFactorShort = oiAccelDown || volAccelOK;
+
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort };
+}
+
+const SPARK_LABELS = {
+  none: null,
+  earlyWatch: '👀 EARLY WATCH',
+  spark: '🟡 SPARK',
+  strongSpark: '🟠 STRONG SPARK',
+  highProbability: '🔥 HIGH PROBABILITY',
+  extreme: '🚨 EXTREME SETUP',
+};
+function getSparkTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 7) return 'extreme';
+  if (score >= 6) return 'highProbability';
+  if (score >= 5) return 'strongSpark';
+  if (score >= 4) return 'spark';
+  if (score >= 3) return 'earlyWatch';
+  return 'none';
+}
+
+// ═══ IDEA 07 - "RELATIVE FLOW" (BTC-independent flow) ═══════════════════════
+// Разграничава "монетата се събужда сама" от "монетата просто следва BTC".
+// Изцяло построен ВЪРХУ вече изчисления SPARK hard-factor gate (виж
+// calcSparkScore/getSparkTier по-горе) - нула нови мрежови заявки/данни:
+// BTC-ят вече минава през същия SPARK скан като всяка друга монета от
+// WATCHLIST (виж checkMarketSignals по-долу), само реюзваме неговия резултат
+// за сравнение. SHADOW MODE - изцяло информативно, не гейтва/блокира нищо
+// съществуващо. Byte-identical копие на функцията от signal-logic.js.
+const RELATIVE_FLOW_LABELS = {
+  none: null,
+  coinSpecific: '🎯 COIN-SPECIFIC',
+  marketDriven: '🌊 MARKET-DRIVEN',
+  mixed: '↔️ MIXED',
+};
+function calcRelativeFlow({ coinHasHardFactor, coinDirection, btcHasHardFactor, btcDirection, coinOiDelta15m, btcOiDelta15m, coinVolRatio, btcVolRatio }) {
+  if (!coinHasHardFactor) {
+    return { classification: 'none', oiDivergence: null, volDivergence: null };
+  }
+  const oiDivergence = (coinOiDelta15m ?? 0) - (btcOiDelta15m ?? 0);
+  const volDivergence = (coinVolRatio ?? 0) - (btcVolRatio ?? 0);
+  let classification;
+  if (!btcHasHardFactor) classification = 'coinSpecific';
+  else if (btcDirection === coinDirection) classification = 'marketDriven';
+  else classification = 'mixed';
+  return { classification, oiDivergence, volDivergence };
+}
+
+// ═══ TAKER BUY/SELL ОБЕМ - "CVD/Delta proxy" (инфраструктура за IDEA 01/05/06) ═
+// Binance klines дават само комбиниран обем (buy+sell слети) - без разбивка
+// не може да се различи "агресивно купуване" от "агресивна продажба", а точно
+// това търсят IDEA 01 (Absorption/Trap), IDEA 05 (Flow Warming) и IDEA 06
+// (Reload/Second Entry). futures/data/takerlongshortRatio е най-близкият
+// безплатен Binance proxy до истинско CVD/Delta - връща агресивен taker
+// buyVol/sellVol за периода (не суровен trader account ratio, какъвто е
+// globalLongShortAccountRatio по-горе). Изцяло нов, отделен слой - засега само
+// смята и връща данните (виж fetchTakerLongShortWorker и scanSymbolSignals
+// по-долу), не гейтва/сменя нищо съществуващо. Byte-identical копие на
+// функциите от signal-logic.js.
+function calcTakerBuyPressure(entry) {
+  if (!entry) return null;
+  const total = entry.buyVol + entry.sellVol;
+  if (!total) return null;
+  return (entry.buyVol / total) * 100;
+}
+// Мулти-грануларна delta на taker buy pressure (5m/15m/1h), огледално на
+// calcOiMultiDelta по-горе - от ЕДНА история с period=5m смятаме и трите delta
+// (5m = 1 период назад, 15m = 3 периода назад, 1h = 12 периода назад).
+// Ускоряващ се buyPressure БЕЗ пропорционално движение на цената е точно
+// "абсорбция"/"flow warming" сигналът, който IDEA 01/05 търсят.
+function calcTakerFlowDelta(takerHist) {
+  const n = takerHist ? takerHist.length : 0;
+  const now = n ? calcTakerBuyPressure(takerHist[n - 1]) : null;
+  const deltaAt = (lookback) => {
+    if (n < lookback + 1 || now == null) return null;
+    const prev = calcTakerBuyPressure(takerHist[n - 1 - lookback]);
+    if (prev == null) return null;
+    return now - prev;
+  };
+  return { buyPressureNow: now, delta5m: deltaAt(1), delta15m: deltaAt(3), delta1h: deltaAt(12) };
+}
+// Taker buy/sell обем (Binance futures/data/takerlongshortRatio) - през
+// relay-я по същата причина като klines/ticker/funding/openinterest. Връща
+// масив {time, buyVol, sellVol} във възходящ хронологичен ред (най-новото
+// последно), или null при грешка/липсващи данни - огледално на
+// fetchOpenInterestHistWorker по-долу.
+async function fetchTakerLongShortWorker(env, symbol, period = '5m', limit = 13) {
+  try {
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/takerlongshort?symbol=${symbol}&period=${period}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (!Array.isArray(data) || !data.length) return null;
+    return data.map(d => ({ time: d.timestamp, buyVol: parseFloat(d.buyVol), sellVol: parseFloat(d.sellVol) })).filter(d => isFinite(d.buyVol) && isFinite(d.sellVol));
+  } catch (e) {
+    return null;
+  }
+}
+
+// ═══ IDEA 05 - "FLOW WARMING" (Position Flow / Impulse Fuel Engine) ═══════════
+// Ранно предупреждение ПРЕДИ SPARK/официалния IMPULSE да са се задействали.
+// SPARK (виж calcSparkScore по-горе) вече гледа OI ускорение И обемно
+// ускорение поотделно (ИЛИ едно от двете е достатъчно за hard factor), но
+// никога taker CVD. Тук изискваме ДВОЕН, едновременен твърд фактор - OI
+// ускорение И taker buy/sell CVD ускорение (calcTakerFlowDelta по-горе) в
+// СЪЩАТА посока - по-строго от SPARK нарочно, за да хване по-рано точно
+// комбинацията "капиталът/агресивният поток вече се събужда заедно", преди
+// да е събрала достатъчно "меки" точки, за да мине SPARK прага. Byte-identical
+// копие на функциите от signal-logic.js.
+const FLOW_WARMING_TAKER_DELTA_THRESHOLD = 3; // пунктове (% buy pressure delta за 15м)
+function calcFlowWarmingScore({ symbol, oiDelta15m, takerDelta15m, volAccel, chg1h }) {
+  const tier = getSparkCoinTier(symbol);
+  const oiThreshold = SPARK_OI_THRESHOLD[tier];
+  const volThreshold = SPARK_VOL_RATIO_THRESHOLD[tier];
+  const oiAccelUp = oiDelta15m != null && oiDelta15m >= oiThreshold;
+  const oiAccelDown = oiDelta15m != null && oiDelta15m <= -oiThreshold;
+  const takerAccelUp = takerDelta15m != null && takerDelta15m >= FLOW_WARMING_TAKER_DELTA_THRESHOLD;
+  const takerAccelDown = takerDelta15m != null && takerDelta15m <= -FLOW_WARMING_TAKER_DELTA_THRESHOLD;
+  const volAccelOK = volAccel != null && volAccel.ratio != null && volAccel.ratio >= volThreshold;
+  const priceCompressed = chg1h != null && Math.abs(chg1h) <= 4;
+
+  let longScore = 0, shortScore = 0;
+  if (oiAccelUp && takerAccelUp) longScore += 2;
+  if (oiAccelDown && takerAccelDown) shortScore += 2;
+  if (volAccelOK) { longScore++; shortScore++; }
+  if (priceCompressed) { longScore++; shortScore++; }
+
+  // Твърд фактор тук е ДВОЙНО условие (за разлика от SPARK-овия hasHardFactor,
+  // който е "ИЛИ") - изисква OI И CVD едновременно да ускоряват в СЪЩАТА
+  // посока, не поотделно. Именно тази комбинация е новото спрямо SPARK.
+  const hasHardFactorLong = oiAccelUp && takerAccelUp;
+  const hasHardFactorShort = oiAccelDown && takerAccelDown;
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort };
+}
+const FLOW_WARMING_LABELS = {
+  none: null,
+  warming: '🌡️ FLOW WARMING',
+  leader: '🔥 EARLY FLOW LEADER',
+};
+// Максимален score е 4 (2т от двойния твърд фактор + 1т обем + 1т компресия).
+function getFlowWarmingTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'leader';
+  if (score >= 3) return 'warming';
+  return 'none';
+}
+
+// ═══ IDEA 01 - "ABSORPTION / TRAP GATE" (PRE-IMPULSE) ═══════════════════════
+// Търси "капан" за трейдъри на грешната страна - цена помита близка
+// swing high/low (ликвидиране на стопове/лимитни поръчки на грешната страна),
+// но веднага се "reclaim"-ва (SFP - Swing Failure Pattern), докато агресивният
+// (taker CVD) поток в посоката на помитането е бил ПОГЪЛНАТ, не е продължил.
+// ВАЖНО (изрично изискване на предложението): това е САМО ранно
+// предупреждение/watch - НЕ автоматичен entry сигнал, виж TRAP_LABELS и
+// известието по-долу. Byte-identical копие на функциите от signal-logic.js.
+function calcLiquiditySweep(candles, opts = {}) {
+  const lookback = opts.lookback ?? 20;
+  const n = candles.length;
+  if (n < lookback + 2) return { bullish: false, bearish: false, lowestLow: null, highestHigh: null };
+  const last = candles[n - 1];
+  const window = candles.slice(n - 1 - lookback, n - 1);
+  const lowestLow = Math.min(...window.map(c => c.low));
+  const highestHigh = Math.max(...window.map(c => c.high));
+  const bullish = last.low < lowestLow && last.close > lowestLow && last.close > last.open;
+  const bearish = last.high > highestHigh && last.close < highestHigh && last.close < last.open;
+  return { bullish, bearish, lowestLow, highestHigh };
+}
+
+const TRAP_TAKER_DELTA_THRESHOLD = 2;
+function calcTrapScore({ symbol, sweepBullish, sweepBearish, takerBuyPressure, takerDelta5m, oiDeltaPct, volAccel }) {
+  const tier = getSparkCoinTier(symbol);
+  const volThreshold = SPARK_VOL_RATIO_THRESHOLD[tier];
+  const bullishAbsorbed = sweepBullish && ((takerBuyPressure != null && takerBuyPressure >= 50) || (takerDelta5m != null && takerDelta5m >= TRAP_TAKER_DELTA_THRESHOLD));
+  const bearishAbsorbed = sweepBearish && ((takerBuyPressure != null && takerBuyPressure <= 50) || (takerDelta5m != null && takerDelta5m <= -TRAP_TAKER_DELTA_THRESHOLD));
+  const oiHeld = oiDeltaPct != null && oiDeltaPct >= 0;
+  const volAccelOK = volAccel != null && volAccel.ratio != null && volAccel.ratio >= volThreshold;
+
+  let longScore = 0, shortScore = 0;
+  if (bullishAbsorbed) longScore += 2;
+  if (bearishAbsorbed) shortScore += 2;
+  if (oiHeld) { longScore++; shortScore++; }
+  if (volAccelOK) { longScore++; shortScore++; }
+
+  return { longScore, shortScore, hasHardFactorLong: bullishAbsorbed, hasHardFactorShort: bearishAbsorbed };
+}
+const TRAP_LABELS = {
+  none: null,
+  watch: '🪤 TRAP WATCH',
+  confirmed: '🪤 TRAP CONFIRMED',
+};
+function getTrapTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'confirmed';
+  if (score >= 3) return 'watch';
+  return 'none';
+}
+
+// ═══ IDEA 06 - "IMPULSE RELOAD / SECOND-ENTRY ENGINE" ═══════════════════════
+// Решава "изпуснах първия вход" - IMPULSE -> контролиран pullback -> FLOW
+// RELOAD (обем спада, CVD се обръща обратно в посоката на импулса) -> SECOND
+// IMPULSE trigger (reclaim на micro-high/low + обем + CVD потвърждение).
+// ИЗРИЧНО НЕ Е DCA модул (виж спецификацията) - RELOAD е НОВ, независим
+// сигнал за вход, не осредняване на съществуваща позиция. "IMPULSE MEMORY" -
+// за разлика от обикновения candleTime cooldown на IMPULSE тага по-горе (той
+// само пречи на повторно известие за СЪЩИЯ impulse), тук изрично ПАЗИМ
+// impulse-а "жив" в state.reloadWindow вместо да го забравяме веднага, точно
+// за да хванем евентуален ВТОРИ вход. Изцяло Worker-only (виж прецедента с
+// PHASE CYCLE ENGINE по-горе - state machine, специфична за WhatsApp cron
+// потока, не част от browser Scanner UI-то, затова не се мирори в
+// signal-logic.js/signal-scanner.html).
+const RELOAD_MAX_HOURS = 12; // ако pullback+reload не се случат в тоя прозорец, забравяме impulse-а
+const RELOAD_PULLBACK_MIN_PCT = 0.5; // под това е шум, не истински pullback
+const RELOAD_PULLBACK_MAX_PCT = 8; // над това вече не е "контролиран" - инвалидира прозореца
+const RELOAD_VOL_CONFIRM_RATIO = 1.3; // първоначална преценка, нужна калибрация с реални данни
+
+function calcReloadPullbackPct(dir, extremePrice, price) {
+  if (extremePrice == null || price == null || !extremePrice) return null;
+  return dir === 1 ? ((extremePrice - price) / extremePrice) * 100 : ((price - extremePrice) / extremePrice) * 100;
+}
+// Веднъж открит истински pullback (pullbackPct >= MIN), "замразяваме" фазата -
+// extremePrice спира да следва движението (виж wiring-а в scanSymbolSignals)
+// и става фиксираният micro-high/low, който SECOND IMPULSE трябва да reclaim-не.
+function calcReloadPhaseTransition({ phase, pullbackPct }) {
+  if (phase === 'tracking' && pullbackPct != null && pullbackPct >= RELOAD_PULLBACK_MIN_PCT) return 'pullback';
+  return phase;
+}
+function calcReloadInvalidated(pullbackPct) {
+  return pullbackPct != null && pullbackPct > RELOAD_PULLBACK_MAX_PCT;
+}
+// SECOND IMPULSE trigger - reclaim на замразения micro-high/low + обем + CVD
+// потвърждение, САМО след като реално сме преминали през 'pullback' фаза
+// (не позволява да гръмне направо от 'tracking', без изобщо да е имало pullback).
+function calcSecondImpulseTrigger({ phase, dir, extremePrice, price, volAccel, takerDelta5m }) {
+  if (phase !== 'pullback' || extremePrice == null || price == null) return false;
+  const reclaimed = dir === 1 ? price > extremePrice : price < extremePrice;
+  const volConfirm = volAccel != null && volAccel.ratio != null && volAccel.ratio >= RELOAD_VOL_CONFIRM_RATIO;
+  const cvdConfirm = dir === 1 ? (takerDelta5m != null && takerDelta5m > 0) : (takerDelta5m != null && takerDelta5m < 0);
+  return reclaimed && volConfirm && cvdConfirm;
+}
+
+// ===================== VOLUME PROFILE ENGINE (обща основа за идеи 02/03/04) =====================
+// Истински tick-ниво Volume Profile не е възможен през безплатните Binance REST
+// ендпойнти (няма нито volume-profile, нито историческо orderbook API - само
+// klines с общ обем на цялата свещ). Затова тук строим ПРИБЛИЖЕНИЕ: обемът на
+// всяка свещ се разпределя пропорционално по ценовите нива, които тя покрива
+// (high-low диапазонът ѝ), и се натрупва в bucketCount равни ценови кошчета през
+// целия подаден прозорец от свещи (напр. последните 30 дневни затворени свещи -
+// избора кои свещи и колко назад е на извикващия код, не на тази функция).
+function buildVolumeProfile(candles, opts = {}) {
+  const bucketCount = opts.bucketCount || 50;
+  if (!Array.isArray(candles) || candles.length === 0) return null;
+  let rangeLow = Infinity, rangeHigh = -Infinity;
+  for (const c of candles) {
+    if (c.low < rangeLow) rangeLow = c.low;
+    if (c.high > rangeHigh) rangeHigh = c.high;
+  }
+  if (!(rangeHigh > rangeLow)) return null;
+  const bucketSize = (rangeHigh - rangeLow) / bucketCount;
+  const buckets = [];
+  for (let i = 0; i < bucketCount; i++) {
+    buckets.push({ priceLow: rangeLow + i * bucketSize, priceHigh: rangeLow + (i + 1) * bucketSize, volume: 0 });
+  }
+  for (const c of candles) {
+    const vol = c.volume || 0;
+    if (!(vol > 0)) continue;
+    const cRange = c.high - c.low;
+    if (!(cRange > 0)) {
+      // Свещ без диапазон (high===low) - целият ѝ обем отива в единственото
+      // кошче, което съдържа тази цена.
+      const idx = Math.min(bucketCount - 1, Math.max(0, Math.floor((c.high - rangeLow) / bucketSize)));
+      buckets[idx].volume += vol;
+      continue;
+    }
+    for (const b of buckets) {
+      const overlapLow = Math.max(c.low, b.priceLow);
+      const overlapHigh = Math.min(c.high, b.priceHigh);
+      if (overlapHigh > overlapLow) {
+        b.volume += vol * ((overlapHigh - overlapLow) / cRange);
+      }
+    }
+  }
+  const totalVolume = buckets.reduce((s, b) => s + b.volume, 0);
+  return { buckets, rangeLow, rangeHigh, bucketSize, totalVolume };
+}
+
+// POC (Point of Control) - ценовото ниво (среда на кошчето) с най-голям натрупан обем.
+function calcPOC(profile) {
+  if (!profile || !profile.buckets || profile.buckets.length === 0) return null;
+  let best = profile.buckets[0];
+  for (const b of profile.buckets) if (b.volume > best.volume) best = b;
+  return { price: (best.priceLow + best.priceHigh) / 2, priceLow: best.priceLow, priceHigh: best.priceHigh, volume: best.volume };
+}
+
+// Value Area (VAH/VAL) - стандартният "разширяване от POC навън" алгоритъм:
+// тръгва се от кошчето на POC и се добавя по-обемното от двете съседни кошчета
+// (ляво/дясно), докато покритият обем стигне targetPct (по подразбиране 70% -
+// класическата стойност за volume/market profile) от общия обем на профила.
+function calcValueArea(profile, opts = {}) {
+  const targetPct = opts.targetPct || 0.70;
+  if (!profile || !profile.buckets || profile.buckets.length === 0) return null;
+  const buckets = profile.buckets;
+  const totalVolume = profile.totalVolume || buckets.reduce((s, b) => s + b.volume, 0);
+  if (!(totalVolume > 0)) return null;
+  let pocIdx = 0;
+  for (let i = 1; i < buckets.length; i++) if (buckets[i].volume > buckets[pocIdx].volume) pocIdx = i;
+  let loIdx = pocIdx, hiIdx = pocIdx;
+  let covered = buckets[pocIdx].volume;
+  const target = totalVolume * targetPct;
+  while (covered < target && (loIdx > 0 || hiIdx < buckets.length - 1)) {
+    const volLo = loIdx > 0 ? buckets[loIdx - 1].volume : -1;
+    const volHi = hiIdx < buckets.length - 1 ? buckets[hiIdx + 1].volume : -1;
+    if (volHi >= volLo) { hiIdx++; covered += buckets[hiIdx].volume; }
+    else { loIdx--; covered += buckets[loIdx].volume; }
+  }
+  return { val: buckets[loIdx].priceLow, vah: buckets[hiIdx].priceHigh, coveredPct: covered / totalVolume };
+}
+
+// HVN (High Volume Node) / LVN (Low Volume Node) - локални върхове/долини в
+// профила спрямо средния обем на кошче. HVN = зони на приемане на цената
+// ("магнити" - идея 02 ще ги ползва за target/destination score), LVN = зони на
+// отхвърляне (пазарът обикновено минава бързо през тях, "празноти" в профила).
+function getHVNLVN(profile) {
+  if (!profile || !profile.buckets || profile.buckets.length < 3) return { hvn: [], lvn: [] };
+  const buckets = profile.buckets;
+  const avgVolume = profile.totalVolume / buckets.length;
+  const hvn = [], lvn = [];
+  for (let i = 1; i < buckets.length - 1; i++) {
+    const prev = buckets[i - 1].volume, cur = buckets[i].volume, next = buckets[i + 1].volume;
+    const mid = (buckets[i].priceLow + buckets[i].priceHigh) / 2;
+    if (cur > prev && cur > next && cur > avgVolume) hvn.push({ price: mid, volume: cur });
+    else if (cur < prev && cur < next && cur < avgVolume) lvn.push({ price: mid, volume: cur });
+  }
+  return { hvn, lvn };
+}
+
+// ═══ IDEA 02 - "TARGET / DESTINATION SCORE" ═══════════════════════════════════
+// POC-ът от Volume Profile Engine (виж по-горе) е ОСНОВНАТА цел - "магнит", към
+// който пазарът обичайно се връща (mean-reversion) след достатъчно отдалечаване
+// от него. HVN зоните са ДОПЪЛНИТЕЛНИ магнити по пътя - чисто информативни,
+// НЕ участват в score-а. Score-ът е нарочно САМО разстояние+сила на нивото (БЕЗ
+// OI/CVD hard factor изискване, за разлика от TRAP/FLOW WARMING) - потвърден с
+// потребителя.
+const TARGET_MIN_DISTANCE_PCT = 3; // под това % разстояние от POC няма смисъл от "цел" - вече е твърде близо
+
+function calcTargetDistancePct(price, targetPrice) {
+  if (price == null || targetPrice == null || !(price > 0)) return null;
+  return ((targetPrice - price) / price) * 100;
+}
+
+// Score 0-5: до 3т за разстояние (колкото по-отдалечена е цената от POC, толкова
+// по-силен обратен "пул"), до 2т за силата на самия POC (какъв дял държи от
+// целия обем на профила - по-голям дял = по-ясно изразен, по-надежден магнит).
+function calcTargetScore({ price, poc, profileTotalVolume }) {
+  if (price == null || !poc || poc.price == null) {
+    return { score: 0, direction: null, distancePct: null, levelStrengthPct: null, targetPrice: null };
+  }
+  const distancePct = calcTargetDistancePct(price, poc.price);
+  const absDistance = Math.abs(distancePct);
+  const direction = distancePct > 0 ? 'long' : 'short'; // POC над цената -> очакван "пул" нагоре (LONG); под цената -> надолу (SHORT)
+  const levelStrengthPct = (profileTotalVolume != null && profileTotalVolume > 0) ? (poc.volume / profileTotalVolume) * 100 : null;
+
+  let distancePts = 0;
+  if (absDistance >= 10) distancePts = 3;
+  else if (absDistance >= 6) distancePts = 2;
+  else if (absDistance >= TARGET_MIN_DISTANCE_PCT) distancePts = 1;
+
+  let strengthPts = 0;
+  if (levelStrengthPct != null) {
+    if (levelStrengthPct >= 8) strengthPts = 2;
+    else if (levelStrengthPct >= 4) strengthPts = 1;
+  }
+
+  return { score: distancePts + strengthPts, direction, distancePct, levelStrengthPct, targetPrice: poc.price };
+}
+
+const TARGET_LABELS = {
+  none: null,
+  watch: '🎯 TARGET WATCH',
+  strong: '🎯 TARGET STRONG',
+};
+// Изисква ЯВНО минимално разстояние (TARGET_MIN_DISTANCE_PCT) - под него цената
+// е твърде близо до POC, за да има смисъл от "цел" (вече почти е стигнала).
+function getTargetTier(score, distancePct) {
+  if (distancePct == null || Math.abs(distancePct) < TARGET_MIN_DISTANCE_PCT) return 'none';
+  if (score >= 4) return 'strong';
+  if (score >= 2) return 'watch';
+  return 'none';
+}
+
+// Намира най-близките HVN "магнити" ПО ПЪТЯ към POC (строго между текущата цена
+// и целта, в правилната посока) - чисто информативни, НЕ влизат в score-а.
+function findNearestMagnets(price, direction, targetPrice, hvnList = [], limit = 2) {
+  if (price == null || !direction || targetPrice == null || !Array.isArray(hvnList)) return [];
+  const relevant = hvnList.filter(n => direction === 'long'
+    ? (n.price > price && n.price <= targetPrice)
+    : (n.price < price && n.price >= targetPrice));
+  relevant.sort((a, b) => Math.abs(a.price - price) - Math.abs(b.price - price));
+  return relevant.slice(0, limit);
+}
+
+// ═══ HYSTERESIS (анти-flapping буфер) ═══════════════════════════════════════
+// Общ помощник за ВСИЧКИ score-базирани детектори (TARGET/TRAP/AUCTION/
+// MIGRATION/FLOW WARMING/LIQUIDATION GRAVITY) - без него дребно колебание на
+// score-а точно около границата на tier (напр. TARGET distancePct 10.0% ->
+// 9.8%, score 4 -> 3) сменя key-я (long:strong -> long:watch) и предизвиква
+// НОВО известие само на минути разстояние, макар посоката да е СЪЩАТА (реален
+// случай, видян в production). Правило: смяна на key ВИНАГИ пали известие
+// ВЕДНАГА, АКО посоката (direction) също се е сменила (long<->short е
+// съществена промяна, не шум) - но ако посоката е СЪЩАТА, а само tier/score-ът
+// е трепнал, изчакваме поне HYSTERESIS_COOLDOWN_MIN минути от последното
+// известие на този детектор, преди да позволим ново.
+const HYSTERESIS_COOLDOWN_MIN = 30;
+function canFireWithHysteresis(entry, key, direction, cooldownMin = HYSTERESIS_COOLDOWN_MIN) {
+  if (key === 'none') return false;
+  if (!entry || entry.key == null) return true;
+  if (entry.key === key) return false;
+  if (entry.direction !== direction) return true;
+  return (Date.now() - entry.at) >= cooldownMin * 60000;
+}
+
+// TARGET - огледално на flowWarmingCanFire/markFlowWarmingFired по-горе (LIVE-
+// style, без candleTime - key е чисто direction:tier, защото профилът се мени
+// бавно, веднъж на затворен ден), собствен KV state ключ (state.target).
+function targetCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.target, key, direction);
+}
+function markTargetFired(state, key, direction) {
+  state.target = { key, direction, at: Date.now() };
+}
+
+// ═══ IDEA 03 - "AUCTION QUALITY" ═══════════════════════════════════════════════
+// Оценява БАЛАНСА на Value Area от Volume Profile Engine (виж по-горе): широка/
+// тясна (ширина спрямо POC цената) и симетрична/скосена (къде седи POC вътре
+// във VAL..VAH). Тясна + скосена Value Area = "IMBALANCED/TREND" пазар - едната
+// страна доминира, автентично двупосочно наддаване е спряло. За разлика от
+// IDEA 02 (чисто структурно), тук ИМА hard factor изискване (OI и/или CVD да
+// потвърждават посоката на скоса) - потвърдено с потребителя.
+const AUCTION_NARROW_WIDTH_PCT = 6; // Value Area под 6% от POC цената = "тясна"
+const AUCTION_SKEW_THRESHOLD = 0.15; // |skewRatio| >= 0.15 (от -0.5..+0.5 обхват) = достатъчно скосена от центъра
+
+// skewRatio: -0.5 (POC точно на VAL) .. 0 (POC точно по средата, симетрично) .. +0.5 (POC точно на VAH).
+function calcAuctionQualityScore({ poc, vah, val, oiDeltaPct, takerDelta, volAccel }) {
+  if (!poc || poc.price == null || vah == null || val == null || !(vah > val) || !(poc.price > 0)) {
+    return { longScore: 0, shortScore: 0, hasHardFactorLong: false, hasHardFactorShort: false, widthPct: null, skewRatio: null };
+  }
+  const widthPct = ((vah - val) / poc.price) * 100;
+  const skewRatio = (poc.price - val) / (vah - val) - 0.5;
+  const isNarrow = widthPct < AUCTION_NARROW_WIDTH_PCT;
+  const isSkewedLong = skewRatio >= AUCTION_SKEW_THRESHOLD; // POC изместен към VAH - купувачите защитават високите нива
+  const isSkewedShort = skewRatio <= -AUCTION_SKEW_THRESHOLD; // POC изместен към VAL - продавачите защитават ниските нива
+
+  const oiConfirmLong = oiDeltaPct != null && oiDeltaPct > 0;
+  const oiConfirmShort = oiDeltaPct != null && oiDeltaPct < 0;
+  const cvdConfirmLong = takerDelta != null && takerDelta > 0;
+  const cvdConfirmShort = takerDelta != null && takerDelta < 0;
+  const volOK = volAccel != null && volAccel.tier !== 'none';
+
+  const hasHardFactorLong = isNarrow && isSkewedLong && (oiConfirmLong || cvdConfirmLong);
+  const hasHardFactorShort = isNarrow && isSkewedShort && (oiConfirmShort || cvdConfirmShort);
+
+  let longScore = 0, shortScore = 0;
+  if (isNarrow) { longScore++; shortScore++; }
+  if (isSkewedLong) longScore += 2;
+  if (isSkewedShort) shortScore += 2;
+  if (volOK) { longScore++; shortScore++; }
+
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort, widthPct, skewRatio };
+}
+
+const AUCTION_LABELS = {
+  none: null,
+  watch: '⚖️ AUCTION WATCH',
+  confirmed: '⚖️ AUCTION CONFIRMED',
+};
+// Максимален score е 4 (1т тясна + 2т скос + 1т обем), огледално на getTrapTier по-горе.
+function getAuctionQualityTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'confirmed';
+  if (score >= 3) return 'watch';
+  return 'none';
+}
+
+// AUCTION - огледално на flowWarmingCanFire/markFlowWarmingFired по-горе (LIVE-
+// style, без candleTime), собствен KV state ключ (state.auction).
+function auctionCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.auction, key, direction);
+}
+function markAuctionFired(state, key, direction) {
+  state.auction = { key, direction, at: Date.now() };
+}
+
+// ═══ AUTO VAH/VAL STRUCTURE DETECTOR ═══════════════════════════════════════════
+// Автоматично следи VAH/VAL (от Volume Profile Engine по-горе, вече изчислени
+// за ВСЯКА монета) за ВСИЧКИТЕ 23 WATCHLIST монети - БЕЗ ръчно въвеждане (за
+// разлика от PRICE_LEVELS_WATCHLIST по-долу, който остава отделен модул за
+// специфични ръчни нива). Чисто structure/price-based - OI/CVD НЕ са hard
+// factor тук (за разлика от TRAP/AUCTION/MIGRATION) - самият reclaim/rejection
+// на VAH/VAL Е структурното потвърждение. Изцяло независим от TARGET - двата
+// НЕ се гейтват едно друго; комбинацията им (напр. TARGET SHORT + VAH
+// REJECTION) е чисто информационна конвергенция, наблюдавана в известията.
+//
+// 4 събития: VAH RECLAIM/REJECTION, VAL RECLAIM/REJECTION - и двете нива се
+// "атакуват" САМО откъм страната, от която цената идва (виж бележките при
+// calcVahValStructureEvent) - WICK ≠ SIGNAL, изисква се CONFIRMED close отвъд
+// нивото (VAHVAL_CONFIRM_BUFFER_PCT буфер, не просто минимално прекосяване).
+//
+// Anti-spam: "armed/re-arm" state machine, не candleTime dedup (chop около
+// нивото би дал различен candleTime на всяка свещ и пак би спамил) - веднъж
+// произведено събитие, detector-ът се "обезоръжава" (armed=false) и чака ЕДНО
+// от: (а) цената да се отдалечи достатъчно (VAHVAL_REARM_DISTANCE_PCT), (б)
+// cooldown да изтече (VAHVAL_REARM_COOLDOWN_MIN), или (в) самото ниво да се
+// измести структурно (>=1%, Volume Profile-ът се обновява дневно) - преди да
+// позволи ново събитие на СЪЩОТО ниво.
+//
+// Timeframe: ползва последната затворена 15м свещ (c15Closed, вече изтеглена
+// за структурните тагове) - нарочно изолирано в call site-а по-долу, лесно
+// сменяемо с c1hClosed/c4hClosed, ако бъде решено по-късно след наблюдение.
+const VAHVAL_CONFIRM_BUFFER_PCT = 0.15; // % отвъд нивото, нужен за "потвърден" close
+const VAHVAL_REARM_DISTANCE_PCT = 1.5; // % отдалечаване от нивото -> re-arm
+const VAHVAL_REARM_COOLDOWN_MIN = 60; // алтернативно: толкова минути от последното събитие -> re-arm
+
+// Обновява/връща резултат за ЕДНО ниво (VAH или VAL) - вика се 2 пъти
+// (веднъж за VAH, веднъж за VAL) от scanSymbolSignals по-долу. `entry` е
+// state.vahStruct/state.valStruct - мутира се directly (огледално на
+// reloadWindow другаде в този файл).
+function calcVahValStructureEvent(entry, candle, level) {
+  if (!candle || level == null || !(level > 0)) return { fired: false };
+  const bufferAbs = level * VAHVAL_CONFIRM_BUFFER_PCT / 100;
+  const confirmedAbove = candle.close > level + bufferAbs;
+  const confirmedBelow = candle.close < level - bufferAbs;
+  const distancePct = Math.abs(candle.close - level) / level * 100;
+
+  if (entry.side == null) {
+    // Първо наблюдение за тази монета+ниво - само baseline, без събитие.
+    entry.side = confirmedAbove ? 'above' : 'below';
+    entry.lastLevel = level;
+    return { fired: false };
+  }
+
+  if (!entry.armed) {
+    const levelShifted = entry.lastLevel != null && Math.abs(level - entry.lastLevel) / entry.lastLevel * 100 >= 1;
+    const movedAway = distancePct >= VAHVAL_REARM_DISTANCE_PCT;
+    const cooledDown = entry.lastEventAt != null && (Date.now() - entry.lastEventAt) >= VAHVAL_REARM_COOLDOWN_MIN * 60000;
+    if (levelShifted || movedAway || cooledDown) entry.armed = true;
+  }
+
+  let fired = false, eventType = null;
+  if (entry.side === 'below') {
+    if (confirmedAbove) {
+      if (entry.armed) { fired = true; eventType = 'reclaim'; entry.armed = false; entry.lastEventAt = Date.now(); }
+      entry.side = 'above';
+    } else if (candle.high >= level && entry.armed) {
+      fired = true; eventType = 'rejection'; entry.armed = false; entry.lastEventAt = Date.now();
+    }
+  } else {
+    // Огледално на клона по-горе (bug fix - преди тук НИКОГА не палеше събитие,
+    // дори armed, само тих "give-back" reset на side): confirmedBelow с armed
+    // -> BREAKDOWN (потвърден пробив надолу, SHORT), огледално на reclaim;
+    // low докосва нивото без потвърждение -> BOUNCE (неуспешна атака отгоре,
+    // LONG), огледално на rejection.
+    if (confirmedBelow) {
+      if (entry.armed) { fired = true; eventType = 'breakdown'; entry.armed = false; entry.lastEventAt = Date.now(); }
+      entry.side = 'below';
+    } else if (candle.low <= level && entry.armed) {
+      fired = true; eventType = 'bounce'; entry.armed = false; entry.lastEventAt = Date.now();
+    }
+  }
+  entry.lastLevel = level;
+  // Пази последния РЕАЛЕН eventType (не се трие при give-back/тихи тикове) -
+  // ползва се от SETUP слоя (ENTRY ENGINE, виж по-долу) за да знае "текущата
+  // структурна позиция" на нивото, не само моментния tick, в който е паднало.
+  if (fired) entry.lastEventType = eventType;
+
+  return fired ? { fired: true, eventType, level, distancePct } : { fired: false };
+}
+
+const VAHVAL_LABELS = {
+  'vah:reclaim': '📈 VAH RECLAIM',
+  'vah:rejection': '📉 VAH REJECTION',
+  'vah:breakdown': '📉 VAH BREAKDOWN',
+  'vah:bounce': '📈 VAH BOUNCE',
+  'val:reclaim': '📈 VAL RECLAIM',
+  'val:rejection': '📉 VAL REJECTION',
+  'val:breakdown': '📉 VAL BREAKDOWN',
+  'val:bounce': '📈 VAL BOUNCE',
+};
+
+// ═══ ENTRY ENGINE - ЕТАП 1: "SETUP" ═════════════════════════════════════════════
+// Пълна поредица: 🎯 TARGET ("има цел") -> 👀 SETUP ("наблюдавай") -> ⚡ ARMED
+// ("подготвя се") -> 🔥 ENTRY CONFIRMED ("ТОВА Е ВХОД") -> exit management.
+// SETUP е ПЪРВИЯТ слой - НЕ Е entry, само "тази монета вече заслужава внимание
+// в LONG/SHORT посока". База (задължителна): TARGET (tier != none) + VAH/VAL
+// structure alignment в СЪЩАТА посока (viж vahvalEventDirection по-долу) -
+// двете заедно са ДОСТАТЪЧНИ за SETUP. TRAP/AUCTION QUALITY/VALUE MIGRATION
+// са ДОПЪЛНИТЕЛНИ quality/score фактори, НЕ hard gate - липсата им не отменя
+// SETUP (потвърдено изрично с потребителя - не искаме over-gate на този слой,
+// истинското филтриране идва в по-късните етапи ARMED/ENTRY TRIGGER).
+function vahvalEventDirection(eventType) {
+  if (eventType === 'reclaim' || eventType === 'bounce') return 'long';
+  if (eventType === 'rejection' || eventType === 'breakdown') return 'short';
+  return null;
+}
+
+// Връща { direction, score, breakdown } - direction е null, ако базата
+// (TARGET + VAH/VAL alignment) не е изпълнена (= няма SETUP). score е 2-5:
+// 2 винаги (базата), +1 за всеки допълнителен фактор в СЪЩАТА посока.
+function calcSetupState({
+  targetDirection, targetTier, vahLastEventType, valLastEventType,
+  trapDirection, trapTier, auctionDirection, auctionTier, migrationDirection, migrationTier,
+}) {
+  if (targetTier === 'none' || !targetDirection) return { direction: null, score: 0, breakdown: {} };
+  const vahDir = vahvalEventDirection(vahLastEventType);
+  const valDir = vahvalEventDirection(valLastEventType);
+  if (vahDir !== targetDirection && valDir !== targetDirection) return { direction: null, score: 0, breakdown: {} };
+
+  const direction = targetDirection;
+  const breakdown = {
+    trap: trapTier !== 'none' && trapDirection === direction,
+    auction: auctionTier !== 'none' && auctionDirection === direction,
+    migration: migrationTier !== 'none' && migrationDirection === direction,
+  };
+  let score = 2; // TARGET + VAH/VAL база
+  if (breakdown.trap) score++;
+  if (breakdown.auction) score++;
+  if (breakdown.migration) score++;
+  return { direction, score, breakdown };
+}
+
+// Anti-spam: НЕ е score/tier дребно колебание (виж canFireWithHysteresis по-
+// горе) - SETUP е по-скоро БИНАРНО "включено/изключено" събитие. Затова
+// firing логиката е нарочно по-проста: пали САМО при нова активация (от
+// изключено -> включено) или при смяна на посоката - НЕ при промяна на
+// quality score-а, докато посоката остава същата (score-ът е чисто
+// информационен, виж бележката при calcSetupState). Когато SETUP стане
+// неактивен, state.setup изрично се изчиства - следваща активация в СЪЩАТА
+// посока по-късно ще пали НАНОВО (за разлика от canFireWithHysteresis, където
+// същия key никога не пали пак - тук искаме точно обратното).
+function setupCanFire(state, direction) {
+  if (!direction) return false;
+  return !state.setup || state.setup.direction !== direction;
+}
+function markSetupFired(state, direction, score, price) {
+  // MR RE-ARM DIAGNOSTIC TELEMETRY - reArmCount/lastArmStructRef живеят на
+  // episode (state.setup) ниво и се нулират тук при ВСЯКО ново markSetupFired
+  // (нов episode или смяна на посока) - виж wiring-а в ARM формирането
+  // по-долу. Чисто diagnostic state, не участва в SETUP/ARMED/ENTRY решения.
+  state.setup = { direction, score, at: Date.now(), price: price ?? null, reArmCount: 0, lastArmStructRef: null };
+}
+
+// ═══ TREND CONTINUATION SETUP (втори, независим SETUP режим) ═══════════════════
+// Огледално на calcSetupState по-горе (MEAN REVERSION), но с ОБърнати роли:
+// direction driver-ът тук е computeDirectionConfidence().direction/.confident
+// (вече съществуващата SIGNAL_WEIGHTS/ACTIVE SIGNAL MEMORY тегловна система,
+// вижда TREND CONTINUATION-ите РАНО - виж SUI 42-screen анализа) - TARGET
+// НЕ участва тук изобщо (остава чист mean-reversion detector, недокоснат).
+// TRAP/AUCTION/MIGRATION остават score-only quality фактори, точно както при
+// MEAN REVERSION - никаква нова логика за тях, само reuse.
+// Mandatory gate: confident (= вече съществуващите ratioOK ÷4 И enoughScore
+// ≥MIN_TP_SCORE) - НУЛА нови прагове, точно механизмът, който реално хвана
+// SUI LONG рано в производствените данни.
+function calcTrendContinuationSetupState({
+  direction, confident,
+  trapDirection, trapTier, auctionDirection, auctionTier, migrationDirection, migrationTier,
+}) {
+  if (!confident || !direction) return { direction: null, score: 0, breakdown: {} };
+  const breakdown = {
+    trap: trapTier !== 'none' && trapDirection === direction,
+    auction: auctionTier !== 'none' && auctionDirection === direction,
+    migration: migrationTier !== 'none' && migrationDirection === direction,
+  };
+  let score = 2; // confident direction majority база (огледално на TARGET+VAH/VAL база=2 при MEAN REVERSION)
+  if (breakdown.trap) score++;
+  if (breakdown.auction) score++;
+  if (breakdown.migration) score++;
+  return { direction, score, breakdown };
+}
+
+// Edge-triggered fire/mark - byte-for-byte огледално на setupCanFire/
+// markSetupFired по-горе, но върху ОТДЕЛЕН state.trendSetup слот - НЕ пипа
+// state.setup (MEAN REVERSION), за да могат двата режима да останат
+// едновременно активни в противоположни посоки (виж SUI конфликт кейса:
+// TARGET SHORT + TREND CONTINUATION LONG едновременно, часове наред).
+function trendSetupCanFire(state, direction) {
+  if (!direction) return false;
+  return !state.trendSetup || state.trendSetup.direction !== direction;
+}
+function markTrendSetupFired(state, direction, score, price) {
+  state.trendSetup = { direction, score, at: Date.now(), price: price ?? null };
+}
+
+// ═══ ENTRY ENGINE - ЕТАП 2: "ARMED" ══════════════════════════════════════════════
+// Чисто structure/price-action - БЕЗ momentum/CVD/OI (те остават за ENTRY
+// TRIGGER, Етап 3). Non-repainting N-bar fractal swing detection на 5м:
+// свещ `i` се потвърждава като swing high/low едва когато `i+N` вече е
+// затворена - "сега" винаги гледа назад, никога напред (виж
+// updateSwingStructure по-долу). ARMED gate е sticky - веднъж достигнат,
+// остава активен докато SETUP не се деактивира/смени посока, или изтече
+// ARMED_EXPIRY_HOURS (виж wiring-а в scanSymbolSignals).
+const SWING_FRACTAL_N = 2; // свещи от всяка страна, нужни за потвърждение на pivot
+const SWING_MIN_AMPLITUDE_PCT = 0.3; // минимална амплитуда - филтрира плоски/незначителни pivot-и
+const STRUCTURE_BREAK_BUFFER_PCT = 0.15; // confirmed close буфер (WICK != SIGNAL, огледално на VAHVAL_CONFIRM_BUFFER_PCT)
+const ARMED_EXPIRY_HOURS = 6; // ARMED изтича, ако ENTRY TRIGGER не дойде до толкова часа - първоначална преценка
+
+function isSwingHigh(candles, i, n) {
+  const h = candles[i].high;
+  for (let k = i - n; k <= i + n; k++) { if (k !== i && candles[k].high >= h) return false; }
+  return true;
+}
+function isSwingLow(candles, i, n) {
+  const l = candles[i].low;
+  for (let k = i - n; k <= i + n; k++) { if (k !== i && candles[k].low <= l) return false; }
+  return true;
+}
+function swingAmplitudePct(candles, i, n, isHigh) {
+  if (isHigh) {
+    let minLow = Infinity;
+    for (let k = i - n; k <= i + n; k++) { if (k !== i) minLow = Math.min(minLow, candles[k].low); }
+    return (candles[i].high - minLow) / candles[i].high * 100;
+  }
+  let maxHigh = -Infinity;
+  for (let k = i - n; k <= i + n; k++) { if (k !== i) maxHigh = Math.max(maxHigh, candles[k].high); }
+  return (maxHigh - candles[i].low) / candles[i].low * 100;
+}
+
+// Обработва ВСИЧКИ новопотвърдими pivot кандидати от последната обработена
+// свещ насам (state.swingStruct.lastCheckedTime) - всеки кандидат се
+// обработва ТОЧНО ВЕДНЪЖ между тиковете, никога повторно. Мутира `entry`
+// directly (огледално на reloadWindow/vahStruct другаде в този файл).
+function updateSwingStructure(entry, candles) {
+  const n = SWING_FRACTAL_N;
+  if (!Array.isArray(candles) || candles.length < 2 * n + 1) return;
+  const maxCheckableIndex = candles.length - 1 - n;
+  let startIndex = n;
+  if (entry.lastCheckedTime != null) {
+    const foundIdx = candles.findIndex(c => c.openTime === entry.lastCheckedTime);
+    if (foundIdx !== -1) startIndex = foundIdx + 1;
+  }
+  for (let i = startIndex; i <= maxCheckableIndex; i++) {
+    if (i - n < 0) continue;
+    if (isSwingHigh(candles, i, n) && swingAmplitudePct(candles, i, n, true) >= SWING_MIN_AMPLITUDE_PCT) {
+      entry.prevSwingHigh = entry.lastSwingHigh;
+      entry.lastSwingHigh = { price: candles[i].high, time: candles[i].openTime };
+    }
+    if (isSwingLow(candles, i, n) && swingAmplitudePct(candles, i, n, false) >= SWING_MIN_AMPLITUDE_PCT) {
+      entry.prevSwingLow = entry.lastSwingLow;
+      entry.lastSwingLow = { price: candles[i].low, time: candles[i].openTime };
+    }
+    entry.lastCheckedTime = candles[i].openTime;
+  }
+}
+
+function calcLowerHigh(entry) {
+  return !!(entry.lastSwingHigh && entry.prevSwingHigh && entry.lastSwingHigh.price < entry.prevSwingHigh.price);
+}
+function calcHigherLow(entry) {
+  return !!(entry.lastSwingLow && entry.prevSwingLow && entry.lastSwingLow.price > entry.prevSwingLow.price);
+}
+// "Loss of structure" (SHORT) / "reclaim" (LONG) - CONFIRMED 5м close отвъд
+// последния потвърден swing low/high + буфер - wick сам по себе си е само
+// sweep/информация, не structure break (виж дискусията).
+function calcStructureLossDown(entry, lastClosedCandle) {
+  if (!entry.lastSwingLow || !lastClosedCandle) return false;
+  return lastClosedCandle.close < entry.lastSwingLow.price * (1 - STRUCTURE_BREAK_BUFFER_PCT / 100);
+}
+function calcStructureReclaimUp(entry, lastClosedCandle) {
+  if (!entry.lastSwingHigh || !lastClosedCandle) return false;
+  return lastClosedCandle.close > entry.lastSwingHigh.price * (1 + STRUCTURE_BREAK_BUFFER_PCT / 100);
+}
+
+// ARMED gate - чисто структурен: SETUP посока + (lowerHigh/higherLow ИЛИ
+// structure loss/reclaim). Връща 'long'/'short', ако условието е изпълнено
+// точно СЕГА (wiring-ът решава дали да армира/остане sticky - виж по-долу).
+function calcArmedTrigger(setupDirection, swingEntry, lastClosedCandle) {
+  if (setupDirection === 'short') {
+    return (calcLowerHigh(swingEntry) || calcStructureLossDown(swingEntry, lastClosedCandle)) ? 'short' : null;
+  }
+  if (setupDirection === 'long') {
+    return (calcHigherLow(swingEntry) || calcStructureReclaimUp(swingEntry, lastClosedCandle)) ? 'long' : null;
+  }
+  return null;
+}
+
+// MR RE-ARM DIAGNOSTIC TELEMETRY (diagnostic-only, виж discussion-а "дали
+// многократните ENTRY известия са полезни или шум") - ЧИСТО observational
+// replay на ТОЧНО СЪЩИЯ приоритет като calcArmedTrigger по-горе (fresh pivot
+// проверен ПЪРВО, structure break/reclaim ВТОРО, огледално на `||`
+// short-circuit реда там) - calcArmedTrigger остава БАЙТ-ИДЕНТИЧНА, нищо тук
+// не влияе на fire gate-а. Вика се САМО след като calcArmedTrigger вече е
+// върнала non-null за тоя tick (виж wiring-а в scanSymbolSignals) - връща
+// null само в defensive случая, в който нито едно от двете условия не се
+// повтаря вярно (не би трябвало да се случи, но не гадаем).
+function calcArmedTriggerSource(setupDirection, swingEntry, lastClosedCandle) {
+  if (setupDirection === 'short') {
+    if (calcLowerHigh(swingEntry)) return 'fresh_pivot';
+    if (calcStructureLossDown(swingEntry, lastClosedCandle)) return 'structure_break';
+    return null;
+  }
+  if (setupDirection === 'long') {
+    if (calcHigherLow(swingEntry)) return 'fresh_pivot';
+    if (calcStructureReclaimUp(swingEntry, lastClosedCandle)) return 'structure_break';
+    return null;
+  }
+  return null;
+}
+
+// ═══ ENTRY ENGINE - ЕТАП 3: "ENTRY TRIGGER" ══════════════════════════════════════
+// Последният преход: ARMED -> 🔥 ENTRY CONFIRMED (или ⚠️ MISSED). 5м = execution
+// (самата trigger свещ), 15м = само non-contradiction филтър (не самостоятелен
+// trigger), 1ч/4ч = контекст (score boost, не hard gate) - виж дискусията.
+const TRIGGER_MIN_RANGE_ATR_MULTIPLE = 0.5; // trigger/15м свещта трябва да е поне толкова × ATR range - филтрира doji/шум
+const CHASE_MAX_ATR_MULTIPLE = 1.5; // ако trigger close е по-далеч от структурната референция с толкова × ATR -> MISSED
+
+// Trigger свещ: CONFIRMED close в посоката (не wick) + истинско тяло спрямо
+// ATR (не doji-шум).
+function isTriggerCandle(candle, direction, atr) {
+  if (!candle || !(atr > 0)) return false;
+  if (candle.high - candle.low < atr * TRIGGER_MIN_RANGE_ATR_MULTIPLE) return false;
+  return direction === 'short' ? candle.close < candle.open : candle.close > candle.open;
+}
+// 15м "противоречи" = силна свещ (истинско тяло спрямо 15м ATR) в ОБРАТНАТА
+// посока - не изисква собствен trigger, само не бива да е активно против нас.
+function contradicts15m(candle15, direction, atr15) {
+  if (!candle15 || !(atr15 > 0)) return false;
+  if (candle15.high - candle15.low < atr15 * TRIGGER_MIN_RANGE_ATR_MULTIPLE) return false;
+  return direction === 'short' ? candle15.close > candle15.open : candle15.close < candle15.open;
+}
+// CHASE PROTECTION - структурната референция (currentSwingReference) вече по
+// конструкция НЕ гони цената по време на силен едностранен импулс (fractal-ът
+// изисква истинска пауза от 2 свещи от двете страни, за да потвърди нов swing
+// - виж дискусията) - remove risk от overfit чрез фиксирана % дистанция,
+// вместо това ATR-relative (адаптира се към волатилността на всяка монета).
+function isTooExtended(triggerClose, structRef, atr) {
+  if (structRef == null || !(atr > 0)) return false;
+  return Math.abs(triggerClose - structRef) > atr * CHASE_MAX_ATR_MULTIPLE;
+}
+
+// FLOW - асиметрична логика (потвърдена с потребителя): supportive -> +1
+// score; neutral (нито един от двата детектора активен) -> не влияе; opposing
+// (TRAP/FLOW WARMING с hard factor в ОБРАТНАТА посока) -> temporary VETO -
+// НЕ чупи ARMED, просто не пали ENTRY този тик (изчаква следващ тик/trigger).
+// Реюзва вече калибрираните TRAP/FLOW WARMING прагове - без нови "магически"
+// OI%/CVD% граници.
+function calcFlowVeto({ direction, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier }) {
+  return (flowWarmingTier !== 'none' && flowWarmingDirection !== direction) ||
+    (trapTier !== 'none' && trapDirection !== direction);
+}
+function calcFlowBoost({ direction, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier }) {
+  return (flowWarmingTier !== 'none' && flowWarmingDirection === direction) ||
+    (trapTier !== 'none' && trapDirection === direction);
+}
+
+// Обединява всичко - връща { status: 'none'|'veto'|'missed'|'entry', ... }.
+// 'veto' е ДИАГНОСТИЧНО отделен от 'none' (виж TELEMETRY по-долу) - самото
+// поведение е идентично на преди (не пали ENTRY, не консумира ARMED), само
+// етикетът е по-конкретен за наблюдение. ENTRY SCORE 2 (STRUCTURE+TRIGGER
+// база, гарантирани щом статусът е 'entry') + до 3 boost точки (15м
+// confirmation, FLOW, HTF context) - същата рамка като SETUP score-а.
+function calcEntryTrigger({ direction, candle5m, atr5m, candle15m, atr15m, structRef, flowVeto, flowBoost, htfAligned }) {
+  if (!isTriggerCandle(candle5m, direction, atr5m)) return { status: 'none' };
+  if (flowVeto) return { status: 'veto', triggerClose: candle5m.close, structRef };
+  if (isTooExtended(candle5m.close, structRef, atr5m)) {
+    return { status: 'missed', triggerClose: candle5m.close, structRef };
+  }
+  const confirmation15m = !contradicts15m(candle15m, direction, atr15m);
+  const score = 2 + (confirmation15m ? 1 : 0) + (flowBoost ? 1 : 0) + (htfAligned ? 1 : 0);
+  return { status: 'entry', score, confirmation15m, flowBoost, htfAligned, triggerClose: candle5m.close, structRef };
+}
+
+// ═══ ENTRY ENGINE - TELEMETRY (диагностика, НЕ променя ENTRY логиката) ═════════
+// Записва структурирани данни за всяко ENTRY CONFIRMED/MISSED/VETO събитие,
+// плюс outcome на НЯКОЛКО хоризонта (+5м/+15м/+30м/+60м, виж
+// buildPendingOutcomeHorizons/resolvePendingOutcomeHorizons по-долу) - изцяло
+// observability слой, не участва в score/gate решенията по-горе. Собствен KV
+// namespace (telemetry:), не се чете обратно от ENTRY логиката.
+//
+// Диагностичен въпрос: двата SETUP режима (MEAN REVERSION/TREND CONTINUATION)
+// може да имат различен "правилен" outcome прозорец - +15м може да пасва на
+// единия, но да е твърде рано/късно за другия. Всичките 4 хоризонта се смятат
+// от ЕДНА и съща вече изтеглена `price` (виж wiring-а в scanSymbolSignals) -
+// БЕЗ никакви нови мрежови заявки, само по-нататъшно изчакване на съществуващия
+// tick цикъл.
+// PR #113-след (4h хоризонт, предпазлив първи стъпка - виж discussion-а: само
+// 240, 1d (1440) се добавя по-късно след наблюдение на state размера) - виж
+// бележката при state.pendingOutcomes в scanSymbolSignals за защо това НЕ е
+// козметична промяна (pending записите вече стоят в state до 4ч вместо 1ч).
+const OUTCOME_HORIZONS_MIN = [5, 15, 30, 60, 240];
+
+// Изгражда "чакащите" хоризонти за един нов telemetry запис - чист pure
+// helper, извикван веднъж при confirmed/missed решение (виж wiring-а).
+function buildPendingOutcomeHorizons(recordAt) {
+  const horizons = {};
+  for (const m of OUTCOME_HORIZONS_MIN) horizons[`m${m}`] = { dueAt: recordAt + m * 60000, resolved: false };
+  return horizons;
+}
+
+// Резолвира ГОТОВИТЕ (due) хоризонти на ЕДИН pending outcome запис спрямо
+// текущата вече изтеглена `price` - връща { updates, allResolved }. Мутира
+// pending.horizons[...].resolved на място (огледално на updateSwingStructure/
+// markSetupFired другаде в този файл - установен прецедент за state мутация).
+// `now` е explicit параметър (default Date.now()) единствено за да остане
+// тестваема - реалният call site не подава нищо различно от текущото време.
+// PR #103 - на всеки резолвнат хоризонт добавя и snapshot на running MFE/MAE
+// (виж updateExcursion по-долу, който трябва да се извика ПРЕДИ тази функция
+// на всеки tick) - "какъв е бил максималният favorable/adverse excursion ДО
+// момента на този хоризонт". При ПОСЛЕДНия резолвнат хоризонт (allResolved)
+// добавя и финалните timeToMfeMin/timeToMaeMin/maeBeforeMfePct/mfeBeforeMaePct.
+function resolvePendingOutcomeHorizons(pending, price, now = Date.now()) {
+  const updates = {};
+  let allResolved = true;
+  // Defensive guard - легаси pendingOutcomes записи отпреди `horizons` полето
+  // (или всякакви други повредени/непълни записи) нямат pending.horizons и
+  // преди тази проверка гърмяха с "Cannot convert undefined or null to
+  // object" на Object.keys(undefined) - crash-ът се случваше ПРЕДИ
+  // saveSymbolState() в scanSymbolSignals, затова state никога не се
+  // записваше за целия tick (включително несвързани мутации по-рано в
+  // същия tick, напр. TC ARMED reset) - виж discussion-а. Третираме такъв
+  // запис като приключил (allResolved=true, updates={}), за да се
+  // премахне от state.pendingOutcomes на следващия ред (stillPending),
+  // вместо да блокира целия scan за символа безкрайно.
+  if (!pending.horizons || typeof pending.horizons !== 'object') return { updates, allResolved };
+  for (const field of Object.keys(pending.horizons)) {
+    const h = pending.horizons[field];
+    if (h.resolved) continue;
+    if (now >= h.dueAt && price != null) {
+      const suffix = field.slice(1);
+      updates[`outcome${suffix}m`] = calcOutcomePct(pending.direction, pending.entryPrice, price);
+      updates[`mfe${suffix}m`] = pending.mfePct ?? null;
+      updates[`mae${suffix}m`] = pending.maePct ?? null;
+      if (pending.atr5m > 0) {
+        updates[`mfe${suffix}mAtr`] = pctExcursionToAtrRatio(pending.mfePct, pending.entryPrice, pending.atr5m);
+        updates[`mae${suffix}mAtr`] = pctExcursionToAtrRatio(pending.maePct, pending.entryPrice, pending.atr5m);
+      }
+      h.resolved = true;
+    } else {
+      allResolved = false;
+    }
+  }
+  if (allResolved) {
+    updates.timeToMfeMin = (pending.entryAt != null && pending.mfeAt != null) ? (pending.mfeAt - pending.entryAt) / 60000 : null;
+    updates.timeToMaeMin = (pending.entryAt != null && pending.maeAt != null) ? (pending.maeAt - pending.entryAt) / 60000 : null;
+    updates.maeBeforeMfePct = pending.maeBeforeMfePct ?? null;
+    updates.mfeBeforeMaePct = pending.mfeBeforeMaePct ?? null;
+  }
+  return { updates, allResolved };
+}
+
+function calcFlowState(flowVeto, flowBoost) {
+  if (flowVeto) return 'opposing';
+  if (flowBoost) return 'supportive';
+  return 'neutral';
+}
+
+function buildTelemetryRecord({
+  symbol, direction, decision, setupScore, setupBreakdown, armedAt, structRef,
+  triggerClose, atr5m, triggerRange, confirmation15m, flowState,
+  trapTier, trapDirection, flowWarmingTier, flowWarmingDirection, entryScore,
+  setupMode, htfAligned, bothQuality,
+  timeFromArmMin, pctMoveFromArm, atrMoveFromArm, setupAt,
+  targetScore, targetTier, targetDirection,
+  reArmCount, triggerSource, structuralReferenceAtArm, structRefUnchanged,
+}) {
+  const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
+  const chaseDistanceAtrRatio = (atr5m > 0 && chaseDistance != null) ? chaseDistance / atr5m : null;
+  const entryQuality = classifyEntryQuality({ setupMode, chaseDistanceAtrRatio, htfAligned, confirmation15m });
+  return {
+    symbol, direction, decision, at: Date.now(),
+    setupScore, setupBreakdown, armedAt,
+    // OBSERVATION - директна lifecycle връзка към SETUP episode-а (виж
+    // state.setup.at за MEAN REVERSION / state.trendArmed.setupAt за TREND
+    // CONTINUATION - и двата вече съществуват като стабилен идентификатор,
+    // непроменен през re-arm циклите на СЪЩИЯ directional episode - виж
+    // markSetupFired/markTrendSetupFired по-горе). Само за FIRST vs RE-ENTRY
+    // анализ - НЕ се чете обратно от SETUP/ARMED/ENTRY логиката. null-safe -
+    // стари записи без него остават валидни, просто без episode linkage.
+    setupAt: setupAt ?? null,
+    episodeId: setupAt != null ? `${symbol}_${setupMode}_${direction}_${setupAt}` : null,
+    structRef, triggerClose, atr5m,
+    triggerRangeAtrRatio: (atr5m > 0 && triggerRange != null) ? triggerRange / atr5m : null,
+    chaseDistance,
+    chaseDistanceAtrRatio,
+    confirmation15m: confirmation15m ?? null, flowState,
+    trapTier: trapTier ?? 'none', trapDirection: trapDirection ?? null,
+    flowWarmingTier: flowWarmingTier ?? 'none', flowWarmingDirection: flowWarmingDirection ?? null,
+    entryScore: entryScore ?? null,
+    // MEAN REVERSION (TARGET+VAH/VAL) vs TREND CONTINUATION (confident direction
+    // majority) - виж calcSetupState/calcTrendContinuationSetupState по-горе.
+    // Задължително подадено от call site-а (не се предполага default), за да не
+    // се скрие случайно неправилна стойност.
+    setupMode,
+    // HTF CONTEXT (Stage 3 trend4h/emaFilter alignment) - само за entryResult.
+    // status==='entry' calcEntryTrigger връща htfAligned; за missed/veto няма
+    // (никога не се изчислява confirmation15m score-а дотам) - оставаме null,
+    // не се предполага false, за да различаваме "не се е стигнало до проверка"
+    // от "проверено и НЕ съвпада".
+    htfAligned: htfAligned ?? null,
+    outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome240m: null, // попълват се по-късно от resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals
+    // PR #103 PATH DIAGNOSTICS (MFE/MAE) - попълват се по-късно от
+    // updateExcursion/resolvePendingOutcomeHorizons, огледално на outcome{X}m.
+    mfe5m: null, mae5m: null, mfe5mAtr: null, mae5mAtr: null,
+    mfe15m: null, mae15m: null, mfe15mAtr: null, mae15mAtr: null,
+    mfe30m: null, mae30m: null, mfe30mAtr: null, mae30mAtr: null,
+    mfe60m: null, mae60m: null, mfe60mAtr: null, mae60mAtr: null,
+    // 4ч хоризонт (виж discussion-а - предпазлива първа стъпка, 1d остава за по-късно)
+    mfe240m: null, mae240m: null, mfe240mAtr: null, mae240mAtr: null,
+    timeToMfeMin: null, timeToMaeMin: null, maeBeforeMfePct: null, mfeBeforeMaePct: null,
+    // PR #104 - BOTH QUALITY (виж classifyBothQuality по-долу) - null освен
+    // когато TC и MR произведат ENTRY В СЪЩИЯ tick ('normal'/'degraded').
+    bothQuality: bothQuality ?? null,
+    // OBSERVATION-ONLY ENTRY QUALITY SCORE (виж classifyEntryQuality по-долу) -
+    // производно от вече изчислените по-горе chaseDistanceAtrRatio/htfAligned/
+    // confirmation15m/setupMode. null само ако setupMode не е разпознат.
+    entryQualityScore: entryQuality ? entryQuality.score : null,
+    entryQualityTier: entryQuality ? entryQuality.tier : null,
+    // PR #105 - TC LIFECYCLE TELEMETRY (виж buildTcArmedResetRecord по-долу) -
+    // само за TREND CONTINUATION call site-а (MR никога не ги подава, остават
+    // null) - ARMED -> ENTRY EVALUATION latency/move контекст.
+    timeFromArmMin: timeFromArmMin ?? null, pctMoveFromArm: pctMoveFromArm ?? null,
+    atrMoveFromArm: atrMoveFromArm ?? null,
+    // DIAGNOSTIC-ONLY (виж discussion-а: "TARGET SCORE в WhatsApp съобщение
+    // същото ли е като ENTRY SCORE") - текущата TARGET (POC distance/strength,
+    // виж calcTargetScore по-горе) стойност В МОМЕНТА на ENTRY evaluation-а
+    // (СЪЩИЯ tick), за да проверим дали корелира с CONFIRMED резултатите.
+    // НЕ се чете обратно от ENTRY ENGINE логиката - чисто наблюдение.
+    targetScore: targetScore ?? null, targetTier: targetTier ?? null,
+    targetDirection: targetDirection ?? null,
+    // MR RE-ARM DIAGNOSTIC TELEMETRY (виж calcArmedTriggerSource/wiring-а в
+    // scanSymbolSignals по-горе) - само за MEAN REVERSION call site-а (TC
+    // никога не ги подава, остават null) - чисто observation за дали
+    // многократните ENTRY в рамките на един episodeId са реално нова
+    // структура или повторно прекосяване на статично ниво. НЕ влияят на
+    // SETUP/ARMED/ENTRY/fire gate логиката никъде.
+    reArmCount: reArmCount ?? null, triggerSource: triggerSource ?? null,
+    structuralReferenceAtArm: structuralReferenceAtArm ?? null,
+    structRefUnchanged: structRefUnchanged ?? null,
+  };
+}
+
+// Outcome спрямо ПОСОКАТА: положителен % = цената се е движила В очакваната
+// посока (SHORT -> надолу е "добър" outcome), огледално за LONG.
+function calcOutcomePct(direction, entryPrice, laterPrice) {
+  if (entryPrice == null || laterPrice == null || !(entryPrice > 0)) return null;
+  const rawPct = (laterPrice - entryPrice) / entryPrice * 100;
+  return direction === 'short' ? -rawPct : rawPct;
+}
+
+// PR #103 - PATH DIAGNOSTICS (MFE/MAE, diagnostic-only). Конвертира % excursion
+// в ATR-нормализирано разстояние - реюзвано за mfe/mae{X}mAtr снапшотите.
+function pctExcursionToAtrRatio(pct, entryPrice, atr) {
+  if (pct == null || entryPrice == null || !(atr > 0)) return null;
+  const priceDelta = Math.abs((pct / 100) * entryPrice);
+  return priceDelta / atr;
+}
+
+// ═══ PR #105 - TC LIFECYCLE TELEMETRY (diagnostic-only) ═══════════════════════
+// Отговаря на въпроса "КЪДЕ се губят TC сигналите между SETUP -> ARMED ->
+// ENTRY?" (виж discussion-а за BTC 05:40/05:45 повторно ARMED). Само
+// TREND CONTINUATION - НЕ пипа MEAN REVERSION, НЕ пипа execution логиката
+// (calcTrendContinuationSetupState/calcArmedTrigger/calcEntryTrigger остават
+// байт-идентични - виж wiring-а в scanSymbolSignals). Собствен KV namespace
+// (tclifecycle:), никога не се чете обратно от ARMED/ENTRY логиката - чист
+// append-only recorder.
+// `at` параметър (PR #141 review fix - TIMESTAMP IDENTITY): по подразбиране
+// Date.now() (стар behavior, запазен за backward compatibility), но
+// caller-ът в scanSymbolSignals подава ИЗРИЧНО state.trendSetup.at/
+// state.trendArmed.at - СЪЩАТА стойност, вече записана в state обекта
+// секунди по-рано в тоя тик - вместо да позволи тук да се извика ВТОРИ,
+// независим Date.now(). Преди фикса двете извиквания (едно в
+// markTrendSetupFired/ARMED assignment-а, едно тук) можеха теоретично да
+// върнат различни milliseconds, което чупеше identity-matching-а в новите
+// conversion/diagnostic функции по-долу (виж tcSetupKey/tcArmedKey). Нулева
+// промяна в кога реално се случва SETUP/ARMED решението - само ГАРАНТИРА,
+// че lifecycle записът и state обектът записват ЕДНА И СЪЩА стойност.
+function buildTcSetupCreatedRecord({ symbol, direction, price, setupScore, confidenceMajority, at }) {
+  return {
+    kind: 'setup_created', symbol, direction, at: at ?? Date.now(),
+    price: price ?? null, setupScore: setupScore ?? null,
+    confidenceMajority: confidenceMajority ?? null,
+  };
+}
+function buildTcArmedCreatedRecord({ symbol, direction, priceAtArm, structuralReference, atrAtArm, setupAt, at }) {
+  return {
+    kind: 'armed_created', symbol, direction, at: at ?? Date.now(),
+    priceAtArm: priceAtArm ?? null, structuralReference: structuralReference ?? null,
+    atrAtArm: (atrAtArm > 0) ? atrAtArm : null, setupAt: setupAt ?? null,
+  };
+}
+// reason: 'confidence_lost'|'direction_changed'|'expired_6h'|'entry_confirmed'|
+// 'entry_missed' - виж discussion-а защо точно тия 5 (единствените реални
+// клонове, при които state.trendArmed се нулира в кода). pctMoveFromArm/
+// atrMoveFromArm реюзват СЪЩАТА calcOutcomePct/pctExcursionToAtrRatio формула
+// като MFE/MAE (PR #103) - без нова математика. `at` опционален параметър
+// (symmetric с SETUP/ARMED builders по-горе, за тестируемост) - armed_reset
+// събитието е сам по себе си "моментът на reset", няма по-ранен canonical
+// state timestamp, с който да се синхронизира, затова Date.now() тук остава
+// коректен fallback, не bug.
+function buildTcArmedResetRecord({ symbol, direction, armedAt, priceAtArm, reason, price, atrAtArm, at }) {
+  const resolvedAt = at ?? Date.now();
+  const armedDurationMin = (armedAt != null) ? (resolvedAt - armedAt) / 60000 : null;
+  const pctMoveFromArm = calcOutcomePct(direction, priceAtArm, price);
+  const atrMoveFromArm = pctExcursionToAtrRatio(pctMoveFromArm, priceAtArm, atrAtArm);
+  return {
+    kind: 'armed_reset', symbol, direction, at: resolvedAt, armedAt: armedAt ?? null, reason,
+    price: price ?? null, armedDurationMin, pctMoveFromArm, atrMoveFromArm,
+  };
+}
+
+// Актуализира running MFE/MAE на ЕДИН pending outcome, използвайки вече
+// изтеглената последна затворена 5м свещ (candle.high/candle.low) - БЕЗ нова
+// мрежова заявка (виж wiring-а в scanSymbolSignals - reuse-ва c5Closed, което
+// вече е изтеглено за ATR/структура по-горе в същия tick). Direction-aware:
+// LONG използва candle.high за favorable/candle.low за adverse (обратно за
+// SHORT) - реюзва СЪЩАТА calcOutcomePct формула, само върху high/low вместо
+// единична price точка. Мутира pending на място (established прецедент - виж
+// resolvePendingOutcomeHorizons/updateSwingStructure другаде в тоя файл).
+// mfePct/maePct тръгват от 0 ("никакво движение все още"), НЕ от -Infinity -
+// ако цената никога не тръгне в дадена посока, съответната excursion остава 0,
+// не null. maeBeforeMfePct/mfeBeforeMaePct (RETRACE BEFORE MOVE, PR #103 т.3)
+// пазят СУРОВАТА стойност на "другата" excursion В МОМЕНТА на всеки нов
+// екстремум - без нов threshold, само наблюдение.
+function updateExcursion(pending, candle, now = Date.now()) {
+  if (!candle || candle.high == null || candle.low == null || pending.entryPrice == null) return;
+  if (pending.mfePct == null) pending.mfePct = 0;
+  if (pending.maePct == null) pending.maePct = 0;
+  const favorablePrice = pending.direction === 'short' ? candle.low : candle.high;
+  const adversePrice = pending.direction === 'short' ? candle.high : candle.low;
+  const favorablePct = calcOutcomePct(pending.direction, pending.entryPrice, favorablePrice);
+  const adversePct = calcOutcomePct(pending.direction, pending.entryPrice, adversePrice);
+  if (favorablePct != null && favorablePct > pending.mfePct) {
+    pending.mfePct = favorablePct;
+    pending.mfeAt = now;
+    pending.maeBeforeMfePct = pending.maePct;
+  }
+  if (adversePct != null && adversePct < pending.maePct) {
+    pending.maePct = adversePct;
+    pending.maeAt = now;
+    pending.mfeBeforeMaePct = pending.mfePct;
+  }
+}
+
+// Агрегира вече заредени/филтрирани telemetry записи (чисто in-memory, БЕЗ
+// KV достъп тук - виж /telemetry ендпойнта в fetch() handler-а по-долу) -
+// брой по decision/symbol/direction, среден ENTRY SCORE, среден
+// chaseDistance/ATR, outcome статистика (win rate = дял записи с
+// положителен outcome15m).
+// Помощен агрегатор за "decision бройки + outcome статистика" по произволен
+// ключ (entryScore/confirmation15m/flowState) - огледално на основната outcome
+// логика в buildTelemetrySummary, само parametrized по bucket key, за да не се
+// дублира изчислението на win rate/avgOutcomePct на 3 места.
+function makeOutcomeBucket() {
+  return { confirmed: 0, missed: 0, veto: 0, outcome: { count: 0, avgOutcomePct: null, winRatePct: null }, _sum: 0, _count: 0, _wins: 0 };
+}
+function addToOutcomeBucket(bucket, r) {
+  if (r.decision === 'confirmed' || r.decision === 'missed' || r.decision === 'veto') bucket[r.decision]++;
+  if (r.outcome15m != null) {
+    bucket._sum += r.outcome15m; bucket._count++;
+    if (r.outcome15m > 0) bucket._wins++;
+  }
+}
+function finalizeOutcomeBucket(bucket) {
+  if (bucket._count) {
+    bucket.outcome.count = bucket._count;
+    bucket.outcome.avgOutcomePct = bucket._sum / bucket._count;
+    bucket.outcome.winRatePct = (bucket._wins / bucket._count) * 100;
+  }
+  delete bucket._sum; delete bucket._count; delete bucket._wins;
+  return bucket;
+}
+
+// Diagnostic-only разширение (виж discussion за 100% SHORT bias/-0.071% avg
+// outcome) - breakdown по entryScore/confirmation15m/flowState, за да
+// локализираме ОТКЪДЕ идва bias-ът, БЕЗ да пипаме ENTRY ENGINE механиката.
+// Чисто observability, наблюдение над вече записаните полета - никакви нови
+// KV четения тук (виж /telemetry ендпойнта, records вече е зареден там).
+// Общ pure builder за "breakdown по произволен ключ" (виж byEntryScore/
+// byFlowState по-горе - вече установен образец) - keyFn(record) връща bucket
+// ключ (string) или null/undefined за "пропусни записа". allowedKeys предварително
+// инициализира тези бъкети дори при 0 записи (за да не липсват от JSON
+// отговора), но keyFn може да върне и НЕсписъчен (динамичен) ключ - напр.
+// setupScore стойностите.
+function buildKeyedOutcomeBreakdown(records, keyFn, allowedKeys = []) {
+  const out = {};
+  for (const k of allowedKeys) out[k] = makeOutcomeBucket();
+  for (const r of records) {
+    const k = keyFn(r);
+    if (k == null) continue;
+    if (!out[k]) out[k] = makeOutcomeBucket();
+    addToOutcomeBucket(out[k], r);
+  }
+  for (const k of Object.keys(out)) finalizeOutcomeBucket(out[k]);
+  return out;
+}
+function directionKey(r) { return (r.direction === 'long' || r.direction === 'short') ? r.direction : null; }
+function symbolKey(r) { return r.symbol || null; }
+function setupScoreKey(r) { return r.setupScore != null ? String(r.setupScore) : null; }
+function confirmation15mKey(r) { return (r.confirmation15m === true || r.confirmation15m === false) ? String(r.confirmation15m) : null; }
+// 'none' покрива и исторически записи отпреди добавянето на htfAligned полето
+// (винаги undefined за тях) - "не сме проверили", различно от "проверено и не съвпада".
+function htfAlignedKey(r) { return r.htfAligned === true ? 'aligned' : r.htfAligned === false ? 'notAligned' : 'none'; }
+function setupModeKey(r) { return (r.setupMode === 'mean_reversion' || r.setupMode === 'trend_continuation') ? r.setupMode : null; }
+// DIAGNOSTIC-ONLY (виж discussion-а: TARGET SCORE/tier от calcTargetScore,
+// записан В МОМЕНТА на ENTRY evaluation-а - проверка дали корелира с
+// CONFIRMED резултатите, преди евентуално да се ползва в ENTRY логиката).
+function targetTierKey(r) { return (r.targetTier === 'none' || r.targetTier === 'watch' || r.targetTier === 'strong') ? r.targetTier : null; }
+// PR #102 т.1 - entryScore (ENTRY TRIGGER-ово качество) е ОТДЕЛНО поле от
+// setupScore (SETUP-ово качество) - вече съществуващият setupScoreKey не го
+// покрива. Липсващ entryScore (missed/veto нямат) -> null, пропуска се.
+function entryScoreKey(r) { return r.entryScore != null ? String(r.entryScore) : null; }
+// Естествено срещащи се TRAP/AUCTION/MIGRATION комбинации (виж заявката т.1) -
+// НЕ предварително изброени (за разлика от allowedKeys другаде) - само реално
+// съществуващите комбинации се появяват като ключове, останалите просто липсват.
+function setupBreakdownComboKey(r) {
+  const b = r.setupBreakdown;
+  if (!b || typeof b !== 'object') return null;
+  const parts = [];
+  if (b.trap) parts.push('trap');
+  if (b.auction) parts.push('auction');
+  if (b.migration) parts.push('migration');
+  return parts.length ? parts.join('+') : 'base_only';
+}
+// CHASE_MAX_ATR_MULTIPLE (вече съществуващ Stage 3 chase-protection праг) се
+// реюзва тук САМО като описателна bucket граница - диагностика, не нов gate.
+function chaseDistanceBucketKey(r) {
+  const ratio = r.chaseDistanceAtrRatio;
+  if (ratio == null) return null;
+  if (ratio < 0.5) return 'lt0_5';
+  if (ratio < 1.0) return 'from0_5to1';
+  if (ratio < CHASE_MAX_ATR_MULTIPLE) return 'from1to1_5';
+  return 'gte1_5';
+}
+// PR #104 - BOTH QUALITY (виж classifyBothQuality по-горе) - null за записи,
+// които не са част от same-tick BOTH ENTRY ('normal'/'degraded' само тогава).
+function bothQualityKey(r) { return (r.bothQuality === 'normal' || r.bothQuality === 'degraded') ? r.bothQuality : null; }
+// OBSERVATION-ONLY ENTRY QUALITY (виж classifyEntryQuality по-долу) - null,
+// само ако setupMode не е разпознат (никога не би трябвало да се случи).
+function entryQualityTierKey(r) { return r.entryQualityTier ?? null; }
+// Диагностичен въпрос: "confirmation15m=false бие true - навсякъде ли, или
+// само при конкретна комбинация?" - добавя 4-те разреза directly ВЪТРЕ в
+// вече изчисления true/false бъкет (мутира на място).
+function attachConfirmation15mCrossBreakdowns(bucket, records) {
+  bucket.bySetupMode = buildKeyedOutcomeBreakdown(records, setupModeKey, ['mean_reversion', 'trend_continuation']);
+  bucket.byDirection = buildKeyedOutcomeBreakdown(records, directionKey, ['long', 'short']);
+  bucket.bySetupScore = buildKeyedOutcomeBreakdown(records, setupScoreKey);
+  bucket.byHtfAligned = buildKeyedOutcomeBreakdown(records, htfAlignedKey, ['aligned', 'notAligned', 'none']);
+  return bucket;
+}
+// Диагностичен въпрос: "HTF alignment ефектът (виж byHtfAligned по-горе,
+// обратен по посока между MR и TC) стабилен ли е по символ, или е noise от
+// 1-2 символа?" - вложено bySymbol ВЪТРЕ във вече изчисления aligned/
+// notAligned/none бъкет (мутира на място, огледално на
+// attachConfirmation15mCrossBreakdowns по-горе).
+function attachHtfAlignedSymbolBreakdown(htfAlignedBucket, records) {
+  for (const key of Object.keys(htfAlignedBucket)) {
+    const groupRecords = records.filter((r) => htfAlignedKey(r) === key);
+    htfAlignedBucket[key].bySymbol = buildKeyedOutcomeBreakdown(groupRecords, symbolKey);
+  }
+  return htfAlignedBucket;
+}
+// Диагностичен breakdown СПЕЦИФИЧНО за TREND CONTINUATION (и огледално MEAN
+// REVERSION, за симетрия) - direction/quality/confirmation15m/HTF/chase-distance,
+// всичко вече записано в telemetry записите, БЕЗ нов fetch.
+function attachSetupModeCrossBreakdowns(bucket, records) {
+  bucket.byDirection = buildKeyedOutcomeBreakdown(records, directionKey, ['long', 'short']);
+  bucket.bySetupScore = buildKeyedOutcomeBreakdown(records, setupScoreKey);
+  bucket.byConfirmation15m = buildKeyedOutcomeBreakdown(records, confirmation15mKey, ['true', 'false']);
+  bucket.byHtfAligned = buildKeyedOutcomeBreakdown(records, htfAlignedKey, ['aligned', 'notAligned', 'none']);
+  attachHtfAlignedSymbolBreakdown(bucket.byHtfAligned, records);
+  bucket.byChaseDistanceBucket = buildKeyedOutcomeBreakdown(records, chaseDistanceBucketKey, ['lt0_5', 'from0_5to1', 'from1to1_5', 'gte1_5']);
+  return bucket;
+}
+// PR #101 т.4 - двойно вложен cross-breakdown (setupMode вече филтрирано от
+// call site-а по-долу) - outerKeyFn/innerKeyFn реюзват вече съществуващите
+// confirmation15mKey/htfAlignedKey. Диагностичен въпрос: "apparent
+// confirmation15m ефектът composition bias ли е от HTF (или обратно)?"
+function buildDoubleNestedBreakdown(records, outerKeyFn, outerKeys, innerKeyFn, innerKeys) {
+  const out = {};
+  for (const ok of outerKeys) out[ok] = buildKeyedOutcomeBreakdown(records.filter((r) => outerKeyFn(r) === ok), innerKeyFn, innerKeys);
+  return out;
+}
+
+// avg/win-rate за произволно outcome поле (outcome5m/15m/30m/60m) - реюзвано
+// за outcomeByHorizon по-долу, за да не дублираме 4 пъти същото броене.
+function buildOutcomeStatsForField(records, field) {
+  let sum = 0, count = 0, wins = 0;
+  for (const r of records) {
+    const v = r[field];
+    if (v != null) { sum += v; count++; if (v > 0) wins++; }
+  }
+  return { count, avgOutcomePct: count ? sum / count : null, winRatePct: count ? (wins / count) * 100 : null };
+}
+
+// PR #102 т.1 - групира records по keyFn, после смята count/avgOutcomePct/
+// winRatePct на всеки хоризонт (m5/15/30/60) за всяка група - общ builder,
+// реюзван от всички измерения на ENTRY SCORE DECOMPOSITION по-долу.
+function buildFieldHorizonBreakdown(records, keyFn) {
+  const groups = {};
+  for (const r of records) {
+    const k = keyFn(r);
+    if (k == null) continue;
+    if (!groups[k]) groups[k] = [];
+    groups[k].push(r);
+  }
+  const out = {};
+  for (const k of Object.keys(groups)) {
+    out[k] = {};
+    for (const m of OUTCOME_HORIZONS_MIN) out[k][`m${m}`] = buildOutcomeStatsForField(groups[k], `outcome${m}m`);
+  }
+  return out;
+}
+// Едно "разрезно гнездо" (direction/entryScore/setupBreakdown/confirmation15m/
+// htfAligned), всяко по m5/15/30/60 - реюзвано и за "overall", и за bySetupMode
+// по-долу (виж заявката: "Ефектът еднакъв ли е при TC и MR?").
+function buildEntryScoreDecompositionGroup(records) {
+  return {
+    byDirection: buildFieldHorizonBreakdown(records, directionKey),
+    byEntryScore: buildFieldHorizonBreakdown(records, entryScoreKey),
+    bySetupBreakdown: buildFieldHorizonBreakdown(records, setupBreakdownComboKey),
+    byConfirmation15m: buildFieldHorizonBreakdown(records, confirmation15mKey),
+    byHtfAligned: buildFieldHorizonBreakdown(records, htfAlignedKey),
+  };
+}
+// ENTRY SCORE DECOMPOSITION (PR #102 т.1, diagnostic-only) - САМО confirmed
+// (виж заявката: "Разбий confirmed ENTRY резултатите"). "overall" дава общата
+// картина, "bySetupMode" я разделя на MEAN REVERSION/TREND CONTINUATION, за да
+// проверим дали наблюдаваната entryScore inverse correlation е еднаква и при
+// двата режима, или е специфична за единия.
+function buildEntryScoreDecomposition(records) {
+  const confirmed = records.filter((r) => r.decision === 'confirmed');
+  const mr = confirmed.filter((r) => r.setupMode === 'mean_reversion');
+  const tc = confirmed.filter((r) => r.setupMode === 'trend_continuation');
+  return {
+    overall: buildEntryScoreDecompositionGroup(confirmed),
+    bySetupMode: {
+      mean_reversion: buildEntryScoreDecompositionGroup(mr),
+      trend_continuation: buildEntryScoreDecompositionGroup(tc),
+    },
+  };
+}
+
+// ============================================================================
+// PR #103 - SIGNAL PATH / EXCURSION DIAGNOSTICS (MFE/MAE). Diagnostic-only -
+// вижда КАКВО се случва по пътя между ENTRY и всеки хоризонт (виж
+// updateExcursion/resolvePendingOutcomeHorizons по-горе за самото попълване
+// на mfe{X}m/mae{X}m/mfe{X}mAtr/mae{X}mAtr/timeToMfeMin/timeToMaeMin/
+// maeBeforeMfePct/mfeBeforeMaePct полетата). Никаква промяна на execution -
+// само нов разрез върху вече записаните пътища.
+// ============================================================================
+
+// count/avg/median на MFE и MAE (+ ATR-нормализирани версии, ако налични) за
+// ЕДИН хоризонт ("5"/"15"/"30"/"60") върху подадени records. Median реюзва
+// вече съществуващия calcPercentile (Discovery lifetime stats по-долу в
+// файла) - важен е, защото единични големи движения могат да изкривят average
+// (виж заявката т.5).
+function buildExcursionStatsForHorizon(records, horizonSuffix) {
+  const mfeValues = records.map((r) => r[`mfe${horizonSuffix}m`]).filter((v) => v != null);
+  const maeValues = records.map((r) => r[`mae${horizonSuffix}m`]).filter((v) => v != null);
+  const atrMfeValues = records.map((r) => r[`mfe${horizonSuffix}mAtr`]).filter((v) => v != null);
+  const atrMaeValues = records.map((r) => r[`mae${horizonSuffix}mAtr`]).filter((v) => v != null);
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  const median = (arr) => (arr.length ? calcPercentile([...arr].sort((a, b) => a - b), 50) : null);
+  return {
+    count: mfeValues.length,
+    avgMfePct: avg(mfeValues), medianMfePct: median(mfeValues),
+    avgMaePct: avg(maeValues), medianMaePct: median(maeValues),
+    avgMfeAtr: atrMfeValues.length ? avg(atrMfeValues) : null,
+    avgMaeAtr: atrMaeValues.length ? avg(atrMaeValues) : null,
+  };
+}
+// TIME TO MFE/MAE (PR #103 т.2) + RETRACE BEFORE MOVE (т.3) - единични стойности
+// на запис (не по хоризонт - "кога общо е достигнат крайният екстремум"),
+// затова е отделен сиблинг на m5/15/30/60, не част от тях.
+function buildExcursionTiming(records) {
+  const timeToMfe = records.map((r) => r.timeToMfeMin).filter((v) => v != null);
+  const timeToMae = records.map((r) => r.timeToMaeMin).filter((v) => v != null);
+  const maeBeforeMfe = records.map((r) => r.maeBeforeMfePct).filter((v) => v != null);
+  const mfeBeforeMae = records.map((r) => r.mfeBeforeMaePct).filter((v) => v != null);
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  return {
+    count: timeToMfe.length,
+    avgTimeToMfeMin: avg(timeToMfe), avgTimeToMaeMin: avg(timeToMae),
+    avgMaeBeforeMfePct: avg(maeBeforeMfe), avgMfeBeforeMaePct: avg(mfeBeforeMae),
+  };
+}
+// Едно пълно "excursion гнездо" (m5/15/30/60 + timing) - реюзвано навсякъде по-долу.
+function buildExcursionGroup(records) {
+  const out = { timing: buildExcursionTiming(records) };
+  for (const m of OUTCOME_HORIZONS_MIN) out[`m${m}`] = buildExcursionStatsForHorizon(records, String(m));
+  return out;
+}
+// Групира по keyFn(record), после смята excursion гнездо на всяка група -
+// огледално на buildFieldHorizonBreakdown, само върху MFE/MAE вместо outcome.
+function buildKeyedExcursionBreakdown(records, keyFn) {
+  const groups = {};
+  for (const r of records) {
+    const k = keyFn(r);
+    if (k == null) continue;
+    if (!groups[k]) groups[k] = [];
+    groups[k].push(r);
+  }
+  const out = {};
+  for (const k of Object.keys(groups)) out[k] = buildExcursionGroup(groups[k]);
+  return out;
+}
+// modeOverlap excursion разрез (tcOnly/mrOnly/both + both.bySameDirection/
+// byOppositeDirection) - реюзва вече съществуващите classifyModeOverlap/
+// buildModeOverlapPairs/directionRelationKey (PR #101/#102), БЕЗ да дублира
+// matching логиката.
+function buildExcursionModeOverlapBreakdown(records) {
+  const classifications = classifyModeOverlap(records);
+  const groups = { tcOnly: [], mrOnly: [], both: [] };
+  records.forEach((r, i) => {
+    const c = classifications[i];
+    if (c === 'both') groups.both.push(r);
+    else if (c === 'mr_only') groups.mrOnly.push(r);
+    else if (c === 'tc_only') groups.tcOnly.push(r);
+  });
+  const out = {
+    tcOnly: buildExcursionGroup(groups.tcOnly),
+    mrOnly: buildExcursionGroup(groups.mrOnly),
+    both: buildExcursionGroup(groups.both),
+  };
+  const pairs = buildModeOverlapPairs(records);
+  const sameIdx = new Set(), oppIdx = new Set();
+  for (const p of pairs) {
+    const rel = directionRelationKey(p);
+    if (rel === 'same_direction') { sameIdx.add(p.mrIdx); sameIdx.add(p.tcIdx); }
+    else if (rel === 'opposite_direction') { oppIdx.add(p.mrIdx); oppIdx.add(p.tcIdx); }
+  }
+  out.both.bySameDirection = buildExcursionGroup(records.filter((_, i) => sameIdx.has(i)));
+  out.both.byOppositeDirection = buildExcursionGroup(records.filter((_, i) => oppIdx.has(i)));
+  return out;
+}
+// SIGNAL PATH / EXCURSION DIAGNOSTICS (PR #103, diagnostic-only) - CONFIRMED и
+// MISSED (chase-protection counterfactual) СТРОГО отделени (виж заявката т.6 -
+// "без смесване с CONFIRMED"). За MISSED основният разрез е chaseDistanceAtrRatio
+// bucket-ите - целта НЕ е да докажем, че MISSED е трябвало да е ENTRY, а да
+// видим какво реално се случва СЛЕД отказа (продължава ли движението, връща
+// ли се, колко е adverse/favorable excursion, след колко време).
+function buildPathDiagnostics(records) {
+  const confirmed = records.filter((r) => r.decision === 'confirmed');
+  const missed = records.filter((r) => r.decision === 'missed');
+  return {
+    confirmed: {
+      overall: buildExcursionGroup(confirmed),
+      bySetupMode: buildKeyedExcursionBreakdown(confirmed, setupModeKey),
+      byDirection: buildKeyedExcursionBreakdown(confirmed, directionKey),
+      byEntryScore: buildKeyedExcursionBreakdown(confirmed, entryScoreKey),
+      bySetupBreakdown: buildKeyedExcursionBreakdown(confirmed, setupBreakdownComboKey),
+      byConfirmation15m: buildKeyedExcursionBreakdown(confirmed, confirmation15mKey),
+      byHtfAligned: buildKeyedExcursionBreakdown(confirmed, htfAlignedKey),
+      byModeOverlap: buildExcursionModeOverlapBreakdown(confirmed),
+      byChaseDistanceBucket: buildKeyedExcursionBreakdown(confirmed, chaseDistanceBucketKey),
+    },
+    missed: {
+      overall: buildExcursionGroup(missed),
+      byChaseDistanceBucket: buildKeyedExcursionBreakdown(missed, chaseDistanceBucketKey),
+    },
+  };
+}
+
+// PR #101 - TC/MR OVERLAP CLASSIFICATION (diagnostic-only, виж заявката т.3).
+// MEAN REVERSION и TREND CONTINUATION са напълно независими state slots (виж
+// PR #98) - НЯМА tie-breaker/dedup в execution логиката. Но за статистиката
+// трябва да знаем дали два записа (различен setupMode, СЪЩИЯ symbol) отразяват
+// ДВА независими пазарни събития, или ЕДНО и СЪЩО (двата engine-a оценяват
+// СЪЩАТА 5м свещ на СЪЩИЯ cron tick - в такъв случай `at` timestamp-ите им са
+// на практика идентични, милисекунди разлика, не произволно близки).
+// MODE_OVERLAP_WINDOW_MS е WIDE достатъчно да хване тази "същ tick" близост,
+// но тесен достатъчно (много по-малък от 5-мин cron интервала) да не слее
+// два реално различни tick-а един в друг.
+const MODE_OVERLAP_WINDOW_MS = 60000;
+// Намира ВСИЧКИ MR/TC двойки в close time window (виж MODE_OVERLAP_WINDOW_MS
+// по-горе) - споделено между classifyModeOverlap (per-record класификация) и
+// buildModeOverlapDirectionDecomposition (PR #102, детайлна разбивка на BOTH).
+// Връща индексите (не само референции) - позволява classifyModeOverlap да
+// маркира точно тия записи в overlapIdx Set-а по-долу.
+function buildModeOverlapPairs(records) {
+  const bySymbol = {};
+  records.forEach((r, i) => {
+    if (r.setupMode !== 'mean_reversion' && r.setupMode !== 'trend_continuation') return;
+    if (!bySymbol[r.symbol]) bySymbol[r.symbol] = [];
+    bySymbol[r.symbol].push(i);
+  });
+  const pairs = [];
+  for (const symbol of Object.keys(bySymbol)) {
+    const idxs = bySymbol[symbol];
+    const mrIdxs = idxs.filter((i) => records[i].setupMode === 'mean_reversion');
+    const tcIdxs = idxs.filter((i) => records[i].setupMode === 'trend_continuation');
+    for (const mi of mrIdxs) {
+      for (const ti of tcIdxs) {
+        if (Math.abs(records[mi].at - records[ti].at) <= MODE_OVERLAP_WINDOW_MS) {
+          pairs.push({ mrIdx: mi, tcIdx: ti, mr: records[mi], tc: records[ti] });
+        }
+      }
+    }
+  }
+  return pairs;
+}
+function classifyModeOverlap(records) {
+  const pairs = buildModeOverlapPairs(records);
+  const overlapIdx = new Set();
+  for (const p of pairs) { overlapIdx.add(p.mrIdx); overlapIdx.add(p.tcIdx); }
+  return records.map((r, i) => {
+    if (r.setupMode !== 'mean_reversion' && r.setupMode !== 'trend_continuation') return null;
+    if (overlapIdx.has(i)) return 'both';
+    return r.setupMode === 'mean_reversion' ? 'mr_only' : 'tc_only';
+  });
+}
+// PR #102 т.2 - разбивка на BOTH по directionRelation (same_direction/
+// opposite_direction) + TC score×MR score / HTF relation / confirmation15m
+// relation - диагностика ЗАЩО BOTH bucket-ът е толкова слаб. Diagnostic-only:
+// НЕ dedup, НЕ филтър, НЕ warning в известията, НЕ пипа TC/MR state machines.
+function directionRelationKey(pair) {
+  if (pair.mr.direction == null || pair.tc.direction == null) return null;
+  return pair.mr.direction === pair.tc.direction ? 'same_direction' : 'opposite_direction';
+}
+function htfRelationKey(pair) {
+  if (pair.tc.htfAligned == null || pair.mr.htfAligned == null) return 'unknown';
+  return pair.tc.htfAligned === pair.mr.htfAligned ? 'same' : 'different';
+}
+function confirmation15mRelationKey(pair) {
+  if (pair.tc.confirmation15m == null || pair.mr.confirmation15m == null) return 'unknown';
+  return pair.tc.confirmation15m === pair.mr.confirmation15m ? 'same' : 'different';
+}
+function scoreComboKey(pair) {
+  if (pair.tc.setupScore == null || pair.mr.setupScore == null) return null;
+  return `tc${pair.tc.setupScore}_mr${pair.mr.setupScore}`;
+}
+// PR #104 - BOTH QUALITY: LIVE аналог на историческия findings (виж
+// scoreComboKey по-горе) - modeOverlap=both + scoreCombo=tc3_mr3 е бил
+// многократно потвърден като най-слабата BOTH подгрупа. Само маркиране
+// (alert text + telemetry поле) - НЕ hard veto, TC/MR execution логиката
+// (entryResult/trendEntryResult/state machines) остава напълно непроменена.
+// tc2_mr2 и всички останали комбинации -> 'normal' (незасегнати от заявката).
+function classifyBothQuality(mrSetupScore, tcSetupScore) {
+  if (mrSetupScore == null || tcSetupScore == null) return null;
+  return (mrSetupScore === 3 && tcSetupScore === 3) ? 'degraded' : 'normal';
+}
+// OBSERVATION-ONLY ENTRY QUALITY SCORE - произлиза САМО от вече съществуващи
+// telemetry полета (chaseDistanceAtrRatio/htfAligned/confirmation15m/
+// setupMode), калибрирано от натрупаните /telemetry summary агрегати към
+// 2026-09-27 (~1800-2000 evaluations на снапшот):
+//   - chaseDistanceAtrRatio bucket (виж chaseDistanceBucketKey по-горе) е
+//     най-консистентният разделител, наблюдаван досега: TC lt0_5 ->
+//     avgOutcomePct ~+0.14/+0.16%, TC gte1_5 -> ~-0.09/-0.12% (MR показва
+//     същата посока, по-слабо изразена).
+//   - htfAligned=true корелира с по-добър outcome при TREND CONTINUATION
+//     (aligned бъкетът последователно над notAligned/none в TC breakdown-а),
+//     почти плоско при MEAN REVERSION.
+//   - confirmation15m=true ПАРАДОКСАЛНО показва ПО-НИСЪК winRatePct от false
+//     във ВСЕКИ досегашен снапшот (~42-44% срещу ~47-49%) - затова тук носи
+//     лек ОТРИЦАТЕЛЕН принос, нарочно обратно на наивното очакване.
+//   - setupMode базата отразява постоянната разлика: MEAN REVERSION
+//     последователно ~49-50% winRatePct срещу TREND CONTINUATION ~43-44%.
+// Теглата са малки, именувани константи - нарочно, за да могат лесно да се
+// прекалибрират при по-голяма forward извадка (виж разговора от 2026-09-27),
+// без да се пипа функцията структурно. Диагностика/observability САМО - НЕ
+// се чете обратно от SETUP/ARMED/ENTRY логиката, thresholds, scoring, chase
+// protection, FLOW veto или WhatsApp gating.
+const ENTRY_QUALITY_WEIGHTS = {
+  setupModeBase: { mean_reversion: 50, trend_continuation: 44 },
+  chaseDistanceBucket: { lt0_5: 8, from0_5to1: 2, from1to1_5: -3, gte1_5: -10 },
+  // HTF alignment ефектът е ОБРАТЕН по посока между MR и TC (виж
+  // bySetupMode.<mode>.byHtfAligned.<group>.bySymbol diagnostic-а от PR #123)
+  // - при MR aligned исторически по-добър и консистентен по символ, при TC
+  // notAligned системно по-добър (ALGOUSDT/1000PEPEUSDT/AAVEUSDT) - вече не е
+  // еднакво тегло за двата мода.
+  htfAlignedTrueBySetupMode: { mean_reversion: 3, trend_continuation: -1 },
+  htfAlignedFalseBySetupMode: { mean_reversion: -1, trend_continuation: 1 },
+  confirmation15mTrue: -2, confirmation15mFalse: 2,
+};
+function classifyEntryQuality({ setupMode, chaseDistanceAtrRatio, htfAligned, confirmation15m }) {
+  const base = ENTRY_QUALITY_WEIGHTS.setupModeBase[setupMode];
+  if (base == null) return null;
+  let score = base;
+  const bucket = chaseDistanceBucketKey({ chaseDistanceAtrRatio });
+  if (bucket != null) score += ENTRY_QUALITY_WEIGHTS.chaseDistanceBucket[bucket];
+  if (htfAligned === true) score += ENTRY_QUALITY_WEIGHTS.htfAlignedTrueBySetupMode[setupMode];
+  else if (htfAligned === false) score += ENTRY_QUALITY_WEIGHTS.htfAlignedFalseBySetupMode[setupMode];
+  if (confirmation15m === true) score += ENTRY_QUALITY_WEIGHTS.confirmation15mTrue;
+  else if (confirmation15m === false) score += ENTRY_QUALITY_WEIGHTS.confirmation15mFalse;
+  score = Math.max(0, Math.min(100, score));
+  const tier = score >= 55 ? 'A' : score >= 45 ? 'B' : score >= 35 ? 'C' : 'D';
+  return { score, tier };
+}
+// Групира ПОДАДЕНИТЕ pairs по keyFn(pair) - за всяка група взима и двете
+// страни (mr И tc записа) на всяка двойка, после смята count/avgOutcomePct/
+// winRatePct на всеки хоризонт - огледално на buildFieldHorizonBreakdown
+// по-горе, само че ключът се извлича от ДВОЙКАТА, не от единичен record.
+function buildPairGroupBreakdown(pairs, records, keyFn) {
+  const groups = {};
+  for (const p of pairs) {
+    const k = keyFn(p);
+    if (k == null) continue;
+    if (!groups[k]) groups[k] = new Set();
+    groups[k].add(p.mrIdx); groups[k].add(p.tcIdx);
+  }
+  const out = {};
+  for (const k of Object.keys(groups)) {
+    const recs = records.filter((_, i) => groups[k].has(i));
+    out[k] = {};
+    for (const m of OUTCOME_HORIZONS_MIN) out[k][`m${m}`] = buildOutcomeStatsForField(recs, `outcome${m}m`);
+  }
+  return out;
+}
+function buildModeOverlapDirectionDecomposition(records) {
+  const pairs = buildModeOverlapPairs(records);
+  const relations = pairs.map(directionRelationKey);
+  return {
+    totalPairs: pairs.length,
+    sameDirectionPairs: relations.filter((r) => r === 'same_direction').length,
+    oppositeDirectionPairs: relations.filter((r) => r === 'opposite_direction').length,
+    byDirectionRelation: buildPairGroupBreakdown(pairs, records, directionRelationKey),
+    byScoreCombo: buildPairGroupBreakdown(pairs, records, scoreComboKey),
+    byHtfRelation: buildPairGroupBreakdown(pairs, records, htfRelationKey),
+    byConfirmation15mRelation: buildPairGroupBreakdown(pairs, records, confirmation15mRelationKey),
+    // Суров per-pair контекст (виж заявката) - за директна инспекция в JSON-а,
+    // без да се налага ръчно кръстосване на записите.
+    pairs: pairs.map((p) => ({
+      symbol: p.mr.symbol,
+      directionRelation: directionRelationKey(p),
+      tcDirection: p.tc.direction ?? null, mrDirection: p.mr.direction ?? null,
+      tcSetupScore: p.tc.setupScore ?? null, mrSetupScore: p.mr.setupScore ?? null,
+      tcConfirmation15m: p.tc.confirmation15m ?? null, mrConfirmation15m: p.mr.confirmation15m ?? null,
+      tcHtfAligned: p.tc.htfAligned ?? null, mrHtfAligned: p.mr.htfAligned ?? null,
+    })),
+  };
+}
+// Обобщава modeOverlap класификацията в count/avgOutcomePct/winRatePct
+// (+ по m5/m15/m30/m60) за трите групи - изцяло върху вече изчислената
+// класификация по-горе, БЕЗ нов KV достъп.
+function buildModeOverlapSummary(records) {
+  const classifications = classifyModeOverlap(records);
+  const groups = { tcOnly: [], mrOnly: [], both: [] };
+  records.forEach((r, i) => {
+    const c = classifications[i];
+    if (c === 'both') groups.both.push(r);
+    else if (c === 'mr_only') groups.mrOnly.push(r);
+    else if (c === 'tc_only') groups.tcOnly.push(r);
+  });
+  const out = {};
+  for (const key of Object.keys(groups)) {
+    out[key] = buildOutcomeStatsForField(groups[key], 'outcome15m');
+    out[key].byHorizon = {};
+    for (const m of OUTCOME_HORIZONS_MIN) out[key].byHorizon[`m${m}`] = buildOutcomeStatsForField(groups[key], `outcome${m}m`);
+  }
+  out.both.directionDecomposition = buildModeOverlapDirectionDecomposition(records);
+  return out;
+}
+
+// PR #101 т.5 - разширява една outcomeByHorizon.<mode> клетка с
+// byConfirmation15m/byHtfAligned/byEntryScore (count/avgOutcomePct/
+// winRatePct стойности, реюзвайки buildOutcomeStatsForField) - за да видим
+// КОГА (на кой хоризонт) се появява ефектът от даден фактор, не само ДАЛИ.
+function buildHorizonBreakdown(records, field) {
+  const entryScores = [...new Set(records.map((r) => r.entryScore).filter((v) => v != null))];
+  const byEntryScore = {};
+  for (const s of entryScores) byEntryScore[String(s)] = buildOutcomeStatsForField(records.filter((r) => r.entryScore === s), field);
+  return {
+    ...buildOutcomeStatsForField(records, field),
+    byConfirmation15m: {
+      true: buildOutcomeStatsForField(records.filter((r) => r.confirmation15m === true), field),
+      false: buildOutcomeStatsForField(records.filter((r) => r.confirmation15m === false), field),
+    },
+    byHtfAligned: {
+      aligned: buildOutcomeStatsForField(records.filter((r) => r.htfAligned === true), field),
+      notAligned: buildOutcomeStatsForField(records.filter((r) => r.htfAligned === false), field),
+      none: buildOutcomeStatsForField(records.filter((r) => r.htfAligned == null), field),
+    },
+    byEntryScore,
+  };
+}
+
+// EPISODE-LEVEL AGGREGATION (diagnostic-only, виж discussion-а "episode
+// clustering" - UAI/AAVE случаите, при които стотици ENTRY записи
+// принадлежат на шепа дълго-живеещи episode-и) - ДОПЪЛНИТЕЛЕН изглед,
+// НЕ заменя buildTelemetrySummary по-горе/по-долу. Групира по episodeId
+// (вече съществуващо поле от buildTelemetryRecord), избира ХРОНОЛОГИЧНО
+// ПЪРВИЯ запис на всеки episode (по `at`) и смята outcome статистика САМО
+// върху тая first-fire подмножина - реюзва buildOutcomeStatsForField (виж
+// по-горе), което вече филтрира null СТОЙНОСТИ на ВСЕКИ отделен хоризонт
+// поотделно - pending (still-null) хоризонти на скорошни first-fire записи
+// автоматично не замърсяват резолвнатите, нищо допълнително не е нужно тук.
+// Записи с episodeId=null (легаси ARMED state отпреди episodeId wiring-а,
+// виж discussion-а) се броят отделно в unknownEpisode, изключени от
+// uniqueEpisodeCount - не можем да гарантираме уникалност без identifier.
+// OBSERVATION-ONLY: episode-ите тук НЕ са твърдени за независими пазарни
+// възможности (ranking/selection bias остава недоказан за независимост,
+// виж discussion-а) - чисто count/outcome агрегация.
+function buildEpisodeSummary(records, truncated) {
+  const byEpisode = {};
+  let unknownCount = 0;
+  for (const r of records) {
+    if (r.episodeId == null) { unknownCount++; continue; }
+    if (!byEpisode[r.episodeId]) byEpisode[r.episodeId] = [];
+    byEpisode[r.episodeId].push(r);
+  }
+  const episodeIds = Object.keys(byEpisode);
+  const firesPerEpisodeCounts = episodeIds.map((id) => byEpisode[id].length);
+  const firstFireRecords = episodeIds.map((id) => {
+    const group = byEpisode[id];
+    return group.reduce((earliest, r) => (r.at < earliest.at ? r : earliest), group[0]);
+  });
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  const median = (arr) => (arr.length ? calcPercentile([...arr].sort((a, b) => a - b), 50) : null);
+  const firstFireOutcomeByHorizon = {};
+  for (const m of OUTCOME_HORIZONS_MIN) {
+    firstFireOutcomeByHorizon[`m${m}`] = buildOutcomeStatsForField(firstFireRecords, `outcome${m}m`);
+  }
+  return {
+    recordsAnalyzed: records.length,
+    // Копие на top-level truncated флага (виж /telemetry wiring-а) - за да е
+    // episodeSummary самодостатъчен за четене, без кръстосано препращане към
+    // горното ниво на отговора (debug данните често се копират изолирано).
+    truncated: !!truncated,
+    uniqueEpisodeCount: episodeIds.length,
+    firesPerEpisode: {
+      avg: avg(firesPerEpisodeCounts), median: median(firesPerEpisodeCounts),
+      min: firesPerEpisodeCounts.length ? Math.min(...firesPerEpisodeCounts) : null,
+      max: firesPerEpisodeCounts.length ? Math.max(...firesPerEpisodeCounts) : null,
+    },
+    firstFireOutcome: firstFireOutcomeByHorizon,
+    unknownEpisode: { count: unknownCount },
+  };
+}
+
+function buildTelemetrySummary(records) {
+  const summary = {
+    totalConfirmed: 0, totalMissed: 0, totalVeto: 0,
+    bySymbol: {},
+    byDirection: { long: { confirmed: 0, missed: 0, veto: 0 }, short: { confirmed: 0, missed: 0, veto: 0 } },
+    avgEntryScore: null, avgChaseDistanceAtrRatio: null,
+    outcome: { count: 0, avgOutcomePct: null, winRatePct: null },
+    byEntryScore: {},
+    byConfirmation15m: { true: makeOutcomeBucket(), false: makeOutcomeBucket() },
+    byFlowState: {},
+    bySetupMode: { mean_reversion: makeOutcomeBucket(), trend_continuation: makeOutcomeBucket() },
+  };
+  let scoreSum = 0, scoreCount = 0, chaseSum = 0, chaseCount = 0, outcomeSum = 0, outcomeCount = 0, outcomeWins = 0;
+  for (const r of records) {
+    const bucket = r.decision === 'confirmed' ? 'totalConfirmed' : r.decision === 'missed' ? 'totalMissed' : r.decision === 'veto' ? 'totalVeto' : null;
+    if (bucket) summary[bucket]++;
+    if (!summary.bySymbol[r.symbol]) summary.bySymbol[r.symbol] = { confirmed: 0, missed: 0, veto: 0 };
+    if (r.decision === 'confirmed' || r.decision === 'missed' || r.decision === 'veto') summary.bySymbol[r.symbol][r.decision]++;
+    if ((r.direction === 'long' || r.direction === 'short') && (r.decision === 'confirmed' || r.decision === 'missed' || r.decision === 'veto')) {
+      summary.byDirection[r.direction][r.decision]++;
+    }
+    if (r.decision === 'confirmed' && r.entryScore != null) { scoreSum += r.entryScore; scoreCount++; }
+    if (r.chaseDistanceAtrRatio != null) { chaseSum += r.chaseDistanceAtrRatio; chaseCount++; }
+    if (r.outcome15m != null) { outcomeSum += r.outcome15m; outcomeCount++; if (r.outcome15m > 0) outcomeWins++; }
+
+    if (r.entryScore != null) {
+      if (!summary.byEntryScore[r.entryScore]) summary.byEntryScore[r.entryScore] = makeOutcomeBucket();
+      addToOutcomeBucket(summary.byEntryScore[r.entryScore], r);
+    }
+    if (r.confirmation15m === true || r.confirmation15m === false) {
+      addToOutcomeBucket(summary.byConfirmation15m[String(r.confirmation15m)], r);
+    }
+    if (r.flowState) {
+      if (!summary.byFlowState[r.flowState]) summary.byFlowState[r.flowState] = makeOutcomeBucket();
+      addToOutcomeBucket(summary.byFlowState[r.flowState], r);
+    }
+    if (r.setupMode === 'mean_reversion' || r.setupMode === 'trend_continuation') {
+      addToOutcomeBucket(summary.bySetupMode[r.setupMode], r);
+    }
+  }
+  if (scoreCount) summary.avgEntryScore = scoreSum / scoreCount;
+  if (chaseCount) summary.avgChaseDistanceAtrRatio = chaseSum / chaseCount;
+  if (outcomeCount) {
+    summary.outcome.count = outcomeCount;
+    summary.outcome.avgOutcomePct = outcomeSum / outcomeCount;
+    summary.outcome.winRatePct = (outcomeWins / outcomeCount) * 100;
+  }
+  for (const key of Object.keys(summary.byEntryScore)) finalizeOutcomeBucket(summary.byEntryScore[key]);
+  finalizeOutcomeBucket(summary.byConfirmation15m.true);
+  finalizeOutcomeBucket(summary.byConfirmation15m.false);
+  for (const key of Object.keys(summary.byFlowState)) finalizeOutcomeBucket(summary.byFlowState[key]);
+  finalizeOutcomeBucket(summary.bySetupMode.mean_reversion);
+  finalizeOutcomeBucket(summary.bySetupMode.trend_continuation);
+
+  // Diagnostic cross-breakdowns (виж заявката: "откъде идва confirmation15m
+  // аномалията" + "TREND CONTINUATION breakdown") - изцяло върху вече
+  // изчислените в паметта `records`, БЕЗ нови KV четения.
+  const true15Records = records.filter((r) => r.confirmation15m === true);
+  const false15Records = records.filter((r) => r.confirmation15m === false);
+  attachConfirmation15mCrossBreakdowns(summary.byConfirmation15m.true, true15Records);
+  attachConfirmation15mCrossBreakdowns(summary.byConfirmation15m.false, false15Records);
+
+  const meanReversionRecords = records.filter((r) => r.setupMode === 'mean_reversion');
+  const trendContinuationRecords = records.filter((r) => r.setupMode === 'trend_continuation');
+  attachSetupModeCrossBreakdowns(summary.bySetupMode.mean_reversion, meanReversionRecords);
+  attachSetupModeCrossBreakdowns(summary.bySetupMode.trend_continuation, trendContinuationRecords);
+
+  // Multi-horizon outcome (виж заявката: "+15м може да пасва на единия режим,
+  // не и на другия") - reuse-ва вече записаните outcome5m/15m/30m/60m полета,
+  // без нов fetch. PR #101 т.5 - вложено разширение bySetupMode.<mode> с
+  // byConfirmation15m/byHtfAligned/byEntryScore, за да видим НЕ само дали
+  // фактор има ефект, а КОГА (на кой хоризонт) ефектът се появява.
+  summary.outcomeByHorizon = {};
+  for (const m of OUTCOME_HORIZONS_MIN) {
+    const field = `outcome${m}m`;
+    summary.outcomeByHorizon[`m${m}`] = {
+      overall: buildOutcomeStatsForField(records, field),
+      bySetupMode: {
+        mean_reversion: buildHorizonBreakdown(meanReversionRecords, field),
+        trend_continuation: buildHorizonBreakdown(trendContinuationRecords, field),
+      },
+    };
+  }
+
+  // PR #101 т.3 - TC/MR OVERLAP (виж classifyModeOverlap/buildModeOverlapSummary
+  // по-горе) - diagnostic-only, не пипа execution logic-ата. Разширено в
+  // PR #102 т.2 с modeOverlap.both.directionDecomposition (same/opposite
+  // direction, TC×MR score, HTF/confirmation15m relation).
+  summary.modeOverlap = buildModeOverlapSummary(records);
+
+  // DIAGNOSTIC-ONLY (виж discussion-а: "TARGET SCORE в WhatsApp съобщение
+  // същото ли е като ENTRY SCORE, и може ли да помогне за по-прецизен вход")
+  // - targetTier (none/watch/strong) записан В МОМЕНТА на ENTRY evaluation-а
+  // (виж targetScore/targetTier полетата в buildTelemetryRecord по-горе),
+  // breakdown по confirmed/missed/veto + outcome статистика. Чисто
+  // observability - targetTier/targetScore НЕ участват в ENTRY решението.
+  summary.byTargetTier = buildKeyedOutcomeBreakdown(records, targetTierKey, ['none', 'watch', 'strong']);
+
+  // PR #102 т.1 - ENTRY SCORE DECOMPOSITION (виж buildEntryScoreDecomposition
+  // по-горе) - defensere: КОЙ компонент (trap/auction/migration/confirmation15m/
+  // htfAligned/direction) обяснява наблюдаваната entryScore inverse correlation.
+  summary.entryScoreDecomposition = buildEntryScoreDecomposition(records);
+
+  // PR #101 т.4 - setupMode -> confirmation15m -> HTF и обратно setupMode ->
+  // HTF -> confirmation15m (виж buildDoubleNestedBreakdown по-горе) - "apparent
+  // confirmation15m ефектът composition bias ли е от HTF, или обратно?"
+  summary.setupModeConfirmation15mByHtf = {
+    mean_reversion: buildDoubleNestedBreakdown(meanReversionRecords, confirmation15mKey, ['true', 'false'], htfAlignedKey, ['aligned', 'notAligned', 'none']),
+    trend_continuation: buildDoubleNestedBreakdown(trendContinuationRecords, confirmation15mKey, ['true', 'false'], htfAlignedKey, ['aligned', 'notAligned', 'none']),
+  };
+  summary.setupModeHtfByConfirmation15m = {
+    mean_reversion: buildDoubleNestedBreakdown(meanReversionRecords, htfAlignedKey, ['aligned', 'notAligned', 'none'], confirmation15mKey, ['true', 'false']),
+    trend_continuation: buildDoubleNestedBreakdown(trendContinuationRecords, htfAlignedKey, ['aligned', 'notAligned', 'none'], confirmation15mKey, ['true', 'false']),
+  };
+
+  // PR #103 - SIGNAL PATH / EXCURSION DIAGNOSTICS (виж buildPathDiagnostics
+  // по-горе) - MFE/MAE path профил на CONFIRMED и MISSED, диагностика на
+  // причината зад m15/m60 inverse correlation-а от PR #102.
+  summary.pathDiagnostics = buildPathDiagnostics(records);
+
+  // PR #104 - BOTH QUALITY (виж classifyBothQuality/bothQualityKey по-горе) -
+  // измерва РЕАЛНИЯ ефект от живото маркиране: NORMAL (both, не tc3_mr3) vs
+  // DEGRADED (both, tc3_mr3) изход по m5/m15/m30/m60. Само записите от MOMEHTA
+  // на деплоя нататък ще имат непразно bothQuality (виж wiring-а в
+  // scanSymbolSignals) - исторически записи остават null, не се реконструират.
+  summary.bothQualityStats = buildFieldHorizonBreakdown(records, bothQualityKey);
+  // OBSERVATION-ONLY ENTRY QUALITY SCORE (виж classifyEntryQuality по-горе) -
+  // A/B/C/D tier breakdown по m5/m15/m30/m60, за проверка дали score-ът
+  // реално разделя win rate-а, докато се трупа по-голяма forward извадка.
+  summary.entryQualityStats = buildFieldHorizonBreakdown(records, entryQualityTierKey);
+  return summary;
+}
+
+// ═══ PR #105 - TC LIFECYCLE TELEMETRY SUMMARY (viж buildTcSetupCreatedRecord/
+// buildTcArmedCreatedRecord/buildTcArmedResetRecord по-горе) - прост funnel
+// SETUP -> ARMED -> RE-ARM/RESET -> ENTRY EVALUATION -> CONFIRMED/MISSED/VETO,
+// за да отговорим "КЪДЕ се губят TC сигналите?" (A: няма trigger свещ / B:
+// chase protection / C: FLOW veto / D: confidence flicker / E: чака твърде
+// дълго). Diagnostic-only - изцяло върху вече записаните records, БЕЗ нов fetch.
+
+// resetByReason - динамични ключове (само реално срещнатите reasons, огледално
+// на setupBreakdownComboKey другаде в тоя файл) - 'confidence_lost'/
+// 'direction_changed'/'expired_6h'/'entry_confirmed'/'entry_missed' са
+// ЕДИНСТВЕНИТЕ реални клонове в кода (виж wiring-а в scanSymbolSignals).
+function buildTcResetByReason(resetRecords) {
+  const out = {};
+  for (const r of resetRecords) {
+    if (!r.reason) continue;
+    out[r.reason] = (out[r.reason] || 0) + 1;
+  }
+  return out;
+}
+
+// RE-ARM (виж заявката: "колко пъти symbol+direction се ARMED-ва повторно" +
+// "времето между re-arm") - derived ИЗЦЯЛО от armed_created записите,
+// сортирани по symbol+direction+timestamp - без нов "episode id" state
+// (потвърдено с потребителя: TC SETUP се нулира на СЪЩОТО условие като TC
+// ARMED, затова "по-голям episode" не съществува като стабилно състояние в
+// кода - това е НАЙ-ДОБРИЯТ proxy, не изкуствена дефиниция).
+function buildTcReArmStats(armedCreatedRecords) {
+  const bySymbolDirection = {};
+  for (const r of armedCreatedRecords) {
+    const key = `${r.symbol}_${r.direction}`;
+    if (!bySymbolDirection[key]) bySymbolDirection[key] = [];
+    bySymbolDirection[key].push(r.at);
+  }
+  let reArmCount = 0;
+  const allGapsMin = [];
+  const bySymbolDirectionOut = {};
+  for (const key of Object.keys(bySymbolDirection)) {
+    const times = bySymbolDirection[key].slice().sort((a, b) => a - b);
+    const gapsMin = [];
+    for (let i = 1; i < times.length; i++) gapsMin.push((times[i] - times[i - 1]) / 60000);
+    reArmCount += gapsMin.length;
+    allGapsMin.push(...gapsMin);
+    bySymbolDirectionOut[key] = { armedCount: times.length, reArmCount: gapsMin.length, gapsMin };
+  }
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  const median = (arr) => (arr.length ? calcPercentile([...arr].sort((a, b) => a - b), 50) : null);
+  return {
+    reArmCount, avgReArmGapMin: avg(allGapsMin), medianReArmGapMin: median(allGapsMin),
+    bySymbolDirection: bySymbolDirectionOut,
+  };
+}
+
+// Latency buckets ARMED -> ENTRY evaluation (виж заявката) - на база
+// timeFromArmMin, вече записан на ENTRY EVALUATION записите (PR #105
+// buildTelemetryRecord разширение). null timeFromArmMin (легаси записи отпреди
+// деплоя) не участва в никой bucket - не се реконструира.
+const TC_ARM_TO_ENTRY_LATENCY_BUCKETS = ['lt1min', 'from1to5min', 'from5to10min', 'from10to30min', 'from30to60min', 'gte60min'];
+function tcArmToEntryLatencyBucketKey(timeFromArmMin) {
+  if (timeFromArmMin == null) return null;
+  if (timeFromArmMin < 1) return 'lt1min';
+  if (timeFromArmMin < 5) return 'from1to5min';
+  if (timeFromArmMin < 10) return 'from5to10min';
+  if (timeFromArmMin < 30) return 'from10to30min';
+  if (timeFromArmMin < 60) return 'from30to60min';
+  return 'gte60min';
+}
+function buildTcLatencyBucketStats(records) {
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  const pctVals = records.map((r) => r.pctMoveFromArm).filter((v) => v != null);
+  const atrVals = records.map((r) => r.atrMoveFromArm).filter((v) => v != null);
+  return {
+    count: records.length,
+    confirmed: records.filter((r) => r.decision === 'confirmed').length,
+    missed: records.filter((r) => r.decision === 'missed').length,
+    veto: records.filter((r) => r.decision === 'veto').length,
+    avgPctMoveFromArm: avg(pctVals), avgAtrMoveFromArm: avg(atrVals),
+  };
+}
+function buildTcLatencyBuckets(tcEntryRecords) {
+  const groups = {};
+  for (const r of tcEntryRecords) {
+    const k = tcArmToEntryLatencyBucketKey(r.timeFromArmMin);
+    if (k == null) continue;
+    if (!groups[k]) groups[k] = [];
+    groups[k].push(r);
+  }
+  const out = {};
+  for (const k of TC_ARM_TO_ENTRY_LATENCY_BUCKETS) out[k] = buildTcLatencyBucketStats(groups[k] || []);
+  return out;
+}
+
+// Главният funnel - tcEntryRecords = вече съществуващите telemetry: записи,
+// филтрирани по setupMode='trend_continuation' (ENTRY EVALUATION - CONFIRMED/
+// MISSED/VETO), lifecycleRecords = новите tclifecycle: записи (setup_created/
+// armed_created/armed_reset). armedAt свързва ENTRY EVALUATION към неговия
+// ARMED епизод (вече съществуващо поле, виж buildTelemetryRecord).
+function buildTcLifecycleSummary(lifecycleRecords, tcEntryRecords) {
+  const setupCreatedRecords = lifecycleRecords.filter((r) => r.kind === 'setup_created');
+  const armedCreatedRecords = lifecycleRecords.filter((r) => r.kind === 'armed_created');
+  const resetRecords = lifecycleRecords.filter((r) => r.kind === 'armed_reset');
+
+  const confirmed = tcEntryRecords.filter((r) => r.decision === 'confirmed').length;
+  const missed = tcEntryRecords.filter((r) => r.decision === 'missed').length;
+  const vetoRecords = tcEntryRecords.filter((r) => r.decision === 'veto');
+  const veto = vetoRecords.length;
+  // episodesWithVeto (уникални ARMED епизоди с >=1 VETO) vs rawVetoEvaluations
+  // (общ брой VETO evaluation-и) - VETO НЕ е терминален за епизода (виж
+  // discussion-а), затова двете НЕ съвпадат automatически.
+  const episodesWithVeto = new Set(vetoRecords.map((r) => `${r.symbol}|${r.armedAt}`)).size;
+  const avgVetoPerVetoEpisode = episodesWithVeto ? veto / episodesWithVeto : null;
+  const armedEpisodesReachingEvaluation = new Set(tcEntryRecords.map((r) => `${r.symbol}|${r.armedAt}`)).size;
+
+  const armedCreatedCount = armedCreatedRecords.length;
+  const setupCreatedCount = setupCreatedRecords.length;
+  const pct = (num, den) => (den ? (num / den) * 100 : null);
+
+  return {
+    setupCreated: setupCreatedCount,
+    armedCreated: armedCreatedCount,
+    reArm: buildTcReArmStats(armedCreatedRecords),
+    resetByReason: buildTcResetByReason(resetRecords),
+    entryEvaluation: {
+      total: tcEntryRecords.length, confirmed, missed, veto,
+      episodesWithVeto, rawVetoEvaluations: veto, avgVetoPerVetoEpisode,
+      armedEpisodesReachingEvaluation,
+    },
+    conversionPct: {
+      setupToArmedPct: pct(armedCreatedCount, setupCreatedCount),
+      armedToAnyEvaluationPct: pct(armedEpisodesReachingEvaluation, armedCreatedCount),
+      armedToConfirmedPct: pct(confirmed, armedCreatedCount),
+      armedToMissedPct: pct(missed, armedCreatedCount),
+      armedToVetoEpisodePct: pct(episodesWithVeto, armedCreatedCount),
+    },
+    latencyBuckets: buildTcLatencyBuckets(tcEntryRecords),
+  };
+}
+
+// ═══ ENTRY TELEMETRY INTEGRITY AUDIT (ЕТАП 1, diagnostic-only) ═══════════════
+// Разграничава три различни "conversion" понятия, вместо едно event ratio,
+// което може да надвиши 100% (виж discussion-а "setupToArmedPct: 607.9%").
+// СТАРИТЕ conversionPct полета в buildTcLifecycleSummary по-горе остават
+// byte-идентични - тук САМО се добавят нови, ясно именувани полета. Никое
+// съществуващо поле не се премахва/преименува/променя смислово.
+//
+// EVENT RATIO (вече съществува като conversionPct.* по-горе) - брой събития
+// / брой други събития, БЕЗ dedup по episode - МОЖЕ да надвиши 100%, защото
+// един SETUP може да произведе много ARMED събития (re-arm, виж
+// buildTcReArmStats). Полезен за "колко често се случва X спрямо Y", НЕ за
+// "какъв дял от уникалните SETUP-и стигат до ARMED".
+//
+// COMPOSITE KEY HELPERS (PR #141 review fix) - предишната версия ключуваше
+// SETUP/ARMED samo по `at`, без symbol/direction. Две различни монети (или
+// LONG+SHORT на СЪЩАТА монета), случили се на идентичен millisecond
+// timestamp, щяха технически да се слеят в един "unique SETUP"/episode.
+// Малко вероятно, но напълно възможно (35-symbol watchlist, споделен cron
+// tick) - composite ключ премахва риска напълно, без да променя смисъла при
+// нормални (не-колизионни) данни.
+function tcSetupKey(symbol, direction, at) { return `${symbol}|${direction}|${at}`; }
+function tcArmedKey(symbol, direction, at) { return `${symbol}|${direction}|${at}`; }
+// Огледално на episodeId конвенцията в buildTelemetryRecord по-горе
+// (`${symbol}_${setupMode}_${direction}_${setupAt}`) - тук setupMode е
+// ВИНАГИ 'trend_continuation', защото lifecycleRecords/armedCreatedRecords
+// идват изключително от tclifecycle: namespace-а (виж
+// TC_LIFECYCLE_AGGREGATION_POPULATION по-долу).
+function tcEpisodeKey(symbol, direction, setupAt) { return `${symbol}_trend_continuation_${direction}_${setupAt}`; }
+
+// UNIQUE CONVERSION - брой уникални SETUP моменти (по symbol+direction+at),
+// достигнали поне едно ARMED (свързано чрез armed_created.setupAt), делено
+// на общия брой уникални SETUP моменти. Винаги 0-100%.
+//
+// PR #141 review fix: разчита на това, че `at` на SETUP CREATED lifecycle
+// записа е КАНОНИЧНИЯТ state.trendSetup.at (виж buildTcSetupCreatedRecord/
+// markTrendSetupFired wiring-а в scanSymbolSignals - подаден изрично като
+// `at` параметър, НЕ отделен Date.now() извикване) - затова съвпада byte-by-
+// byte с armed_created.setupAt (копие на СЪЩАТА state.trendSetup.at
+// стойност), вместо да разчита на две независими Date.now() извиквания да
+// върнат идентичен millisecond (ненадеждно).
+function buildTcUniqueConversion(setupCreatedRecords, armedCreatedRecords) {
+  const uniqueSetupKeys = new Set(setupCreatedRecords.map((r) => tcSetupKey(r.symbol, r.direction, r.at)));
+  const armedSetupKeys = new Set(
+    armedCreatedRecords
+      .filter((r) => r.setupAt != null)
+      .map((r) => tcSetupKey(r.symbol, r.direction, r.setupAt))
+  );
+  let reachedArmed = 0;
+  for (const key of uniqueSetupKeys) { if (armedSetupKeys.has(key)) reachedArmed++; }
+  return {
+    uniqueSetupCount: uniqueSetupKeys.size,
+    uniqueSetupReachedArmedCount: reachedArmed,
+    uniqueSetupToArmedPct: uniqueSetupKeys.size ? (reachedArmed / uniqueSetupKeys.size) * 100 : null,
+  };
+}
+
+// EPISODE CONVERSION - брой ARMED episode-и (уникални по symbol+direction+
+// setupAt, точната episodeId конвенция от buildTelemetryRecord), стигнали
+// поне 1 CONFIRMED evaluation, делено на общия брой допустими ARMED
+// episode-и (с поне 1 ARMED CREATED и известен setupAt). Винаги 0-100%.
+//
+// PR #141 review fix: вместо да свързва CONFIRMED evaluation обратно към
+// своя ARMED episode чрез `armedAt === armed_created.at` (крехко - две
+// независими Date.now() извиквания), ползва директно ВЕЧЕ коректно
+// построеното `episodeId` поле на самия entry record (buildTelemetryRecord
+// го смята от setupAt/direction/symbol/setupMode - виж по-горе), сравнено
+// срещу eligible episode ключове, построени по СЪЩАТА конвенция от ARMED
+// CREATED записите. Нулева зависимост от timestamp identity между две
+// отделни builder извиквания.
+function buildTcEpisodeConversion(armedCreatedRecords, tcEntryRecords) {
+  const eligibleEpisodes = new Set();
+  for (const r of armedCreatedRecords) {
+    if (r.setupAt == null) continue;
+    eligibleEpisodes.add(tcEpisodeKey(r.symbol, r.direction, r.setupAt));
+  }
+  const confirmedEpisodes = new Set();
+  for (const r of tcEntryRecords) {
+    if (r.decision !== 'confirmed') continue;
+    if (r.episodeId == null) continue;
+    if (eligibleEpisodes.has(r.episodeId)) confirmedEpisodes.add(r.episodeId);
+  }
+  return {
+    eligibleEpisodeCount: eligibleEpisodes.size,
+    confirmedEpisodeCount: confirmedEpisodes.size,
+    episodeConfirmedPct: eligibleEpisodes.size ? (confirmedEpisodes.size / eligibleEpisodes.size) * 100 : null,
+  };
+}
+function buildTcConversionMetrics(setupCreatedRecords, armedCreatedRecords, tcEntryRecords) {
+  return {
+    unique: buildTcUniqueConversion(setupCreatedRecords, armedCreatedRecords),
+    episode: buildTcEpisodeConversion(armedCreatedRecords, tcEntryRecords),
+  };
+}
+
+// MISSING EPISODE IDS (PR #141 review fix, изискано в оригиналната задача,
+// пропуснато в първата версия) - episodeId-та на ARMED episode-и, чийто
+// SETUP CREATED запис НЕ присъства в текущо сканирания lifecycle прозорец
+// (truncation/retention граница) - lineage пропуск, различен от
+// nullEpisodeIdCount (който мери ENTRY EVALUATION записи без episodeId).
+// Дедупликирано, bounded от самия MAX_KEYS_SCANNED таван на caller-а.
+function buildTcMissingEpisodeIds(setupCreatedRecords, armedCreatedRecords) {
+  const knownSetupKeys = new Set(setupCreatedRecords.map((r) => tcSetupKey(r.symbol, r.direction, r.at)));
+  const missing = [];
+  const seen = new Set();
+  for (const r of armedCreatedRecords) {
+    if (r.setupAt == null) continue;
+    if (knownSetupKeys.has(tcSetupKey(r.symbol, r.direction, r.setupAt))) continue;
+    const episodeId = tcEpisodeKey(r.symbol, r.direction, r.setupAt);
+    if (seen.has(episodeId)) continue;
+    seen.add(episodeId);
+    missing.push(episodeId);
+  }
+  return missing;
+}
+
+// COHORT COMPLETENESS (PR #141 review fix, допълнена по втория review pass
+// - FINAL REVIEW CORRECTION) - 0-100% conversion не означава автоматично
+// статистически валиден denominator, И ПО-ВАЖНО: "KV сканирането е
+// завършено" (list_complete:true) НЕ означава автоматично, че SETUP ->
+// ARMED -> ENTRY връзките са действително проследими. Двете са РАЗЛИЧНИ
+// понятия:
+//
+// SCAN COMPLETENESS - дали KV .list() е изчерпал всички страници
+// (!lifecycleTruncated && !telemetryTruncated). KV може напълно честно да
+// докладва "прочетох всичко, което съществува под тоя prefix в момента" и
+// въпреки това SETUP записът на даден ARMED episode да е изтекъл/изтрит от
+// retention политика по-рано (KV без TTL проблем тук, но структурно
+// възможно при бъдещи промени) - сканирането е "пълно", но lineage-ът НЕ е.
+//
+// LINEAGE COMPLETENESS - дали SETUP -> ARMED -> ENTRY връзките, видими В
+// ТЕКУЩО сканираните записи, се затварят коректно - 0 missingEpisodeIds, 0
+// unmatchedEvaluationCount, 0 nullEpisodeIdCount. Ако някое от тях е >0,
+// cohortStatus НЕ бива да твърди "complete", дори при scanComplete:true.
+//
+// Връща {status, scanComplete, lineageComplete} - status е удобен единичен
+// consumer-facing флаг, но scanComplete/lineageComplete по-долу остават
+// явно разграничени (никога не се сливат в едно булево).
+function buildTcCohortStatus({ scanTruncated, setupCreatedRecords, armedCreatedRecords, missingEpisodeIds, unmatchedEvaluationCount, nullEpisodeIdCount }) {
+  const scanComplete = !scanTruncated;
+  const lineageComplete = missingEpisodeIds.length === 0 && unmatchedEvaluationCount === 0 && nullEpisodeIdCount === 0;
+  let status;
+  if (!scanComplete) status = 'partial_truncated_scan_window';
+  else if (!setupCreatedRecords.length && !armedCreatedRecords.length) status = 'insufficient_data';
+  else if (!lineageComplete) status = 'scan_complete_lineage_incomplete';
+  else status = 'complete_within_scanned_window';
+  return { status, scanComplete, lineageComplete };
+}
+
+// KV PAGINATED LIST С ЧЕСТНА TRUNCATION ПРОВЕРКА (PR #141 review fix -
+// TRUNCATION DETECTION). Старата inline логика на всеки debug ендпойнт
+// смяташе `truncated = keys.length > maxKeysScanned` - при ТОЧНО
+// maxKeysScanned прочетени ключа, докато KV.list() твърди list_complete:
+// false (т.е. реално има още страници), тая проверка връщаше `false`
+// (подвеждащо "dataset е пълен"). Коректната проверка е дали КV никога не е
+// докладвал list_complete:true - честно отразява "има ли ОЩЕ данни отвъд
+// прочетеното", не само "колко сме прочели". Използвана само от /telemetry
+// и /tc-lifecycle (ЕТАП 1 обхват) - другите debug ендпойнти (discovery-*)
+// остават с предишната inline логика, извън обхвата на тоя одит.
+async function listKvKeysWithTruncation(kv, prefix, maxKeysScanned) {
+  let keys = [];
+  let cursor;
+  let listComplete = false;
+  do {
+    const listResult = await kv.list({ prefix, cursor, limit: 1000 });
+    keys.push(...listResult.keys);
+    listComplete = !!listResult.list_complete;
+    cursor = listComplete ? undefined : listResult.cursor;
+  } while (cursor && keys.length < maxKeysScanned);
+  const truncated = !listComplete || keys.length > maxKeysScanned;
+  return { keys: keys.slice(0, maxKeysScanned), truncated };
+}
+
+// COVERAGE RANGE - най-ранния/най-късния `at` timestamp сред сканираните
+// записи. Чисто observational - показва какъв времеви прозорец реално
+// покрива текущата (евентуално truncated) извадка.
+function buildCoverageRange(records) {
+  if (!records.length) return { coverageStart: null, coverageEnd: null };
+  let min = records[0].at, max = records[0].at;
+  for (const r of records) {
+    if (r.at < min) min = r.at;
+    if (r.at > max) max = r.at;
+  }
+  return { coverageStart: min, coverageEnd: max };
+}
+
+// POSSIBLE DUPLICATE EVENT DETECTION (diagnostic-only, НЕ dedup/merge логика -
+// re-arm качеството е отделна бъдеща задача) - флагира lifecycle събития за
+// СЪЩИЯ symbol+direction+kind, случили се подозрително близо едно до друго
+// (под прага по-долу). Технически МОЖЕ да е реален бърз re-arm, но е толкова
+// близо до нормалния cron tick интервал, че overlapping/retried invocation е
+// поне толкова вероятно обяснение (виж discussion-а "1000PEPEUSDT
+// concentration" - наблюдавани gaps от части от секундата). Не премахва и не
+// слива записи - само брои ги за видимост.
+const DUPLICATE_EVENT_GAP_MS = 5000;
+function countPossibleDuplicateEvents(lifecycleRecords, thresholdMs = DUPLICATE_EVENT_GAP_MS) {
+  const byKey = {};
+  for (const r of lifecycleRecords) {
+    const key = `${r.symbol}|${r.direction}|${r.kind}`;
+    if (!byKey[key]) byKey[key] = [];
+    byKey[key].push(r.at);
+  }
+  let count = 0;
+  for (const key of Object.keys(byKey)) {
+    const times = byKey[key].slice().sort((a, b) => a - b);
+    for (let i = 1; i < times.length; i++) {
+      if (times[i] - times[i - 1] < thresholdMs) count++;
+    }
+  }
+  return count;
+}
+
+// UNMATCHED EVALUATION COUNT - ENTRY EVALUATION записи (tcEntryRecords), чийто
+// symbol+direction+armedAt НЕ съвпада с symbol+direction+`at` на нито един
+// ARMED CREATED запис в ТЕКУЩО сканирания прозорец. Директно обяснява защо
+// armedToAnyEvaluationPct (виж buildTcLifecycleSummary по-горе) може да
+// надвиши 100%: двете KV namespaces (tclifecycle:/telemetry:) се сканират
+// НЕЗАВИСИМО, всяка със собствен MAX_KEYS_SCANNED таван - evaluation за
+// ARMED епизод, чийто armed_created попадне извън единия прозорец (но не и
+// другия), се брои тук.
+//
+// PR #141 review fix: composite key (symbol+direction+at), не само `at` -
+// избягва cross-symbol/cross-direction колизии при идентичен millisecond
+// timestamp. Разчита на канонично синхронизирания state.trendArmed.at (виж
+// tcSetupKey/buildTcUniqueConversion коментара по-горе за same fix класа).
+function countUnmatchedEvaluations(armedCreatedRecords, tcEntryRecords) {
+  const knownArmedKeys = new Set(armedCreatedRecords.map((r) => tcArmedKey(r.symbol, r.direction, r.at)));
+  let count = 0;
+  for (const r of tcEntryRecords) {
+    if (r.armedAt == null) continue;
+    if (!knownArmedKeys.has(tcArmedKey(r.symbol, r.direction, r.armedAt))) count++;
+  }
+  return count;
+}
+
+// MISSING LATENCY COUNT - ENTRY EVALUATION записи, изключени от ВСИЧКИ latency
+// bucket-и (виж buildTcLatencyBuckets по-горе), защото timeFromArmMin е null -
+// легаси записи отпреди PR #105 деплоя (виж коментара при
+// TC_ARM_TO_ENTRY_LATENCY_BUCKETS по-горе: "не се реконструира"). Директно
+// обяснява "982 observations от 1026 evaluations" разликата.
+function countMissingLatency(tcEntryRecords) {
+  return tcEntryRecords.filter((r) => r.timeFromArmMin == null).length;
+}
+
+// AGGREGATION POPULATION - чиста документация-като-данни (виж discussion-а:
+// лесно се чете /tc-lifecycle резултата като "целия Entry Engine", докато той
+// е ИЗКЛЮЧИТЕЛНО TREND CONTINUATION - MEAN REVERSION живее само в /telemetry,
+// разпознаваем по setupMode:'mean_reversion'). Нулева логика, само описание
+// за consumer-а на JSON отговора.
+const TC_LIFECYCLE_AGGREGATION_POPULATION = {
+  lifecycle: "trend_continuation ONLY (tclifecycle: namespace) - mean_reversion SETUP/ARMED/RESET не се записва тук",
+  entryEvaluation: "trend_continuation ONLY (telemetry: записи, филтрирани по ':trend_continuation' суфикс)",
+  note: 'За mean_reversion виж /telemetry endpoint-а директно (setupMode==="mean_reversion")',
+};
+
+function buildTcIntegrityDiagnostics(lifecycleRecords, tcEntryRecords, lifecycleTruncated, telemetryTruncated) {
+  const setupCreatedRecords = lifecycleRecords.filter((r) => r.kind === 'setup_created');
+  const armedCreatedRecords = lifecycleRecords.filter((r) => r.kind === 'armed_created');
+  // Смятани ЕДИН път тук, после реюзвани И от buildTcCohortStatus, И от
+  // върнатия обект по-долу - избягва разминаване между "какво решава
+  // cohortStatus" и "какво вижда consumer-ът" (FINAL REVIEW CORRECTION).
+  const nullEpisodeIdCount = tcEntryRecords.filter((r) => r.episodeId == null).length;
+  const missingEpisodeIds = buildTcMissingEpisodeIds(setupCreatedRecords, armedCreatedRecords);
+  const unmatchedEvaluationCount = countUnmatchedEvaluations(armedCreatedRecords, tcEntryRecords);
+  const cohort = buildTcCohortStatus({
+    scanTruncated: !!lifecycleTruncated || !!telemetryTruncated,
+    setupCreatedRecords, armedCreatedRecords,
+    missingEpisodeIds, unmatchedEvaluationCount, nullEpisodeIdCount,
+  });
+  return {
+    recordsReturned: lifecycleRecords.length,
+    // KV .list() не дава надежден общ брой отвъд вече сканираното - не се
+    // измисля стойност (insufficient_data правило).
+    recordsAvailable: null,
+    isTruncated: { lifecycle: !!lifecycleTruncated, entryEvaluation: !!telemetryTruncated },
+    // PR #141 review fix - виж buildTcCohortStatus по-горе: 0-100%
+    // conversionMetrics по-долу остава ВЯРНО смятан дори при truncation
+    // (composite keys, не inflated event ratio), но денoминаторът може да е
+    // частичен - cohortStatus прави това явно, вместо да подвежда consumer-а
+    // да приема partial window като "цялата история". cohortScanComplete/
+    // cohortLineageComplete стоят РАЗГРАНИЧЕНИ (FINAL REVIEW CORRECTION) -
+    // scan завършен ≠ lineage проследим.
+    cohortStatus: cohort.status,
+    cohortScanComplete: cohort.scanComplete,
+    cohortLineageComplete: cohort.lineageComplete,
+    ...buildCoverageRange(lifecycleRecords),
+    nullEpisodeIdCount,
+    missingEpisodeIds,
+    duplicateEventCount: countPossibleDuplicateEvents(lifecycleRecords),
+    missingLatencyCount: countMissingLatency(tcEntryRecords),
+    unmatchedEvaluationCount,
+    aggregationPopulation: TC_LIFECYCLE_AGGREGATION_POPULATION,
+    conversionMetrics: buildTcConversionMetrics(setupCreatedRecords, armedCreatedRecords, tcEntryRecords),
+  };
+}
+
+// /telemetry sibling на buildTcIntegrityDiagnostics по-горе (ЕТАП 1) - покрива
+// ВСИЧКИ decision записи (mean_reversion + trend_continuation + veto), не само
+// TC. setupModeMissingCount - записи с непознато/липсващо setupMode (нито
+// 'mean_reversion', нито 'trend_continuation') - легаси записи отпреди
+// setupMode полето, виж discussion-а.
+function buildTelemetryIntegrityDiagnostics(records, truncated) {
+  return {
+    ...buildCoverageRange(records),
+    isTruncated: !!truncated,
+    setupModeMissingCount: records.filter((r) => r.setupMode !== 'mean_reversion' && r.setupMode !== 'trend_continuation').length,
+  };
+}
+
+// ENTRY ENGINE STAGE DIRECTION COUNTS - diagnostic-only брояч на LONG/SHORT
+// разпределението на SETUP/ARMED (не само терминалния ENTRY, виж
+// buildTelemetryRecord по-горе) - единствения начин да разберем дали SHORT
+// bias-ът е upstream (липсва LONG още при SETUP) или се филтрира едва на
+// ENTRY TRIGGER (Stage 3) гейта. Чист pure reducer - KV wiring-ът е в
+// scanSymbolSignals (виж "STAGE DIRECTION COUNTS" коментара там), best-effort
+// и напълно изолиран от CORE (никога не хвърля нагоре).
+function incrementStageDirectionCount(counts, stage, direction) {
+  const base = (counts && typeof counts === 'object') ? counts : {};
+  const prevSetup = (base.setup && typeof base.setup === 'object') ? base.setup : {};
+  const prevArmed = (base.armed && typeof base.armed === 'object') ? base.armed : {};
+  const next = {
+    setup: { long: prevSetup.long || 0, short: prevSetup.short || 0 },
+    armed: { long: prevArmed.long || 0, short: prevArmed.short || 0 },
+  };
+  if ((stage === 'setup' || stage === 'armed') && (direction === 'long' || direction === 'short')) {
+    next[stage][direction]++;
+  }
+  return next;
+}
+
+// ═══ IDEA 04 - "VALUE MIGRATION" ═══════════════════════════════════════════════
+// Сравнява POC на ВЧЕРАШНИЯ (затворен) дневен профил с POC на ДНЕШНИЯ (все още
+// незавършен) дневен профил, построени от 1ч свещи - миграция на POC нагоре/
+// надолу през деня е ранен индикатор, че пазарът приема нова "справедлива цена"
+// (value), не просто шум около старата. ИМА hard factor изискване (OI/CVD да
+// потвърждават посоката на миграцията) - потвърдено с потребителя, огледално
+// на TRAP/AUCTION.
+const MIGRATION_MIN_PCT = 1; // под това % разлика между двата POC - шум, не истинска миграция
+const MIGRATION_MIN_CANDLES = 3; // минимум свещи за "днес", преди да има смисъл от сравнение
+
+// Разделя подадените 1ч свещи по UTC календарен ден (openTime в ms) - връща Map
+// от "YYYY-MM-DD" -> масив свещи, само за съответния ден.
+function splitCandlesByUtcDay(candles) {
+  const map = new Map();
+  if (!Array.isArray(candles)) return map;
+  for (const c of candles) {
+    if (c.openTime == null) continue;
+    const dayKey = new Date(c.openTime).toISOString().slice(0, 10);
+    if (!map.has(dayKey)) map.set(dayKey, []);
+    map.get(dayKey).push(c);
+  }
+  return map;
+}
+
+// Взима свещите за "днес" (последния наличен UTC ден в данните) и "вчера"
+// (предходния) - последните 2 УНИКАЛНИ дни в подадения масив, не системния
+// часовник директно (детерминирано, работи еднакво и в тестове).
+function getTodayYesterdayCandles(candles) {
+  const byDay = splitCandlesByUtcDay(candles);
+  const days = Array.from(byDay.keys()).sort();
+  if (days.length < 2) return { today: [], yesterday: [] };
+  return { today: byDay.get(days[days.length - 1]) || [], yesterday: byDay.get(days[days.length - 2]) || [] };
+}
+
+// Score 0-4: hard factor (OI/CVD потвърждение на посоката) гейтва tier-а изцяло
+// (виж getValueMigrationTier) - огледално на TRAP/AUCTION.
+function calcValueMigrationScore({ todayCandles, yesterdayCandles, oiDeltaPct, takerDelta, volAccel }) {
+  if (!Array.isArray(todayCandles) || todayCandles.length < MIGRATION_MIN_CANDLES ||
+      !Array.isArray(yesterdayCandles) || yesterdayCandles.length === 0) {
+    return { longScore: 0, shortScore: 0, hasHardFactorLong: false, hasHardFactorShort: false, migrationPct: null, todayPoc: null, yesterdayPoc: null };
+  }
+  const todayPoc = calcPOC(buildVolumeProfile(todayCandles));
+  const yesterdayPoc = calcPOC(buildVolumeProfile(yesterdayCandles));
+  if (!todayPoc || !yesterdayPoc || !(yesterdayPoc.price > 0)) {
+    return { longScore: 0, shortScore: 0, hasHardFactorLong: false, hasHardFactorShort: false, migrationPct: null, todayPoc: null, yesterdayPoc: null };
+  }
+  const migrationPct = ((todayPoc.price - yesterdayPoc.price) / yesterdayPoc.price) * 100;
+  const absMigration = Math.abs(migrationPct);
+  const migratingUp = migrationPct >= MIGRATION_MIN_PCT;
+  const migratingDown = migrationPct <= -MIGRATION_MIN_PCT;
+
+  const oiConfirmLong = oiDeltaPct != null && oiDeltaPct > 0;
+  const oiConfirmShort = oiDeltaPct != null && oiDeltaPct < 0;
+  const cvdConfirmLong = takerDelta != null && takerDelta > 0;
+  const cvdConfirmShort = takerDelta != null && takerDelta < 0;
+  const volOK = volAccel != null && volAccel.tier !== 'none';
+
+  const hasHardFactorLong = migratingUp && (oiConfirmLong || cvdConfirmLong);
+  const hasHardFactorShort = migratingDown && (oiConfirmShort || cvdConfirmShort);
+
+  let longScore = 0, shortScore = 0;
+  if (migratingUp) longScore += 2;
+  if (migratingDown) shortScore += 2;
+  if (absMigration >= MIGRATION_MIN_PCT * 3) { if (migratingUp) longScore++; if (migratingDown) shortScore++; }
+  if (volOK) { longScore++; shortScore++; }
+
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort, migrationPct, todayPoc: todayPoc.price, yesterdayPoc: yesterdayPoc.price };
+}
+
+const MIGRATION_LABELS = {
+  none: null,
+  watch: '🔀 VALUE MIGRATION WATCH',
+  confirmed: '🔀 VALUE MIGRATION CONFIRMED',
+};
+// Максимален score е 4 (2т посока + 1т силна миграция + 1т обем), огледално на getTrapTier по-горе.
+function getValueMigrationTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'confirmed';
+  if (score >= 3) return 'watch';
+  return 'none';
+}
+
+// VALUE MIGRATION - огледално на auctionCanFire/markAuctionFired по-горе (LIVE-
+// style, без candleTime), собствен KV state ключ (state.migration).
+function migrationCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.migration, key, direction);
+}
+function markMigrationFired(state, key, direction) {
+  state.migration = { key, direction, at: Date.now() };
+}
+
+// ═══ IDEA 08 - "LIQUIDATION GRAVITY" ═══════════════════════════════════════════
+// Worker-only (огледално на IDEA 06/PHASE CYCLE ENGINE прецедент - виж git
+// history) - за разлика от Volume Profile Engine (строи се НАНОВО всеки тик от
+// вече изтеглени свещи), тук профилът се НАТРУПВА постоянно в KV между
+// тиковете, месеци напред. Причината: Binance klines може да се преизтеглят
+// назад по всяко време (история), но CoinGlass `/liquidation/order` връща само
+// последните 7 дни И максимум 200 записа на заявка - НЯМА начин да се построи
+// профил еднократно от миналото, той расте единствено напред във времето,
+// натрупвайки новите ликвидации тик по тик (виж accumulateLiquidationGravity).
+// Затова профилът структурно не може да съществува извън persistent KV state -
+// UI-то (signal-scanner.html) няма собствено персистентно съхранение и не се
+// мирorира там, същата логика като PHASE CYCLE/RELOAD.
+//
+// Логаритмични (не линейни) ценови кошчета - за разлика от Volume Profile
+// buckets (фиксиран линеен диапазон от ЕДНА моментна снимка свещи), тук
+// профилът обхваща месеци движение на цената без предварително известен
+// диапазон, затова процентно-базирано (log-scale) кошче е единственият начин
+// да остане смислено сравним, докато цената се движи през времето.
+const LIQ_GRAVITY_BUCKET_PCT = 0.005; // 0.5% логаритмична ширина на кошче
+const LIQ_GRAVITY_PROXIMITY_PCT = 2; // "наближава" клъстер = под 2% разстояние - първоначална преценка, нужна калибрация
+const LIQ_GRAVITY_CLUSTER_MIN_USD = 2000000; // 2 млн. USD натрупани в кошче = "силен" клъстер - първоначална преценка, нужна калибрация
+
+function priceToLiqBucket(price) {
+  if (!(price > 0)) return null;
+  return Math.round(Math.log(price) / Math.log(1 + LIQ_GRAVITY_BUCKET_PCT));
+}
+function liqBucketToPrice(bucketIndex) {
+  return Math.pow(1 + LIQ_GRAVITY_BUCKET_PCT, bucketIndex);
+}
+
+// Натрупва само НОВИТЕ поръчки (o.time > lastSeenTime) в state.liqGravity.buckets
+// - вика се веднъж на тик, БЕЗ да пресмята нищо наново, само добавя delta.
+// Мутира state directly (както buildUpWindow/reloadWindow другаде в този файл).
+function accumulateLiquidationGravity(state, orders) {
+  if (!state.liqGravity) state.liqGravity = { buckets: {}, lastSeenTime: 0 };
+  const g = state.liqGravity;
+  if (!Array.isArray(orders)) return;
+  let maxTime = g.lastSeenTime;
+  for (const o of orders) {
+    if (!(o.time > g.lastSeenTime) || !(o.price > 0) || !(o.usdValue > 0)) continue;
+    const bucket = priceToLiqBucket(o.price);
+    if (bucket == null) continue;
+    g.buckets[bucket] = (g.buckets[bucket] || 0) + o.usdValue;
+    if (o.time > maxTime) maxTime = o.time;
+  }
+  g.lastSeenTime = maxTime;
+}
+
+// Намира най-близкия "силен" клъстер (кошче с натрупан USD обем >= usdMin) до
+// текущата цена - null, ако profile-ът е празен или няма нито едно кошче над прага.
+function findNearestLiquidationCluster(state, price, opts = {}) {
+  const usdMin = opts.usdMin ?? LIQ_GRAVITY_CLUSTER_MIN_USD;
+  const g = state?.liqGravity;
+  if (!g || !g.buckets || price == null) return null;
+  let best = null, bestDist = Infinity;
+  for (const key of Object.keys(g.buckets)) {
+    const usd = g.buckets[key];
+    if (usd < usdMin) continue;
+    const bucketPrice = liqBucketToPrice(Number(key));
+    const dist = Math.abs(bucketPrice - price);
+    if (dist < bestDist) { bestDist = dist; best = { price: bucketPrice, usd }; }
+  }
+  return best;
+}
+
+// Score 0-4: hard factor (OI/CVD потвърждение на посоката) гейтва tier-а
+// изцяло (виж getLiquidationGravityTier) - огледално на TRAP/AUCTION/MIGRATION.
+function calcLiquidationGravityScore({ price, cluster, oiDeltaPct, takerDelta, volAccel }) {
+  if (price == null || !(price > 0) || !cluster) {
+    return { longScore: 0, shortScore: 0, hasHardFactorLong: false, hasHardFactorShort: false, distancePct: null, clusterPrice: null, clusterUsd: null };
+  }
+  const distancePct = ((cluster.price - price) / price) * 100;
+  const absDistance = Math.abs(distancePct);
+  const isNear = absDistance <= LIQ_GRAVITY_PROXIMITY_PCT;
+  const direction = distancePct > 0 ? 'long' : 'short'; // клъстер НАД цената -> цената приближава го отдолу (LONG посока на движение натам)
+
+  const oiConfirmLong = oiDeltaPct != null && oiDeltaPct > 0;
+  const oiConfirmShort = oiDeltaPct != null && oiDeltaPct < 0;
+  const cvdConfirmLong = takerDelta != null && takerDelta > 0;
+  const cvdConfirmShort = takerDelta != null && takerDelta < 0;
+  const volOK = volAccel != null && volAccel.tier !== 'none';
+
+  const hasHardFactorLong = isNear && direction === 'long' && (oiConfirmLong || cvdConfirmLong);
+  const hasHardFactorShort = isNear && direction === 'short' && (oiConfirmShort || cvdConfirmShort);
+
+  let longScore = 0, shortScore = 0;
+  if (isNear && direction === 'long') longScore += 2;
+  if (isNear && direction === 'short') shortScore += 2;
+  if (volOK) { longScore++; shortScore++; }
+  if (cluster.usd >= LIQ_GRAVITY_CLUSTER_MIN_USD * 2) { if (direction === 'long') longScore++; if (direction === 'short') shortScore++; }
+
+  return { longScore, shortScore, hasHardFactorLong, hasHardFactorShort, distancePct, clusterPrice: cluster.price, clusterUsd: cluster.usd };
+}
+
+const LIQ_GRAVITY_LABELS = {
+  none: null,
+  watch: '🧲 LIQUIDATION GRAVITY WATCH',
+  confirmed: '🧲 LIQUIDATION GRAVITY CONFIRMED',
+};
+// Максимален score е 4 (2т посока+близост + 1т обем + 1т особено силен клъстер), огледално на getTrapTier по-горе.
+function getLiquidationGravityTier(score, hasHardFactor) {
+  if (!hasHardFactor) return 'none';
+  if (score >= 4) return 'confirmed';
+  if (score >= 3) return 'watch';
+  return 'none';
+}
+
+// LIQUIDATION GRAVITY - огледално на auctionCanFire/markAuctionFired по-горе
+// (LIVE-style, без candleTime), собствен KV state ключ (state.liqGravityFired -
+// различен от state.liqGravity по-горе, който пази самия натрупан профил).
+function liqGravityCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.liqGravityFired, key, direction);
+}
+function markLiqGravityFired(state, key, direction) {
+  state.liqGravityFired = { key, direction, at: Date.now() };
+}
+
+// ═══ COINGLASS LIQUIDATION DIAGNOSTICS (SHADOW, diagnostic-only) ════════════════
+// Диагностика на `/futures/liquidation/order` интеграцията (виж доклада
+// "CoinGlass liquidation/order - symbol diagnostics"). ПРИНЦИПИ:
+// (1) ИЗКЛЮЧЕНО по подразбиране - нищо не се изпълнява, освен ако
+//     env.LIQ_DIAG_ENABLED === '1' (Cloudflare var). Deploy без този var =
+//     нулева промяна в поведението.
+// (2) НЕ пипа legacy пътя: fetchLiquidationOrdersWorker/calcLiquidationCascade/
+//     accumulateLiquidationGravity и техните входове/изходи към PHASE CYCLE и
+//     LIQUIDATION GRAVITY известието остават byte-identical. Shadow gravity
+//     профилът живее в ОТДЕЛЕН обект, никога в state.liqGravity.
+// (3) НЕ влияе на SETUP/ARMED/ENTRY, PHASE CYCLE score-а, нито праща известия.
+// (4) Пише САМО в собствен KV prefix `liqdiag:` (отделен от `sigstate:` и
+//     `telemetry:`), чете се единствено от /liq-diagnostics ендпойнта.
+// (5) API ключът НИКОГА не се записва/връща - пазим само code/msg/count/coin.
+const LIQ_DIAG_KV_PREFIX = 'liqdiag:';
+const LIQ_DIAG_LOOKBACK_MS = 20 * 60000; // 15-мин CASCADE прозорец + запас за cron jitter
+const LIQ_DIAG_MAX_EVENTS = 200;
+const LIQ_DIAG_MAX_TIMELINE = 288; // ~24ч при 5-мин cron - за time-join с /telemetry записите
+// Хистограма на 15-мин сумите (USD) - за калибриране на LIQUIDATION_CASCADE_USD_MIN.
+const LIQ_DIAG_USD_BINS = [0, 10000, 50000, 100000, 250000, 500000, 1000000, 2500000, 5000000];
+// Символи, при които махането на "USDT" НЕ дава CoinGlass монетата. НЕПОТВЪРДЕНО
+// с реален отговор - затова toCoinGlassCoin() връща verified:false за тях и
+// диагностиката ги отчита отделно, докато не се види реален `base_asset`.
+const LIQ_DIAG_COIN_OVERRIDES = { '1000PEPEUSDT': 'PEPE' };
+
+function isLiqDiagEnabled(env) {
+  return String(env?.LIQ_DIAG_ENABLED ?? '').trim() === '1';
+}
+
+// Binance USDT-M pair -> CoinGlass coin (`symbol` параметърът на
+// /liquidation/order е монета, напр. BTC; двойка BTCUSDT връща празен масив).
+function toCoinGlassCoin(symbol) {
+  const s = String(symbol || '').toUpperCase();
+  if (LIQ_DIAG_COIN_OVERRIDES[s]) return { coin: LIQ_DIAG_COIN_OVERRIDES[s], verified: false, rule: 'override' };
+  if (/^\d+[A-Z]+USDT$/.test(s)) return { coin: s.replace(/USDT$/, '').replace(/^\d+/, ''), verified: false, rule: 'numeric_prefix' };
+  if (s.endsWith('USDT') && s.length > 4) return { coin: s.slice(0, -4), verified: true, rule: 'strip_usdt' };
+  return { coin: s, verified: false, rule: 'passthrough' };
+}
+
+// Класифицира CoinGlass отговор. CoinGlass връща HTTP 200 и при грешки -
+// реалният статус е в json.code ("0" = успех). Legacy кодът гледа само r.ok
+// и Array.isArray(json.data), затова 'empty', 'api_error', 'bad_shape' и
+// 'network'/'timeout' там се сливат в [] или null.
+function classifyCoinGlassLiqResponse({ httpStatus = null, json = undefined, error = null, hasKey = true } = {}) {
+  if (!hasKey) return { status: 'no_key', code: null, msg: null, count: 0 };
+  if (error) {
+    const isTimeout = error.name === 'AbortError' || /abort|timeout/i.test(String(error.message || ''));
+    return { status: isTimeout ? 'timeout' : 'network', code: null, msg: String(error.message || error.name || 'error').slice(0, 200), count: 0 };
+  }
+  if (httpStatus != null && (httpStatus < 200 || httpStatus >= 300)) {
+    return { status: 'http_error', code: json?.code != null ? String(json.code) : null, msg: json?.msg ? String(json.msg).slice(0, 200) : null, count: 0, httpStatus };
+  }
+  if (json === undefined || json === null || typeof json !== 'object') return { status: 'parse_error', code: null, msg: null, count: 0, httpStatus };
+  const code = json.code != null ? String(json.code) : null;
+  const msg = json.msg != null ? String(json.msg).slice(0, 200) : null;
+  if (code !== '0') return { status: 'api_error', code, msg, count: 0, httpStatus };
+  if (!Array.isArray(json.data)) return { status: 'bad_shape', code, msg, count: 0, httpStatus };
+  return { status: json.data.length ? 'ok' : 'empty', code, msg, count: json.data.length, httpStatus };
+}
+
+// Същата нормализация като legacy fetchLiquidationOrdersWorker + pair/exchange
+// за диагностика (при symbol=BTC отговорът може да включва и други BTC двойки
+// на Binance, напр. USDC/COIN-M - отчита се в pairCounts).
+function normalizeLiqDiagOrders(data) {
+  if (!Array.isArray(data)) return [];
+  return data
+    .map(d => ({ side: Number(d.side), usdValue: parseFloat(d.usd_value), time: Number(d.time), price: parseFloat(d.price), pair: d.symbol != null ? String(d.symbol) : null, baseAsset: d.base_asset != null ? String(d.base_asset) : null }))
+    .filter(d => isFinite(d.usdValue) && isFinite(d.time));
+}
+
+function buildLiqDiagUrl(coin, { startTime, minAmount = 1, exchange = 'Binance' } = {}) {
+  const p = new URLSearchParams({ symbol: coin, exchange, min_liquidation_amount: String(minAmount) });
+  if (startTime != null) p.set('start_time', String(startTime));
+  return `https://open-api-v4.coinglass.com/api/futures/liquidation/order?${p.toString()}`;
+}
+
+// Един shadow fetch с ПРАВИЛНИЯ coin символ и ограничен прозорец (start_time) -
+// legacy заявката не подава start_time и при правилен символ би теглила 7 дни.
+async function fetchLiquidationOrdersDiag(env, symbol, { now = Date.now(), lookbackMs = LIQ_DIAG_LOOKBACK_MS, minAmount = 1, coinOverride = null, fetchImpl = null } = {}) {
+  const mapping = coinOverride ? { coin: coinOverride, verified: false, rule: 'probe_override' } : toCoinGlassCoin(symbol);
+  const startTime = lookbackMs != null ? now - lookbackMs : null;
+  const meta = { symbol, coin: mapping.coin, coinVerified: mapping.verified, coinRule: mapping.rule, startTime, minAmount, at: now };
+  if (!env?.CG_API_KEY) return { ...meta, ...classifyCoinGlassLiqResponse({ hasKey: false }), orders: [], latencyMs: 0 };
+  const t0 = Date.now();
+  try {
+    const doFetch = fetchImpl || fetchWithTimeout;
+    const r = await doFetch(buildLiqDiagUrl(mapping.coin, { startTime, minAmount }), { headers: { 'CG-API-KEY': env.CG_API_KEY } });
+    let json;
+    try { json = await r.json(); } catch (e) { json = undefined; }
+    const cls = classifyCoinGlassLiqResponse({ httpStatus: r.status, json });
+    const orders = cls.status === 'ok' ? normalizeLiqDiagOrders(json.data) : [];
+    return { ...meta, ...cls, orders, latencyMs: Date.now() - t0 };
+  } catch (error) {
+    return { ...meta, ...classifyCoinGlassLiqResponse({ error }), orders: [], latencyMs: Date.now() - t0 };
+  }
+}
+
+// ─── BINANCE forceOrder ПРЕЗ RELAY (shadow източник, заместител на CoinGlass) ───
+// relay/liquidation-collector.js държи 1 WebSocket към Binance !forceOrder@arr
+// и сервира /liquidations?symbol=&since=&token= (RELAY_TOKEN, като /klines).
+// Символът е директно Binance двойката (без coin карта); `side` е в същата
+// конвенция като legacy calcLiquidationCascade (1 = принудително BUY = SHORT
+// ликвидирани, 2 = принудително SELL = LONG ликвидирани). `coverage` казва дали
+// relay-ят е бил свързан през целия поискан прозорец (gaps/рестарт).
+// Връща същата форма като fetchLiquidationOrdersDiag -> applyLiqShadowStep.
+async function fetchLiquidationOrdersRelayDiag(env, symbol, { now = Date.now(), lookbackMs = LIQ_DIAG_LOOKBACK_MS, fetchImpl = null } = {}) {
+  const startTime = now - lookbackMs;
+  const meta = { source: 'relay', symbol, coin: symbol, coinVerified: true, coinRule: 'relay_pair', startTime, minAmount: null, at: now };
+  const blank = (status, extra = {}) => ({ ...meta, status, code: null, msg: null, count: 0, orders: [], latencyMs: 0, coverageComplete: null, coverageReasons: [], ...extra });
+  if (!env?.RELAY_URL || !env?.RELAY_TOKEN) return blank('no_relay');
+  const t0 = Date.now();
+  try {
+    const doFetch = fetchImpl || fetchWithTimeout;
+    const r = await doFetch(`${env.RELAY_URL}/liquidations?symbol=${encodeURIComponent(symbol)}&since=${startTime}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    let json;
+    try { json = await r.json(); } catch (e) { json = undefined; }
+    const latencyMs = Date.now() - t0;
+    if (r.status === 503) return blank('source_disabled', { httpStatus: 503, msg: json?.reason ? String(json.reason).slice(0, 200) : null, latencyMs });
+    if (r.status < 200 || r.status >= 300) return blank('http_error', { httpStatus: r.status, msg: json?.error ? String(json.error).slice(0, 200) : null, latencyMs });
+    if (!json || typeof json !== 'object') return blank('parse_error', { httpStatus: r.status, latencyMs });
+    if (!Array.isArray(json.events)) return blank('bad_shape', { httpStatus: r.status, latencyMs });
+    const orders = json.events
+      .map(e => ({ side: Number(e.side), usdValue: parseFloat(e.usdValue), time: Number(e.time), price: parseFloat(e.price), pair: symbol, baseAsset: null }))
+      .filter(d => (d.side === 1 || d.side === 2) && isFinite(d.usdValue) && isFinite(d.time));
+    const cov = json.coverage && typeof json.coverage === 'object' ? json.coverage : null;
+    return {
+      ...meta, status: orders.length ? 'ok' : 'empty', code: null, msg: null, httpStatus: r.status,
+      count: orders.length, orders, latencyMs, relayTruncated: !!json.truncated,
+      coverageComplete: cov ? cov.complete === true : null,
+      coverageReasons: cov && Array.isArray(cov.reasons) ? cov.reasons.slice(0, 10).map(String) : [],
+    };
+  } catch (error) {
+    const isTimeout = error?.name === 'AbortError' || /abort|timeout/i.test(String(error?.message || ''));
+    return blank(isTimeout ? 'timeout' : 'network', { msg: String(error?.message || error?.name || 'error').slice(0, 200), latencyMs: Date.now() - t0 });
+  }
+}
+
+// Shadow източник: env.LIQ_DIAG_SOURCE = 'relay' (по подразбиране - CoinGlass
+// абонаментът е изтекъл) | 'coinglass'. Важи САМО при LIQ_DIAG_ENABLED=1.
+function getLiqDiagSource(env) {
+  const s = String(env?.LIQ_DIAG_SOURCE ?? '').trim().toLowerCase();
+  return s === 'coinglass' ? 'coinglass' : 'relay';
+}
+function fetchLiquidationOrdersShadow(env, symbol, opts = {}) {
+  return getLiqDiagSource(env) === 'coinglass'
+    ? fetchLiquidationOrdersDiag(env, symbol, opts)
+    : fetchLiquidationOrdersRelayDiag(env, symbol, opts);
+}
+
+function liqDiagUsdBin(usd) {
+  let idx = 0;
+  for (let i = 0; i < LIQ_DIAG_USD_BINS.length; i++) if (usd >= LIQ_DIAG_USD_BINS[i]) idx = i;
+  return String(LIQ_DIAG_USD_BINS[idx]);
+}
+
+// Детекция на вероятно отрязан отговор: много записи, а най-старият е
+// значително по-нов от start_time (т.е. API-то не е върнало целия прозорец).
+function detectLiqDiagTruncation(orders, startTime) {
+  if (!orders.length || startTime == null) return false;
+  let oldest = Infinity;
+  for (const o of orders) if (o.time < oldest) oldest = o.time;
+  return orders.length >= 200 && oldest > startTime + 60000;
+}
+
+function emptyLiqDiagState() {
+  return {
+    v: 1, createdAt: null, updatedAt: null,
+    counts: {}, last: null, lastOkAt: null, maxCount: 0, truncatedSuspectCount: 0,
+    pairCounts: {}, baseAssets: {},
+    shadowGravity: { buckets: {}, lastSeenTime: 0 },
+    coverageIncompleteCount: 0, coverageReasons: {}, sources: {},
+    cascadeHist: { buy: {}, sell: {} },
+    cascadeMax: { buy: 0, sell: 0 },
+    prevShadow: { cascadeBull: false, cascadeBear: false, gravityKey: 'none' },
+    events: [], timeline: [],
+  };
+}
+
+// Чиста (без I/O) shadow стъпка: взема предишния diag state + резултата от
+// fetchLiquidationOrdersDiag + пазарния контекст и връща НОВ diag state.
+// Реизползва СЪЩИТЕ production функции/прагове (calcLiquidationCascade,
+// accumulateLiquidationGravity, findNearestLiquidationCluster,
+// calcLiquidationGravityScore, getLiquidationGravityTier), така че показва
+// точно какво БИ направил production при реални данни - но само го записва.
+function applyLiqShadowStep(prevDiag, fetchResult, { price = null, oiDeltaPct = null, takerDelta = null, volAccel = null, legacyBuyUsd = 0, legacySellUsd = 0 } = {}) {
+  const d = prevDiag && prevDiag.v === 1 ? JSON.parse(JSON.stringify(prevDiag)) : emptyLiqDiagState();
+  const now = fetchResult.at ?? Date.now();
+  if (!d.createdAt) d.createdAt = now;
+  d.updatedAt = now;
+  d.counts[fetchResult.status] = (d.counts[fetchResult.status] || 0) + 1;
+  const truncatedSuspect = fetchResult.relayTruncated === true || (fetchResult.status === 'ok' && fetchResult.source !== 'relay' && detectLiqDiagTruncation(fetchResult.orders, fetchResult.startTime));
+  if (truncatedSuspect) d.truncatedSuspectCount++;
+  const source = fetchResult.source || 'coinglass';
+  if (!d.sources) d.sources = {};
+  d.sources[source] = (d.sources[source] || 0) + 1;
+  const coverageComplete = fetchResult.coverageComplete ?? null;
+  if (coverageComplete === false) {
+    d.coverageIncompleteCount = (d.coverageIncompleteCount || 0) + 1;
+    if (!d.coverageReasons) d.coverageReasons = {};
+    for (const r of fetchResult.coverageReasons || []) d.coverageReasons[r] = (d.coverageReasons[r] || 0) + 1;
+  }
+  d.last = {
+    at: now, status: fetchResult.status, code: fetchResult.code ?? null, msg: fetchResult.msg ?? null,
+    httpStatus: fetchResult.httpStatus ?? null, count: fetchResult.count ?? 0, coin: fetchResult.coin,
+    coinVerified: !!fetchResult.coinVerified, coinRule: fetchResult.coinRule, latencyMs: fetchResult.latencyMs ?? null, truncatedSuspect,
+    source, coverageComplete, coverageReasons: fetchResult.coverageReasons || [],
+  };
+  if (fetchResult.status === 'ok') d.lastOkAt = now;
+  if ((fetchResult.count || 0) > d.maxCount) d.maxCount = fetchResult.count;
+  const orders = fetchResult.orders || [];
+  for (const o of orders) {
+    if (o.pair) d.pairCounts[o.pair] = (d.pairCounts[o.pair] || 0) + 1;
+    if (o.baseAsset) d.baseAssets[o.baseAsset] = (d.baseAssets[o.baseAsset] || 0) + 1;
+  }
+
+  // Shadow CASCADE - същата функция и праг като production.
+  const usable = fetchResult.status === 'ok' || fetchResult.status === 'empty';
+  const cascade = calcLiquidationCascade(orders);
+  if (usable) {
+    const bb = liqDiagUsdBin(cascade.buySumUsd), sb = liqDiagUsdBin(cascade.sellSumUsd);
+    d.cascadeHist.buy[bb] = (d.cascadeHist.buy[bb] || 0) + 1;
+    d.cascadeHist.sell[sb] = (d.cascadeHist.sell[sb] || 0) + 1;
+    if (cascade.buySumUsd > d.cascadeMax.buy) d.cascadeMax.buy = cascade.buySumUsd;
+    if (cascade.sellSumUsd > d.cascadeMax.sell) d.cascadeMax.sell = cascade.sellSumUsd;
+  }
+
+  // Shadow GRAVITY - в ОТДЕЛЕН wrapper обект, никога в реалния state.
+  const shadowWrap = { liqGravity: d.shadowGravity };
+  if (usable) accumulateLiquidationGravity(shadowWrap, orders);
+  d.shadowGravity = shadowWrap.liqGravity;
+  const cluster = findNearestLiquidationCluster(shadowWrap, price);
+  const gScore = calcLiquidationGravityScore({ price, cluster, oiDeltaPct, takerDelta, volAccel });
+  const gDir = gScore.longScore >= gScore.shortScore ? 'long' : 'short';
+  const gMax = Math.max(gScore.longScore, gScore.shortScore);
+  const gHard = gDir === 'long' ? gScore.hasHardFactorLong : gScore.hasHardFactorShort;
+  const gTier = getLiquidationGravityTier(gMax, gHard);
+  const gKey = gTier !== 'none' ? `${gDir}:${gTier}` : 'none';
+
+  // "Would-fire" събития - само при преход (rising edge), за измерване на
+  // качеството по-късно (forward return от `price`), БЕЗ известия.
+  const pushEvent = (ev) => { d.events.push(ev); if (d.events.length > LIQ_DIAG_MAX_EVENTS) d.events.splice(0, d.events.length - LIQ_DIAG_MAX_EVENTS); };
+  if (usable && cascade.bullish && !d.prevShadow.cascadeBull) pushEvent({ at: now, kind: 'cascade', direction: 'long', price, side1Usd: cascade.buySumUsd, side2Usd: cascade.sellSumUsd });
+  if (usable && cascade.bearish && !d.prevShadow.cascadeBear) pushEvent({ at: now, kind: 'cascade', direction: 'short', price, side1Usd: cascade.buySumUsd, side2Usd: cascade.sellSumUsd });
+  if (gKey !== 'none' && gKey !== d.prevShadow.gravityKey) pushEvent({ at: now, kind: 'gravity', direction: gDir, tier: gTier, score: gMax, price, clusterPrice: gScore.clusterPrice, clusterUsd: gScore.clusterUsd, distancePct: gScore.distancePct });
+  d.prevShadow = { cascadeBull: usable ? cascade.bullish : d.prevShadow.cascadeBull, cascadeBear: usable ? cascade.bearish : d.prevShadow.cascadeBear, gravityKey: gKey };
+
+  d.timeline.push({
+    at: now, status: fetchResult.status, source, coverageComplete, price,
+    side1Usd15m: usable ? Math.round(cascade.buySumUsd) : null, side2Usd15m: usable ? Math.round(cascade.sellSumUsd) : null,
+    legacySide1Usd15m: Math.round(legacyBuyUsd || 0), legacySide2Usd15m: Math.round(legacySellUsd || 0),
+    gravityTier: gTier, gravityDistancePct: gScore.distancePct != null ? Math.round(gScore.distancePct * 100) / 100 : null,
+  });
+  if (d.timeline.length > LIQ_DIAG_MAX_TIMELINE) d.timeline.splice(0, d.timeline.length - LIQ_DIAG_MAX_TIMELINE);
+
+  return { diag: d, shadow: { cascade, gravity: { tier: gTier, direction: gDir, score: gMax, cluster } } };
+}
+
+async function loadLiqDiagState(env, symbol) {
+  if (!env?.ALERT_STATE) return null;
+  const raw = await env.ALERT_STATE.get(`${LIQ_DIAG_KV_PREFIX}${symbol}`);
+  return raw ? JSON.parse(raw) : null;
+}
+async function saveLiqDiagState(env, symbol, diag) {
+  if (!env?.ALERT_STATE) return;
+  await env.ALERT_STATE.put(`${LIQ_DIAG_KV_PREFIX}${symbol}`, JSON.stringify(diag));
+}
+
+// Целият shadow цикъл за един символ. НИКОГА не хвърля - диагностиката не
+// може да прекъсне scanSymbolSignals.
+async function runLiqShadowDiagnostics(env, symbol, fetchPromise, ctx) {
+  try {
+    const fetchResult = await fetchPromise;
+    if (!fetchResult) return null;
+    const prev = await loadLiqDiagState(env, symbol);
+    const { diag } = applyLiqShadowStep(prev, fetchResult, ctx);
+    await saveLiqDiagState(env, symbol, diag);
+    return diag;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Агрегат за /liq-diagnostics - чиста функция (без KV), тества се директно.
+function buildLiqDiagSummary(entries) {
+  const bySymbol = {};
+  const totals = {};
+  const neverOk = [], unverifiedCoins = [], withEvents = [];
+  for (const { symbol, diag } of entries) {
+    if (!diag) { bySymbol[symbol] = null; neverOk.push(symbol); continue; }
+    for (const [k, v] of Object.entries(diag.counts || {})) totals[k] = (totals[k] || 0) + v;
+    if (!diag.lastOkAt) neverOk.push(symbol);
+    if (diag.last && !diag.last.coinVerified) unverifiedCoins.push({ symbol, coin: diag.last.coin, baseAssets: diag.baseAssets });
+    const evCount = (diag.events || []).length;
+    if (evCount) withEvents.push({ symbol, events: evCount });
+    bySymbol[symbol] = {
+      last: diag.last, counts: diag.counts, lastOkAt: diag.lastOkAt, maxCount: diag.maxCount,
+      truncatedSuspectCount: diag.truncatedSuspectCount, pairCounts: diag.pairCounts, baseAssets: diag.baseAssets,
+      sources: diag.sources || {}, coverageIncompleteCount: diag.coverageIncompleteCount || 0, coverageReasons: diag.coverageReasons || {},
+      cascadeMax: diag.cascadeMax, cascadeHist: diag.cascadeHist,
+      gravityBuckets: Object.keys(diag.shadowGravity?.buckets || {}).length,
+      gravityLastSeenTime: diag.shadowGravity?.lastSeenTime ?? 0,
+      events: evCount,
+    };
+  }
+  return { symbols: entries.length, totals, neverOk, unverifiedCoins, withEvents, bySymbol };
+}
+
+// Ръчна проба (само през /liq-diagnostics/probe, с token): сравнява legacy
+// заявката (pair, 1:1 с production) срещу coin заявката за ЕДИН символ.
+// coin пробата е с min_liquidation_amount=100000 (документиран таван 200
+// записа) и 60-мин прозорец - лека. Без ключ в изхода.
+async function runLiqDiagProbe(env, symbol, { coinOverride = null, fetchImpl = null, now = Date.now() } = {}) {
+  const strip = (r) => { const { orders, ...rest } = r; return { ...rest, sample: orders.slice(0, 3) }; };
+  // legacy: pair (BTCUSDT) + min=1 като production; 60-мин прозорец вместо
+  // 7-дневния default, за да е лека дори ако pair-ът неочаквано върне данни.
+  const legacy = await fetchLiquidationOrdersDiag(env, symbol, { now, lookbackMs: 60 * 60000, minAmount: 1, coinOverride: symbol, fetchImpl });
+  const coin = await fetchLiquidationOrdersDiag(env, symbol, { now, lookbackMs: 60 * 60000, minAmount: 100000, coinOverride, fetchImpl });
+  let verdict = 'inconclusive';
+  if (legacy.status === 'empty' && coin.status === 'ok') verdict = 'symbol_format_bug_confirmed';
+  else if (legacy.status === 'api_error' || coin.status === 'api_error') verdict = 'api_error_plan_or_auth';
+  else if (legacy.status === 'ok') verdict = 'legacy_pair_returns_data';
+  else if (legacy.status === 'empty' && coin.status === 'empty') verdict = 'both_empty_quiet_market_or_other';
+  return { symbol, verdict, legacy: strip(legacy), coin: strip(coin) };
+}
+
+// ============================================================================
+// PHASE CYCLE ENGINE - "ПРЕДЛОЖЕНИЕ: ДВА ОТДЕЛНИ РЕЖИМА ЗА ТЪРГОВИЯ (IMPULSE
+// HUNTER + EXHAUSTION/TOP HUNTER)". Изцяло нов, отделен слой ВЪРХУ съществуващия
+// LONG/SHORT точков резултат (SIGNAL_WEIGHTS/SIGNAL_FAMILY_MAX/computeDirectionConfidence
+// по-горе НЕ са пипнати с нищо тук) - класифицира монетата в една от 11 фази на
+// пазарния цикъл (WARMING → LONG WATCH/SETUP → STRONG LONG → OVERHEATED/NO CHASE →
+// TOP WATCH → SHORT WATCH/SETUP → STRONG SHORT → BREAKDOWN → пак компресия/
+// WARMING), вместо просто LONG/SHORT/MIXED. Праща СОБСТВЕНО, отделно WhatsApp
+// известие само при РЕАЛНА смяна на фазата (виж cyclePhaseCanFire по-долу) -
+// не участва в MIN_NOTIFY_SCORE/newFired на checkMarketSignals.
+// Четири нови типа данни, които Worker-ът не тегли никъде другаде досега:
+// Open Interest история, order book Buy/Sell стени, 24ч % промяна, ликвидации.
+
+// Open Interest история (Binance futures/data/openInterestHist) - за "OI Δ15m"
+// от предложението (секция E: OI трябва да се чете СПРЯМО цената, не самостоятелно).
+// Връща масив {time, oi} във възходящ хронологичен ред (най-новото последно),
+// или null при грешка/липсващи данни.
+async function fetchOpenInterestHistWorker(env, symbol, period = '5m', limit = 6) {
+  try {
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/openinterest?symbol=${symbol}&period=${period}&limit=${limit}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (!Array.isArray(data) || !data.length) return null;
+    return data.map(d => ({ time: d.timestamp, oi: parseFloat(d.sumOpenInterest) })).filter(d => isFinite(d.oi));
+  } catch (e) {
+    return null;
+  }
+}
+// % промяна на OI за последните `lookback` периода (по подразбиране 3x5м=15м,
+// точно "OI Δ15m" от предложението). null ако няма достатъчно история.
+function calcOiDeltaPct(oiHist, lookback = 3) {
+  if (!oiHist || oiHist.length < lookback + 1) return null;
+  const now = oiHist[oiHist.length - 1].oi;
+  const prev = oiHist[oiHist.length - 1 - lookback].oi;
+  if (!prev) return null;
+  return ((now - prev) / prev) * 100;
+}
+
+// Order book Buy/Sell стени (Binance futures/v1/depth) - PRIORITY F от предложението
+// ("ORDER BOOK WALL FILTER"): само стени в разумно разстояние (по подразбиране
+// 15%) от текущата цена се броят - далечни стени на +100%/+200% не трябва да
+// влияят на локалния bias (реалният проблем, докладван при AIXBT). Връща null
+// при грешка/липсващи данни, за да не чупи PHASE CYCLE заради спомагателна инфо.
+const ORDER_BOOK_WALL_MAX_DISTANCE_PCT = 15;
+async function fetchOrderBookWallsWorker(env, symbol, price) {
+  try {
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/depth?symbol=${symbol}&limit=500&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (!Array.isArray(data.bids) || !Array.isArray(data.asks) || price == null) return null;
+    const inRange = ([p]) => Math.abs((parseFloat(p) - price) / price * 100) <= ORDER_BOOK_WALL_MAX_DISTANCE_PCT;
+    const buyWallUsd = data.bids.filter(inRange).reduce((sum, [p, q]) => sum + parseFloat(p) * parseFloat(q), 0);
+    const sellWallUsd = data.asks.filter(inRange).reduce((sum, [p, q]) => sum + parseFloat(p) * parseFloat(q), 0);
+    return { buyWallUsd, sellWallUsd };
+  } catch (e) {
+    return null;
+  }
+}
+
+// 24ч % промяна (Binance futures/v1/ticker/24hr) - за OVERHEATED/NO CHASE
+// детектора (секция C от предложението). Връща null при грешка/липсващи данни.
+async function fetch24hChangeWorker(env, symbol) {
+  try {
+    const r = await fetchWithTimeout(`${env.RELAY_URL}/ticker24hr?symbol=${symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const chg = parseFloat(data.priceChangePercent);
+    return isFinite(chg) ? chg : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Секция E от предложението - "OI ТРЯБВА ДА СЕ ТЪЛКУВА СПРЯМО ЦЕНАТА": не
+// ползваме OI Δ самостоятелно, само в комбинация с посоката на цената.
+// PRICE↑+OI↑ = продължение; PRICE↑+OI↓ = възможно изчерпване (затваряния);
+// PRICE↓+OI↑ = SHORT продължение; PRICE↓+OI↓ = flush/exhaustion (ликвидации).
+const OI_DELTA_SIGNIFICANT_PCT = 2; // праг под който Δ се смята за шум, не реална промяна
+function interpretOiPriceCross(priceUp, oiDeltaPct) {
+  if (oiDeltaPct == null) return 'unknown';
+  if (Math.abs(oiDeltaPct) < OI_DELTA_SIGNIFICANT_PCT) return 'flat';
+  const oiUp = oiDeltaPct > 0;
+  if (priceUp && oiUp) return 'long_continuation';
+  if (priceUp && !oiUp) return 'long_exhaustion_risk';
+  if (!priceUp && oiUp) return 'short_continuation';
+  return 'long_flush_or_exhaustion';
+}
+
+// "DEATH X" от предложението - Death Cross на дневна база (EMA50 пресича ЛОЛУ
+// EMA200) като ЕДНОКРАТНО СЪБИТИЕ (crossunder), не просто "текущ bear режим"
+// (за това вече си имаме calcEmaTrendFilter.bear по-горе - steady-state режим,
+// не самото пресичане). candles трябва да са ЗАТВОРЕНИ дневни свещи.
+function calcDeathCross(candles, opts = {}) {
+  const fastLen = opts.fastLen ?? 50, slowLen = opts.slowLen ?? 200;
+  const closes = candles.map(c => c.close);
+  const fastSeries = calcEMASeries(closes, fastLen);
+  const slowSeries = calcEMASeries(closes, slowLen);
+  const n = candles.length;
+  const f0 = fastSeries[n - 1], f1 = fastSeries[n - 2], s0 = slowSeries[n - 1], s1 = slowSeries[n - 2];
+  if (f0 == null || f1 == null || s0 == null || s1 == null) return false;
+  return f1 >= s1 && f0 < s0;
+}
+
+// Секция C от предложението - "OVERHEATED / NO CHASE": прекомерен 24ч/7д ръст
+// САМ ПО СЕБЕ СИ не е SHORT сигнал, но комбиниран с голямо разстояние от EMA50
+// (дневна) блокира нови LONG входове, без все още да е потвърдено обръщане.
+// chg7d се смята от вече наличните дневни свещи (без нужда от допълнителна
+// заявка) - close сега срещу close преди 7 затворени дневни свещи.
+const OVERHEATED_CHG24H_PCT = 15;
+const OVERHEATED_CHG7D_PCT = 40;
+const OVERHEATED_EMA_DISTANCE_PCT = 12;
+function calcChg7dPct(candles1dClosed) {
+  const n = candles1dClosed.length;
+  if (n < 8) return null;
+  const now = candles1dClosed[n - 1].close, prev = candles1dClosed[n - 8].close;
+  if (!prev) return null;
+  return ((now - prev) / prev) * 100;
+}
+function calcOverheated(chg24h, chg7d, price, ema50d) {
+  const bigMove = (chg24h != null && chg24h >= OVERHEATED_CHG24H_PCT) || (chg7d != null && chg7d >= OVERHEATED_CHG7D_PCT);
+  if (!bigMove) return false;
+  if (ema50d == null || price == null || ema50d <= 0) return false;
+  return ((price - ema50d) / ema50d) * 100 >= OVERHEATED_EMA_DISTANCE_PCT;
+}
+
+// Секция B - "TOP WATCH фактори" (gate преди да броим SHORT CONFIRMATION):
+// прекалено положителен funding ИЛИ прекалено презареден Long/Short към LONG
+// ИЛИ вече установен OVERHEATED - кое да е от трите отваря TOP WATCH прозореца.
+const TOP_WATCH_FUNDING_MIN = 0.06; // същия праг като MACRO_SQUEEZE_FUNDING_MIN
+const TOP_WATCH_LONGPCT_MIN = 65;
+function isTopWatch(overheated, funding, longPct) {
+  return overheated || (funding != null && funding >= TOP_WATCH_FUNDING_MIN) || (longPct != null && longPct >= TOP_WATCH_LONGPCT_MIN);
+}
+
+// Секция F - Sell стена трябва да доминира с разумен марж (не само 51%/49%),
+// за да се брои като реален SHORT confirmation фактор, огледално на
+// calcWallBias/DOMINANCE_RATIO=1.5 в signal-logic.js.
+const WALL_DOMINANCE_RATIO = 1.5;
+
+// MACD (12,26,9) bullish/bearish crossover на ДНЕВНА база - исторически бичи
+// crossover на MACD линията срещу сигналната линия е бил надежден сигнал за
+// край на мечи цикъл и начало на нов възходящ (напр. BTC 2012 - MACD bullish
+// crossover, последван от рали $5→$283). Индикаторът е чисто математически,
+// НЕ BTC-специфичен - смята се еднакво за всяка монета от watchlist-а.
+// BTC-специфично е само конкретният брой дни между цикли (произлиза от
+// halving-а, който altcoins нямат собствен еквивалент на) - затова тук
+// НЕ хардкодваме никакъв брой дни, само самото пресичане (crossover/
+// crossunder като еднократно събитие, не steady-state режим - огледално на
+// calcDeathCross по-горе). candles трябва да са ЗАТВОРЕНИ дневни свещи.
+function calcMACDCrossover(candles, opts = {}) {
+  const fastLen = opts.fastLen ?? 12, slowLen = opts.slowLen ?? 26, signalLen = opts.signalLen ?? 9;
+  const n = candles.length;
+  if (n < slowLen + signalLen + 1) return { bullish: false, bearish: false };
+  const closes = candles.map(c => c.close);
+  const fastSeries = calcEMASeries(closes, fastLen);
+  const slowSeries = calcEMASeries(closes, slowLen);
+  const macdSeries = fastSeries.map((f, i) => (f == null || slowSeries[i] == null) ? null : f - slowSeries[i]);
+  const firstValid = macdSeries.findIndex(v => v != null);
+  if (firstValid === -1) return { bullish: false, bearish: false };
+  // calcEMASeries очаква масив от числа без null-ове - подаваме само валидната
+  // опашка на MACD линията (от firstValid нататък), после подравняваме обратно
+  // с leading null-ове, за да пазим същите индекси като macdSeries.
+  const macdValid = macdSeries.slice(firstValid);
+  const signalValid = calcEMASeries(macdValid, signalLen);
+  const signalSeries = new Array(firstValid).fill(null).concat(signalValid);
+  const m0 = macdSeries[n - 1], m1 = macdSeries[n - 2];
+  const s0 = signalSeries[n - 1], s1 = signalSeries[n - 2];
+  if (m0 == null || m1 == null || s0 == null || s1 == null) return { bullish: false, bearish: false };
+  return { bullish: m1 <= s1 && m0 > s0, bearish: m1 >= s1 && m0 < s0 };
+}
+
+// LONG_SCORE (Секция A "IMPULSE HUNTER") - 9 точки, подбрани от предложението
+// с приоритет на вече съществуващи, тествани детектори (WARMING/EARLY BUILD-UP/
+// BUILD-UP CONFIRMED/PRE-IMPULSE/4H CLUSTER вече покриват COMPRESSION/CASCADE
+// имплицитно - COMPRESSION е вграден гейт в calcWarmingTier, 4H CLUSTER UP е
+// calc4HBigVolume). Новите данни (OI, funding, wall bias, MACD, ликвидационни
+// каскади) добавят 4 допълнителни точки. Скàлата на изхода следва предложението
+// (0-2=NEUTRAL, 3=WATCH, 4=SETUP, 5+=STRONG) - абсолютните прагове не са
+// преизчислени за новия максимум от 9 (вместо 7), умишлено: по-лесно
+// достигане на STRONG с допълнителните фактори е приемливо, не грешка.
+function calcCycleLongScore({ warmDirectionUp, earlyLong, buildUpConfirmLong, preImpulseLong, bigVol4hUp, oiCross, fundingOK, wallBiasLong, macdBullishCross, liquidationCascadeBullish }) {
+  let score = 0;
+  if (warmDirectionUp) score++;
+  if (earlyLong) score++;
+  if (buildUpConfirmLong) score++;
+  if (preImpulseLong) score++;
+  if (bigVol4hUp) score++;
+  if (oiCross === 'long_continuation') score++;
+  if (fundingOK && wallBiasLong) score++;
+  if (macdBullishCross) score++;
+  if (liquidationCascadeBullish) score++;
+  return score;
+}
+// SHORT_SCORE (Секция B "EXHAUSTION/TOP HUNTER") - оценява се САМО когато
+// isTopWatch() вече е true (виж checkMarketSignals/scanSymbolSignals по-долу) -
+// огледално на предложението, където SHORT CONFIRMATION идва СЛЕД TOP WATCH.
+// 9 точки (7 от предложението + MACD bearish crossunder + ликвидационна каскада,
+// огледално на LONG_SCORE).
+function calcCycleShortScore({ deathCross, dmaBear, oiReversal, bearishStructureActive, sellWallDominant, longOverloaded, structuralShortConfirm, macdBearishCross, liquidationCascadeBearish }) {
+  let score = 0;
+  if (deathCross) score++;
+  if (dmaBear) score++;
+  if (oiReversal) score++;
+  if (bearishStructureActive) score++;
+  if (sellWallDominant) score++;
+  if (longOverloaded) score++;
+  if (structuralShortConfirm) score++;
+  if (macdBearishCross) score++;
+  if (liquidationCascadeBearish) score++;
+  return score;
+}
+
+// Секция G - крайният изход на картата (11 фази вместо просто LONG/SHORT/
+// NEUTRAL). Изчислява се НАНОВО всеки тик от текущите резултати (не строга
+// последователност от предишната фаза) - по-устойчиво от строг state machine,
+// който може да "заседне"; секция D диаграмата се получава естествено, защото
+// прагът на всяка следваща фаза е по-строг от предишната.
+const PHASE_LABELS = {
+  WARMING: '🟡 WARMING',
+  LONG_WATCH: '🟢 LONG WATCH',
+  LONG_SETUP: '🟢 LONG SETUP',
+  STRONG_LONG: '🚀 STRONG LONG',
+  OVERHEATED_NO_CHASE: '🔥 OVERHEATED — NO CHASE',
+  TOP_WATCH: '👀 TOP WATCH',
+  SHORT_WATCH: '🔴 SHORT WATCH',
+  SHORT_SETUP: '🔴 SHORT SETUP',
+  STRONG_SHORT: '💥 STRONG SHORT',
+  BREAKDOWN: '💥 BREAKDOWN',
+  NEUTRAL: '⚪ NEUTRAL / NO TRADE',
+};
+function computeCyclePhase({ longScore, shortScore, overheated, topWatch, warmTierActive, breakdownConfirmed }) {
+  if (topWatch && shortScore >= 5 && breakdownConfirmed) return 'BREAKDOWN';
+  if (topWatch && shortScore >= 5) return 'STRONG_SHORT';
+  if (topWatch && shortScore >= 4) return 'SHORT_SETUP';
+  if (topWatch && shortScore >= 3) return 'SHORT_WATCH';
+  if (topWatch) return 'TOP_WATCH';
+  if (overheated) return 'OVERHEATED_NO_CHASE';
+  if (longScore >= 5) return 'STRONG_LONG';
+  if (longScore >= 4) return 'LONG_SETUP';
+  if (longScore >= 3) return 'LONG_WATCH';
+  if (warmTierActive) return 'WARMING';
+  return 'NEUTRAL';
+}
+
+// Известие само при РЕАЛНА смяна на фазата (не при всеки тик, докато е в
+// същата фаза - иначе спам). ВАЖНО - НЯМА допълнителен времеви cooldown тук:
+// първи опит с плосък 60-мин cooldown погрешно блокираше и ЛЕГИТИМНА бърза
+// прогресия през фазите (напр. WARMING→LONG_WATCH→LONG_SETUP→STRONG_LONG за
+// 15-20 мин при истински бърз импулс - точно сценарият, който "IMPULSE HUNTER"
+// цели да хване рано), не само нежелано флип-флопване. Всеки от 9-те входни
+// фактора вече си има собствен cooldown/хистерезис по-горе (WARMING/EARLY
+// BUILD-UP/и т.н.), затова резкия tick-to-tick "флип-флоп" на самата ФАЗА е
+// естествено рядък - не е нужен допълнителен таймер тук.
+function cyclePhaseCanFire(state, newPhase) {
+  return state.cycle?.phase !== newPhase;
+}
+function markCyclePhase(state, newPhase) {
+  state.cycle = { phase: newPhase, at: Date.now() };
+}
+
+// SPARK - огледално на cyclePhaseCanFire/markCyclePhase по-горе. key е
+// `${direction}:${tier}` (напр. "long:strongSpark"), или 'none' когато
+// score<3 или монетата е extended (виж calcPriceExtension) - firing само на
+// ГЕНУИННА промяна към нов активен SPARK сигнал, никога при изчистване.
+function sparkCanFire(state, key) {
+  return key !== 'none' && state.spark?.key !== key;
+}
+function markSparkFired(state, key) {
+  state.spark = { key, at: Date.now() };
+}
+
+// FLOW WARMING - огледално на sparkCanFire/markSparkFired по-горе, собствен
+// KV state ключ (state.flowWarming, не state.spark) - собствено, независимо
+// известие, огледално на SPARK/🔮 ЦИКЪЛ.
+function flowWarmingCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.flowWarming, key, direction);
+}
+function markFlowWarmingFired(state, key, direction) {
+  state.flowWarming = { key, direction, at: Date.now() };
+}
+
+// TRAP - огледално на flowWarmingCanFire/markFlowWarmingFired по-горе,
+// собствен KV state ключ (state.trap).
+function trapCanFire(state, key, direction) {
+  return canFireWithHysteresis(state.trap, key, direction);
+}
+function markTrapFired(state, key, direction) {
+  state.trap = { key, direction, at: Date.now() };
+}
+
+// WhatsApp/Android понякога разпознава "$" залепено директно за низ от цифри
+// като телефонен/тракинг номер и чупи и визуализацията, и copy-paste (изяжда
+// водещи символи - напр. "$65061.30" стана "5061.30", "$0.3520" стана
+// ".3520" в реални тествани известия). toLocaleString слага разделител по
+// хиляди, който чупи непрекъснатата поредица от цифри; "$" вече не е залепен
+// директно за числото в известията (виж checkMarketSignals/checkDcaLevels).
+function formatPrice(p) {
+  if (p == null) return null;
+  const decimals = p >= 100 ? 2 : p >= 1 ? 4 : 6;
+  return p.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
+// TP % стълба, извлечена от външен VIP сигнален канал (Cornix формат): техните
+// Target 1/3/4/5/7 се мапват към нашите TP1-TP5 (по изрично желание - нямаме
+// втори вход/stop loss тук, защото вече имаме собствена DCA стратегия за това).
+// Процентите са осреднени от два реални техни сигнала (ETH и MNT), които се
+// оказаха с почти идентична %-дистанция от входа въпреки различната монета -
+// значи каналът използва фиксирана относителна стълба, не абсолютни нива.
+const TP_PCTS = [1.26, 2.34, 3.58, 4.52, 8.23];
+
+function calcTakeProfitLevels(price, direction) {
+  return TP_PCTS.map(pct => direction === 'long' ? price * (1 + pct / 100) : price * (1 - pct / 100));
+}
+
+// Колко пъти по-голям трябва да е точковият резултат на мнозинството спрямо
+// малцинството, за да покажем посока+TP с увереност вместо предупреждение за
+// смесени сигнали. 4 означава напр. 4:1 или 8:2 минава, 3:2 или 2:1 - не
+// (само в известието се показва %-но разпределение). Прагът остава 4, но
+// вече сравнява ТЕГЛОВНИ точки (виж SIGNAL_WEIGHTS/SIGNAL_FAMILY_MAX по-долу),
+// не суров брой сигнали - иначе 1 слаб EARLY BUILD-UP (0.5т) срещу 1 силен
+// CONFIRMED (2.0т) щеше да се брои 1:1 наравно, макар CONFIRMED да е 4х
+// по-силно доказателство.
+const DIRECTION_CONFIDENCE_RATIO = 4;
+// Всеки сигнал носи собствена тежест вместо да брои за "1" - по-слаб/ранен
+// сигнал (EARLY BUILD-UP/WARMING) тежи по-малко от структурно потвърждение
+// (CONFIRMED/PRE-IMPULSE). Числата са по подадената спецификация; не пипай
+// без нови натрупани реални резултати.
+const SIGNAL_WEIGHTS = {
+  flush: 1.25, blowoff: 1.25, base: 1.25, distribution: 1.25,
+  squeeze: 1.00, dumpSqueeze: 1.00,
+  shift: 1.25, shiftDown: 1.25,
+  impulse: 1.75, impulseAtr: 2.00,
+  earlyBuildUp: 0.50, buildUpConfirmed: 2.00, preImpulse: 2.50,
+  warming: 0.50, hot: 1.00, super: 1.50, superDown: 1.50,
+  mm: 1.50, mmX25: 1.75, mmOscBest: 1.50, mmOscRe: 1.25,
+  confirmed: 2.00,
+};
+// Колко минути даден сигнал остава "активен" в ACTIVE SIGNAL MEMORY (виж
+// updateActiveSignals/getActiveSignals по-долу) - LIVE детектори по-кратко
+// (60 мин), структурни/по-бавни таймфреймове по-дълго (90 мин на 1ч/15м база,
+// 240 мин = 4ч за BUILD-UP CONFIRMED/PRE-IMPULSE, които стъпват на 4ч свещи).
+const SIGNAL_MEMORY_MINUTES = {
+  warming: 60, hot: 60, super: 60, superDown: 60,
+  mm: 60, mmX25: 60, mmOscBest: 60, mmOscRe: 60,
+  impulse: 60, impulseAtr: 60,
+  shift: 90, shiftDown: 90, confirmed: 90,
+  earlyBuildUp: 90,
+  buildUpConfirmed: 240, preImpulse: 240,
+  flush: 90, blowoff: 90, base: 90, distribution: 90,
+  squeeze: 60, dumpSqueeze: 60,
+};
+// Корелирани семейства - няколко детектора от едно и също семейство често
+// реагират на СЪЩОТО реално движение (volume/ATR/EMA/candle body/breakout),
+// затова не се сумират безкрайно, а се ограничават с таван на семейство: една
+// силна зелена свещ, която пали и SUPER, и MM, и MM x25 едновременно, не е 3
+// напълно независими доказателства, а 1 силно движение, видяно през 3 лещи.
+// EARLY BUILD-UP умишлено няма семейство (family: null по-долу) - той е
+// единственият тригер на отделната, защитена Build-Up верига (не пипана в
+// тази промяна) и не ползва общите volume/ATR данни на Family A.
+const SIGNAL_FAMILY_MAX = {
+  volumeMomentum: 1.50, // WARMING/HOT/SUPER/SUPER DOWN/SQUEEZE/DUMP SQUEEZE
+  mmEngine: 2.00,        // MM/MM x25/MM-OSC BEST/MM-OSC RE-ENTRY
+  impulseFamily: 2.00,   // IMPULSE/IMPULSE+ATR
+  structure: 3.00,       // SHIFT/BUILD-UP CONFIRMED/CONFIRMED/PRE-IMPULSE
+  extreme: 2.00,         // FLUSH/BASE/BLOWOFF/DISTRIBUTION
+};
+// Сумира теглата на всички newFired сигнали в дадена посока, ограничавайки
+// всяко семейство до неговия таван, преди да ги събере - сигнали БЕЗ family
+// (EARLY BUILD-UP) се броят изцяло, без таван.
+function computeFamilyCappedScore(signals, direction) {
+  const byFamily = {};
+  let uncapped = 0;
+  for (const sig of signals) {
+    if (sig.direction !== direction) continue;
+    if (sig.family) byFamily[sig.family] = (byFamily[sig.family] || 0) + sig.weight;
+    else uncapped += sig.weight;
+  }
+  let total = uncapped;
+  for (const family in byFamily) total += Math.min(byFamily[family], SIGNAL_FAMILY_MAX[family]);
+  return total;
+}
+
+// ACTIVE SIGNAL MEMORY - преди тази промяна longScore/shortScore се смятаха
+// само от newFired (тик по тик), затова последователно развиващо се движение
+// (WARMING @13:00 -> MM @13:05 -> CONFIRMED @13:15) никога не се комбинираше
+// в общ резултат - всеки сигнал сам пали cooldown-а си и излиза от newFired
+// на следващите тикове, преди да успее да се "срещне" с останалите. Сега
+// всеки нов сигнал се пази в state.activeSignals (keyed по label, за dedup -
+// повторен fire на СЪЩИЯ label просто обновява timestamp/expiresAt, не се
+// трупа многократно), с изтичане според типа му (SIGNAL_MEMORY_MINUTES).
+// longScore/shortScore се смятат от ВСИЧКИ още неизтекли активни сигнали (нови
+// + запомнени), но family caps продължават да важат непроменени - паметта не
+// заобикаля SIGNAL_FAMILY_MAX. Разни посоки (LONG memory + нов SHORT сигнал)
+// НЕ се трият автоматично една друга - и двете участват в computeDirectionConfidence,
+// за да могат да покажат СМЕСЕНИ СИГНАЛИ коректно.
+function updateActiveSignals(state, newFired) {
+  if (!state.activeSignals) state.activeSignals = {};
+  const now = Date.now();
+  for (const sig of newFired) {
+    const minutes = SIGNAL_MEMORY_MINUTES[sig.type] ?? SIGNAL_REPEAT_COOLDOWN_MIN;
+    state.activeSignals[sig.label] = {
+      label: sig.label, direction: sig.direction, weight: sig.weight, family: sig.family,
+      at: now, expiresAt: now + minutes * 60000,
+    };
+  }
+}
+// Връща масив от още неизтеклите активни сигнали (за computeFamilyCappedScore)
+// и същевременно чисти изтеклите записи от state (не растат безкрайно в KV).
+function getActiveSignals(state) {
+  if (!state.activeSignals) return [];
+  const now = Date.now();
+  const active = [];
+  for (const label in state.activeSignals) {
+    const s = state.activeSignals[label];
+    if (s.expiresAt > now) active.push(s);
+    else delete state.activeSignals[label];
+  }
+  return active;
+}
+// Заменя старото MIN_TP_CONFIRMATION_HITS (брой сигнали) - сега сравнява
+// точковия резултат на мнозинството, не суров брой сигнали (виж SIGNAL_WEIGHTS/
+// SIGNAL_FAMILY_MAX по-горе). При праг 3.0 НИТО ЕДИН единичен сигнал - дори
+// най-силният, PRE-IMPULSE (2.50) - не може сам да отключи TP; винаги трябва
+// комбинация от поне два (нов + активен от паметта), чиято обща family-capped
+// сума достига 3.0 (напр. CONFIRMED 2.00 + HOT 1.00, или PRE-IMPULSE 2.50 +
+// EARLY BUILD-UP 0.50). Все пак прагът е СЪЩЕСТВЕНО по-нисък от старата система,
+// където всеки отделен сигнал (слаб или силен) се брояха еднакво като "1 сигнал"
+// и трябваше да се съберат МНОГО повече на брой, за да минат.
+const MIN_TP_SCORE = 3.0;
+// Отделен, по-нисък праг само за ДАЛИ изобщо да пратим WhatsApp известие -
+// самотен слаб/ранен сигнал (WARMING/EARLY BUILD-UP 0.5т, MM 1.5т, MM x25
+// 1.75т) вече не праща цяло известие (с цена/съпротива/подкрепа/Long-Short)
+// сам по себе си - реален случай, докладван от потребителя: ~100 известия
+// от 10ч насам, повечето под този праг, чист шум. WARMING/EARLY BUILD-UP си
+// остават "рано предупреждение" - продължават да се смятат/пазят в KV
+// cooldown-а нормално, само НЕ пращат известие, докато не се съберат с още
+// нещо (или сами по себе си не достигнат по-силен сигнал като CONFIRMED/
+// PRE-IMPULSE, 2.0-2.5т). Различен от MIN_TP_SCORE (3.0), който само решава
+// дали TP1-5 се показват В известие, което вече се праща.
+const MIN_NOTIFY_SCORE = 2.5;
+
+function computeDirectionConfidence(longScore, shortScore) {
+  const total = longScore + shortScore;
+  const longPct = total ? Math.round((longScore / total) * 100) : 0;
+  const shortPct = total ? 100 - longPct : 0;
+  const majority = Math.max(longScore, shortScore);
+  const minority = Math.min(longScore, shortScore);
+  const ratioOK = total > 0 && (minority === 0 || majority >= minority * DIRECTION_CONFIDENCE_RATIO);
+  const enoughScore = majority >= MIN_TP_SCORE;
+  const confident = ratioOK && enoughScore;
+  const direction = longScore === shortScore ? null : (longScore > shortScore ? 'long' : 'short');
+  return { direction, confident, longPct, shortPct, longScore, shortScore, total, majority, ratioOK, enoughScore };
+}
+
+async function loadSymbolState(env, symbol) {
+  if (!env.ALERT_STATE) return {};
+  const raw = await env.ALERT_STATE.get(`sigstate:${symbol}`);
+  return raw ? JSON.parse(raw) : {};
+}
+async function saveSymbolState(env, symbol, state) {
+  if (!env.ALERT_STATE) return;
+  await env.ALERT_STATE.put(`sigstate:${symbol}`, JSON.stringify(state));
+}
+
+// Сканира един символ, обновява/пази неговото cooldown+ACTIVE SIGNAL MEMORY
+// състояние в KV, и връща { newFired, activeFired, ... } - newFired са
+// етикетите на ГЕНУИННО новите събития този тик (нова затворена свещ за
+// структурните тагове, ново появяване/реокуряне за LIVE тагове - виж
+// tagCanFire/isNewLiveEvent по-горе; празен масив = "нищо ново тази
+// обиколка"); activeFired са ВСИЧКИ още неизтекли активни сигнали (текущо
+// верни ОТ ТОЗИ тик, нови И продължаващи, + запомнени от предишни тикове),
+// от които реално се смятат longScore/shortScore.
+async function scanSymbolSignals(env, symbol) {
+  const [k15, k5, k1h, k4h, k1d] = await Promise.all([
+    // т.8 от анализа - увеличена история (от 60/40/60/210/20) за по-стабилно
+    // Wilder RSI/ATR "warm-up" (Wilder RMA носи затихваща памет от ЦЯЛАТА
+    // подадена история, не само последния period+1 прозорец - колкото повече
+    // свещи назад, толкова по-близо до TradingView стойността за същия момент)
+    // и по-стабилни EMA20/EMA50/EMA200. Самите Wilder формули (calcRSI/calcATR)
+    // НЕ са пипнати тук - само броят подадени свещи.
+    fetchKlinesWorker(env, symbol, '15m', 200),
+    fetchKlinesWorker(env, symbol, '5m', 200),
+    fetchKlinesWorker(env, symbol, '1h', 250),
+    fetchKlinesWorker(env, symbol, '4h', 500), // нужни за EMA200 филтъра на Build-Up Detector-а
+    fetchKlinesWorker(env, symbol, '1d', 200),
+  ]);
+  const c15 = klinesToCandles(k15), c5 = klinesToCandles(k5), c1h = klinesToCandles(k1h);
+  const c4h = klinesToCandles(k4h), c1d = klinesToCandles(k1d);
+  // CONFIRMED/структурни детектори (SHIFT/SHIFT▼/IMPULSE/IMPULSE+ATR/CONFIRMED/
+  // BUILD-UP CONFIRMED/PRE-IMPULSE) трябва да гледат само последната ЗАТВОРЕНА
+  // свещ, за да не се появяват/изчезват насред текущата незатворена свещ.
+  // EARLY/LIVE детекторите (EARLY BUILD-UP, WARMING/HOT/SUPER, MM/MM x25/MM-OSC)
+  // остават на живите candles (c1h/c5/c15) - целта им е ранно предупреждение.
+  const c15Closed = c15.slice(0, -1);
+  const c5Closed = c5.slice(0, -1);
+  const c1hClosed = c1h.slice(0, -1);
+  const c4hClosed = c4h.slice(0, -1);
+  const c1dClosed = c1d.slice(0, -1); // за PHASE CYCLE ENGINE (Death Cross/50 DMA/chg7d) по-долу
+
+  const rsi4h = c4h.length ? calcRSI(c4h.map(x=>x.close), 14) : null;
+  const rsi1d = c1d.length ? calcRSI(c1d.map(x=>x.close), 14) : null;
+  const htfExtreme = rsi4h!=null && rsi1d!=null && rsi4h<35 && rsi1d<35;
+  const htfOverbought = rsi4h!=null && rsi1d!=null && rsi4h>65 && rsi1d>65;
+
+  const flush = calcFlushSignal(c15, htfExtreme);
+  const blowoff = calcBlowoffSignal(c15, htfOverbought);
+  const base = calcBaseSignal(c1h, htfExtreme);
+  const distribution = calcDistributionSignal(c1h, htfOverbought);
+  const squeeze = calcSqueezeSignal(c5);
+  const dumpSqueeze = calcDumpSqueezeSignal(c5);
+  const shift = calcShiftSignal(c1hClosed);
+  const shiftDown = calcShiftDownSignal(c1hClosed);
+  const impulse = calcImpulseSignal(c1hClosed, flush);
+  // openTime на съответната затворена свещ за всеки CONFIRMED/структурен таг -
+  // ползва се от tagCanFire/markTagFired за "1 сигнал на затворена свещ" (виж
+  // бележката там). LIVE таговете по-долу не пращат candleTime.
+  const shiftCandleTime = c1hClosed.length ? c1hClosed[c1hClosed.length - 1].openTime : null;
+  const confirmedCandleTime = c15Closed.length ? c15Closed[c15Closed.length - 1].openTime : null;
+  const impulseAtrCandleTime = c5Closed.length ? c5Closed[c5Closed.length - 1].openTime : null;
+  const buildUpCandleTime = c4hClosed.length ? c4hClosed[c4hClosed.length - 1].openTime : null;
+
+  const state = await loadSymbolState(env, symbol);
+
+  const early = calcBuildUpEarly(c1h);
+  // т.9 - early.long и early.short теоретично могат да са ВЕДНЪЖ и двете true
+  // (независими условия), при което старото `dir: early.long ? 1 : -1` тихо
+  // предпочиташе LONG без основание. Сега арминг на Build-Up прозореца става
+  // само при ЕДНОЗНАЧНА посока (long !== short) - EARLY BUILD-UP сигналите
+  // по-долу (fired.push) продължават да излизат и в двете посоки нормално,
+  // само самият прозорец не се арм-ва в двусмисления случай.
+  if ((early.long !== early.short) && buildUpCanArm(state)) {
+    state.buildUpWindow = { until: Date.now() + BUILDUP_MAX_HOURS * 3600000, dir: early.long ? 1 : -1 };
+    markBuildUpArmed(state);
+  }
+  const buildUpWindow = state.buildUpWindow;
+  const withinBuildUpWindow = !!buildUpWindow && Date.now() < buildUpWindow.until;
+  const trend4h = calc4hTwoBarTrend(c4hClosed);
+  const emaFilter = calcEmaTrendFilter(c4hClosed);
+  const buildUpConfirmLong = withinBuildUpWindow && buildUpWindow.dir === 1 && trend4h.bull && emaFilter.bull;
+  const buildUpConfirmShort = withinBuildUpWindow && buildUpWindow.dir === -1 && trend4h.bear && emaFilter.bear;
+  if (buildUpConfirmLong || buildUpConfirmShort) state.buildUpWindow = null;
+  const buildUpAtrExpanding = calcATRExpansion(c4hClosed);
+  const preImpulseLong = buildUpConfirmLong && buildUpAtrExpanding;
+  const preImpulseShort = buildUpConfirmShort && buildUpAtrExpanding;
+
+  const bigVol4h = calc4HBigVolume(c4h);
+  if (bigVol4h.active) {
+    const dirVal = bigVol4h.direction === 'up' ? 1 : -1;
+    state.warmingBoost = { until: Date.now() + WARMING_BOOST_HOURS*3600000, dir: dirVal };
+  }
+  const boost = state.warmingBoost;
+  const boostActive = !!boost && Date.now() < boost.until;
+  // Directional Warming Boost (PRIORITY 2 от финалния анализ) - boostActive
+  // сам по себе си не казва НИЩО за посоката на текущото движение, само че
+  // ИМА активен 4H BIG VOLUME boost в НЯКАКВА посока (boost.dir). Старият код
+  // прилагаше easeFactor безусловно щом boostActive е true, независимо дали
+  // boost.dir съвпада с посоката на свещта, която calcWarmingTier/superDownDump
+  // всъщност оценяват в момента - 4H BIG VOLUME UP можеше да улесни прага и за
+  // WARMING/SUPER DOWN движение, което е нелогично (up обем не би трябвало да
+  // прави down движенията по-лесни за отключване). Директната посока на
+  // ТЕКУЩАТА последна 1ч свещ се смята тук по същата формула като вътре в
+  // calcWarmingTier (last.close > last.open), за да може easeFactor да се
+  // прецени ПРЕДИ извикването - warmingPreviewDirection винаги съвпада с
+  // warming.direction по-долу, защото е точно същото сравнение върху същата
+  // свещ.
+  const warmingLastCandle = c1h.length ? c1h[c1h.length - 1] : null;
+  const warmingPreviewDirection = warmingLastCandle
+    ? (warmingLastCandle.close > warmingLastCandle.open ? 'up' : warmingLastCandle.close < warmingLastCandle.open ? 'down' : 'flat')
+    : 'flat';
+  const boostMatchesDirection = boostActive && (
+    (boost.dir === 1 && warmingPreviewDirection === 'up') ||
+    (boost.dir === -1 && warmingPreviewDirection === 'down')
+  );
+  const easeFactor = boostMatchesDirection ? (1 - WARMING_BOOST_PCT) : 1;
+  const dumpCascade = calcDumpCascade(c15);
+  const warming = calcWarmingTier(c1h, { easeFactor });
+  const warmPrice = c1h.length ? c1h[c1h.length - 1].close : null;
+  // SUPER DOWN (DUMP) приоритет (т.10) - проверяваме ПЪРВО, с ОТДЕЛЕН cooldown
+  // ключ ('superDown', не 'super'). Старият ред проверяваше/палеше нормалния
+  // SUPER тир ПЪРВИ, който маркираше cooldown ключ 'super' с dir='down' В
+  // СЪЩИЯ тик, преди superDownDump въобще да е бил проверен - warmingTierAllowed
+  // за 'super'/'down' веднага виждаше s.dir === direction и връщаше false, така
+  // че DUMP вариантът структурно никога не можеше да гръмне заедно с нормален
+  // SUPER▼ на едно и също движение (споделен cooldown ключ = race). Сега DUMP
+  // се проверява първо на собствен ключ, и ако гръмне, потиска нормалния
+  // SUPER за СЪЩОТО движение (super+down) - не и HOT/WARM, които остават
+  // независими и могат да гърмят паралелно с DUMP нормално.
+  const compressOK = warming.atrPct != null && warming.atrPct <= 0.75;
+  const superDownDump = dumpCascade.active && warming.direction === 'down' && compressOK
+    && warming.volX != null && warming.volX >= (3.0 * easeFactor * WARMING_DUMP_EASE)
+    && warmingTierAllowed(state, 'superDown', 'down', warmPrice);
+  if (superDownDump) markWarmingFired(state, 'superDown', 'down', warmPrice);
+
+  let warmTier = 'none';
+  const superSuppressedByDump = superDownDump && warming.tier === 'super' && warming.direction === 'down';
+  if (warming.tier !== 'none' && !superSuppressedByDump && warmingTierAllowed(state, warming.tier, warming.direction, warmPrice)) {
+    warmTier = warming.tier;
+    markWarmingFired(state, warming.tier, warming.direction, warmPrice);
+  }
+
+  const ctx15 = calcWarmingContext(c15);
+  if (ctx15.warming) state.mmArm = { until: Date.now() + MM_ARM_MINUTES * 60000 };
+  const armed = !!state.mmArm && Date.now() < state.mmArm.until;
+  const entry5 = calcEntryImpulse(c5);
+  const x25 = calcMMx25Entry(c5);
+  const mmPrice = c5.length ? c5[c5.length - 1].close : null;
+  let mmLong = false, mmShort = false, mmX25Long = false, mmX25Short = false;
+  if (armed && ctx15.biasLong && entry5.impulseUp && mmCanFire(state, 'mm', 1, MM_COOLDOWN_MIN, mmPrice)) { mmLong = true; markMMFired(state, 'mm', 1, mmPrice); }
+  if (armed && ctx15.biasShort && entry5.impulseDn && mmCanFire(state, 'mm', -1, MM_COOLDOWN_MIN, mmPrice)) { mmShort = true; markMMFired(state, 'mm', -1, mmPrice); }
+  if (armed && ctx15.biasLong && x25.long && mmCanFire(state, 'x25', 1, MM_X25_COOLDOWN_MIN, mmPrice)) { mmX25Long = true; markMMFired(state, 'x25', 1, mmPrice); }
+  if (armed && ctx15.biasShort && x25.short && mmCanFire(state, 'x25', -1, MM_X25_COOLDOWN_MIN, mmPrice)) { mmX25Short = true; markMMFired(state, 'x25', -1, mmPrice); }
+
+  const oscEntry = calcMMOscEntry(c5);
+  const oscS = state.mmOsc || {};
+  const oscInWindow = !!oscS.windowUntil && Date.now() < oscS.windowUntil;
+  if (oscInWindow && oscS.dir === 1 && calcMMOscPullbackZone(oscEntry.osc, 1)) oscS.sawPullback = true;
+  if (oscInWindow && oscS.dir === -1 && calcMMOscPullbackZone(oscEntry.osc, -1)) oscS.sawPullback = true;
+  const oscRawLong = oscEntry.long && mmOscCanFire(state, 'long');
+  const oscRawShort = oscEntry.short && mmOscCanFire(state, 'short');
+  const oscReLong = oscRawLong && oscInWindow && oscS.dir === 1 && oscS.sawPullback;
+  const oscReShort = oscRawShort && oscInWindow && oscS.dir === -1 && oscS.sawPullback;
+  const oscBestLong = oscRawLong && !oscReLong;
+  const oscBestShort = oscRawShort && !oscReShort;
+  if (oscRawLong) { markMMOscFired(state, 'long'); oscS.dir = 1; oscS.windowUntil = Date.now() + MMOSC_REWINDOW_MIN * 60000; oscS.sawPullback = false; }
+  if (oscRawShort) { markMMOscFired(state, 'short'); oscS.dir = -1; oscS.windowUntil = Date.now() + MMOSC_REWINDOW_MIN * 60000; oscS.sawPullback = false; }
+  state.mmOsc = oscS;
+
+  const impulseAtr = calcImpulseAtrSignal(c5Closed);
+  const confirmed = calcConfirmedSignal(c15Closed, c1hClosed);
+
+  // fired е масив от {label, direction, weight, family, candleTime, type} обекти -
+  // direction/weight/family тук са ИЗТОЧНИКЪТ на истината за приноса на всеки
+  // сигнал в LONG/SHORT точковия резултат (не се извежда чрез повторно
+  // парсене на текста на label по-долу); type сочи към SIGNAL_MEMORY_MINUTES
+  // (виж ACTIVE SIGNAL MEMORY по-горе). longScore/shortScore НЕ се смятат
+  // тук - смятат се по-долу, от activeSignals (текущо-верни ОТ ТОЗИ тик +
+  // още неизтекли стари сигнали от паметта), след като fired се раздели на
+  // CLOSED (tagCanFire) и LIVE (isNewLiveEvent) - виж бележките там.
+  const fired = [];
+  if (flush) fired.push({ label: '💥 FLUSH', direction: 'long', weight: SIGNAL_WEIGHTS.flush, family: 'extreme', type: 'flush' });
+  if (blowoff) fired.push({ label: '🔥 BLOWOFF', direction: 'short', weight: SIGNAL_WEIGHTS.blowoff, family: 'extreme', type: 'blowoff' });
+  if (base) fired.push({ label: '🔵 BASE', direction: 'long', weight: SIGNAL_WEIGHTS.base, family: 'extreme', type: 'base' });
+  if (distribution) fired.push({ label: '🟠 DISTRIBUTION', direction: 'short', weight: SIGNAL_WEIGHTS.distribution, family: 'extreme', type: 'distribution' });
+  if (squeeze) fired.push({ label: '🟣 SQUEEZE', direction: 'long', weight: SIGNAL_WEIGHTS.squeeze, family: 'volumeMomentum', type: 'squeeze' });
+  if (dumpSqueeze) fired.push({ label: '🟣 DUMP SQUEEZE', direction: 'short', weight: SIGNAL_WEIGHTS.dumpSqueeze, family: 'volumeMomentum', type: 'dumpSqueeze' });
+  if (shift) fired.push({ label: '🟠 SHIFT', direction: 'long', weight: SIGNAL_WEIGHTS.shift, family: 'structure', candleTime: shiftCandleTime, type: 'shift' });
+  if (shiftDown) fired.push({ label: '🟠 SHIFT ▼', direction: 'short', weight: SIGNAL_WEIGHTS.shiftDown, family: 'structure', candleTime: shiftCandleTime, type: 'shiftDown' });
+  if (impulse.long) fired.push({ label: '🟢 IMPULSE LONG', direction: 'long', weight: SIGNAL_WEIGHTS.impulse, family: 'impulseFamily', candleTime: shiftCandleTime, type: 'impulse' });
+  if (impulse.short) fired.push({ label: '🔴 IMPULSE SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.impulse, family: 'impulseFamily', candleTime: shiftCandleTime, type: 'impulse' });
+  // т.9 продължение - buildUpCanArm по-горе вече пази арминга на Build-Up
+  // прозореца от двусмисления случай early.long===early.short===true, но
+  // самите EARLY BUILD-UP▲/▼ сигнали по-долу бяха независими if-ове и
+  // продължаваха да могат да гръмнат ЕДНОВРЕМЕННО в такъв случай - реално
+  // наблюдавано в известие за INJ (choppy/свиващ се пазар), добавяйки 0.50т
+  // едновременно в LONG и SHORT без реално основание (двете "ранни
+  // предупреждения" са взаимно противоречиви, не независими доказателства).
+  // Сега EARLY BUILD-UP гърми само при еднозначна посока, като арминга.
+  const earlyUnambiguous = early.long !== early.short;
+  if (earlyUnambiguous && early.long) fired.push({ label: '🟡 EARLY BUILD-UP ▲', direction: 'long', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null, type: 'earlyBuildUp' });
+  if (earlyUnambiguous && early.short) fired.push({ label: '🟡 EARLY BUILD-UP ▼', direction: 'short', weight: SIGNAL_WEIGHTS.earlyBuildUp, family: null, type: 'earlyBuildUp' });
+  if (buildUpConfirmLong) fired.push({ label: '🟢 BUILD-UP CONFIRMED ▲', direction: 'long', weight: SIGNAL_WEIGHTS.buildUpConfirmed, family: 'structure', candleTime: buildUpCandleTime, type: 'buildUpConfirmed' });
+  if (buildUpConfirmShort) fired.push({ label: '🔴 BUILD-UP CONFIRMED ▼', direction: 'short', weight: SIGNAL_WEIGHTS.buildUpConfirmed, family: 'structure', candleTime: buildUpCandleTime, type: 'buildUpConfirmed' });
+  if (preImpulseLong) fired.push({ label: '🚀 PRE-IMPULSE ▲', direction: 'long', weight: SIGNAL_WEIGHTS.preImpulse, family: 'structure', candleTime: buildUpCandleTime, type: 'preImpulse' });
+  if (preImpulseShort) fired.push({ label: '💥 PRE-IMPULSE ▼', direction: 'short', weight: SIGNAL_WEIGHTS.preImpulse, family: 'structure', candleTime: buildUpCandleTime, type: 'preImpulse' });
+  if (warmTier === 'warm') fired.push({ label: `🔵 WARMING ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.warming, family: 'volumeMomentum', type: 'warming' });
+  if (warmTier === 'hot') fired.push({ label: `🟠 HOT ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.hot, family: 'volumeMomentum', type: 'hot' });
+  if (warmTier === 'super') fired.push({ label: `${warming.direction === 'up' ? '🟢' : '🔴'} SUPER ${warming.direction === 'up' ? '▲' : '▼'}`, direction: warming.direction === 'up' ? 'long' : 'short', weight: SIGNAL_WEIGHTS.super, family: 'volumeMomentum', type: 'super' });
+  if (superDownDump) fired.push({ label: '🚨 SUPER DOWN (DUMP)', direction: 'short', weight: SIGNAL_WEIGHTS.superDown, family: 'volumeMomentum', type: 'superDown' });
+  if (mmLong) fired.push({ label: '🟢 MM LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mm, family: 'mmEngine', type: 'mm' });
+  if (mmShort) fired.push({ label: '🔴 MM SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mm, family: 'mmEngine', type: 'mm' });
+  if (mmX25Long) fired.push({ label: '💎 MM x25 LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine', type: 'mmX25' });
+  if (mmX25Short) fired.push({ label: '💀 MM x25 SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine', type: 'mmX25' });
+  if (oscBestLong) fired.push({ label: '🟢▲ MM-OSC BEST LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmOscBest, family: 'mmEngine', type: 'mmOscBest' });
+  if (oscBestShort) fired.push({ label: '🔴▼ MM-OSC BEST SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmOscBest, family: 'mmEngine', type: 'mmOscBest' });
+  if (oscReLong) fired.push({ label: '🟢△ MM-OSC RE-LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmOscRe, family: 'mmEngine', type: 'mmOscRe' });
+  if (oscReShort) fired.push({ label: '🔴▽ MM-OSC RE-SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmOscRe, family: 'mmEngine', type: 'mmOscRe' });
+  if (impulseAtr.long) fired.push({ label: '⚡ IMPULSE+ATR ▲', direction: 'long', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime, type: 'impulseAtr' });
+  if (impulseAtr.short) fired.push({ label: '⚡ IMPULSE+ATR ▼', direction: 'short', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime, type: 'impulseAtr' });
+  if (confirmed.long) fired.push({ label: '✅ CONFIRMED ▲', direction: 'long', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime, type: 'confirmed' });
+  if (confirmed.short) fired.push({ label: '✅ CONFIRMED ▼', direction: 'short', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime, type: 'confirmed' });
+
+  // Разделяне CLOSED-CANDLE (candleTime != null) от LIVE (candleTime == null) -
+  // всеки тип ползва собствения си "ново ли е събитието" механизъм (виж
+  // бележките при tagCanFire и isNewLiveEvent по-горе).
+  const now = Date.now();
+  const closedFiredRaw = fired.filter(sig => sig.candleTime != null);
+  const liveFiredRaw = fired.filter(sig => sig.candleTime == null);
+
+  const newClosedFired = closedFiredRaw.filter(sig => tagCanFire(state, sig.label, sig.candleTime));
+  newClosedFired.forEach(sig => markTagFired(state, sig.label, sig.candleTime));
+
+  // ВСЕКИ текущо-верен LIVE сигнал опреснява присъствието си (markLiveSeen),
+  // независимо дали е ново или продължаващо събитие - иначе isNewLiveEvent
+  // никога няма как да "знае", че сигналът е бил непрекъснато активен.
+  const newLiveFired = liveFiredRaw.filter(sig => isNewLiveEvent(state, sig.label, now));
+  liveFiredRaw.forEach(sig => markLiveSeen(state, sig.label, now));
+
+  // newFired = само ГЕНУИННО нови събития (нова затворена свещ за структурните,
+  // ново появяване/реокуряне за LIVE) - това е единственият източник за "има
+  // ли изобщо нов сигнал" (виж checkMarketSignals), а не просто "минаха Х мин".
+  const newFired = [...newClosedFired, ...newLiveFired];
+
+  // ACTIVE SIGNAL MEMORY (виж updateActiveSignals/getActiveSignals по-горе) -
+  // longScore/shortScore се смятат от ВСИЧКИ още неизтекли активни сигнали
+  // (текущо-верни ОТ ТОЗИ тик, нови И продължаващи, + запомнени от предишни
+  // тикове), не само от newFired - за да могат последователни сигнали
+  // (WARMING -> MM -> CONFIRMED) реално да се съберат в общ резултат, и за да
+  // не изтича паметта на едно продължаващо LIVE доказателство само защото не
+  // се брои за "ново" (виж isNewLiveEvent по-горе).
+  updateActiveSignals(state, [...newClosedFired, ...liveFiredRaw]);
+  const activeSignals = getActiveSignals(state);
+  const longScore = computeFamilyCappedScore(activeSignals, 'long');
+  const shortScore = computeFamilyCappedScore(activeSignals, 'short');
+
+  const price = c5.length ? c5[c5.length - 1].close : null;
+  const { support, resistance } = calcSupportResistance(c1h, 20);
+  const confidence = computeDirectionConfidence(longScore, shortScore);
+
+  // ---- PHASE CYCLE ENGINE (виж дефинициите на константите/функциите по-горе,
+  // непосредствено след fetchFundingWorker) - реюзва вече изчислените в тази
+  // функция detektori (warmTier/warming/bigVol4h/early/buildUpConfirmLong-Short/
+  // preImpulseLong-Short/confirmed/shiftDown), само 5 нови паралелни заявки за
+  // данните, които Worker-ът не тегли никъде другаде (OI/order book/24ч/
+  // Long-Short/funding - последните две вече се теглят от checkMacroSqueeze за
+  // друга цел, тук е отделно извикване, огледално на съществуващия прецедент).
+  // НЕ променя по никакъв начин longScore/shortScore/confidence по-горе.
+  // COINGLASS LIQUIDATION DIAGNOSTICS (shadow) - стартира паралелно с
+  // Promise.all по-долу, САМО при env.LIQ_DIAG_ENABLED === '1'. Legacy
+  // liquidationOrders заявката остава непроменена.
+  const liqDiagFetchPromise = isLiqDiagEnabled(env) ? fetchLiquidationOrdersShadow(env, symbol).catch(() => null) : null;
+  const [oiHist, wallsRaw, chg24h, longShortCycle, fundingCycle, liquidationOrders, takerHist] = await Promise.all([
+    fetchOpenInterestHistWorker(env, symbol, '5m', 13),
+    fetchOrderBookWallsWorker(env, symbol, price),
+    fetch24hChangeWorker(env, symbol),
+    fetchLongShortWorker(env, symbol),
+    fetchFundingWorker(env, symbol),
+    fetchLiquidationOrdersWorker(env, symbol),
+    fetchTakerLongShortWorker(env, symbol, '5m', 13),
+  ]);
+  const oiDeltaPct = calcOiDeltaPct(oiHist);
+  const oiCross = interpretOiPriceCross(warming.direction === 'up', oiDeltaPct);
+  const wallBiasLong = !!wallsRaw && wallsRaw.buyWallUsd > wallsRaw.sellWallUsd;
+  const sellWallDominant = !!wallsRaw && wallsRaw.sellWallUsd >= wallsRaw.buyWallUsd * WALL_DOMINANCE_RATIO;
+  const chg7d = calcChg7dPct(c1dClosed);
+  const ema50dSeries = calcEMASeries(c1dClosed.map(x => x.close), 50);
+  const ema50d = ema50dSeries.length ? ema50dSeries[ema50dSeries.length - 1] : null;
+  const overheated = calcOverheated(chg24h, chg7d, price, ema50d);
+  const cycleLongPct = longShortCycle ? parseFloat(longShortCycle.longPct) : null;
+  const topWatch = isTopWatch(overheated, fundingCycle, cycleLongPct);
+  const fundingOK = fundingCycle == null || fundingCycle < TOP_WATCH_FUNDING_MIN;
+  const deathCross = c1dClosed.length ? calcDeathCross(c1dClosed) : false;
+  const dmaBear = calcEmaTrendFilter(c1dClosed).bear;
+  const bearishStructureActive = (warmTier !== 'none' && warming.direction === 'down') || buildUpConfirmShort || preImpulseShort;
+  const structuralShortConfirm = shiftDown || confirmed.short;
+  const oiReversal = oiCross === 'short_continuation' || oiCross === 'long_exhaustion_risk';
+  const macdCross = c1dClosed.length ? calcMACDCrossover(c1dClosed) : { bullish: false, bearish: false };
+  const liquidationCascade = calcLiquidationCascade(liquidationOrders);
+
+  const cycleLongScore = calcCycleLongScore({
+    warmDirectionUp: warmTier !== 'none' && warming.direction === 'up',
+    earlyLong: early.long,
+    buildUpConfirmLong, preImpulseLong,
+    bigVol4hUp: bigVol4h.active && bigVol4h.direction === 'up',
+    oiCross, fundingOK, wallBiasLong,
+    macdBullishCross: macdCross.bullish,
+    liquidationCascadeBullish: liquidationCascade.bullish,
+  });
+  // SHORT_SCORE се смята САМО ако вече сме в TOP WATCH (секция B от
+  // предложението - SHORT CONFIRMATION идва СЛЕД TOP WATCH gate-а, не преди).
+  const cycleShortScore = topWatch ? calcCycleShortScore({
+    deathCross, dmaBear, oiReversal, bearishStructureActive, sellWallDominant,
+    longOverloaded: cycleLongPct != null && cycleLongPct >= TOP_WATCH_LONGPCT_MIN,
+    structuralShortConfirm, macdBearishCross: macdCross.bearish,
+    liquidationCascadeBearish: liquidationCascade.bearish,
+  }) : 0;
+  const cyclePhase = computeCyclePhase({
+    longScore: cycleLongScore, shortScore: cycleShortScore, overheated, topWatch,
+    warmTierActive: warmTier !== 'none',
+    breakdownConfirmed: structuralShortConfirm,
+  });
+  const cyclePhaseChanged = cyclePhaseCanFire(state, cyclePhase);
+  if (cyclePhaseChanged) markCyclePhase(state, cyclePhase);
+
+  // ---- SPARK (виж дефинициите непосредствено след calcLiquidationCascade по-
+  // горе) - реюзва вече изчислените в тази функция c1h/c4h (LIVE, за най-бърза
+  // реакция - същата конвенция както WARMING/Early Build-Up), trend4h,
+  // wallBiasLong/sellWallDominant, fundingCycle, и същия oiHist fetch (вече
+  // разширен на limit=13 по-горе, за да не се прави отделна мрежова заявка).
+  // НЕ променя по никакъв начин cycleLongScore/cycleShortScore/cyclePhase.
+  // РЕАЛЕН БЪГ (открит при тестване на FLOW WARMING) - getSparkCoinTier
+  // (викана вътре в calcSparkScore/calcFlowWarmingScore) очаква "чист" символ
+  // без USDT наставка (MAJOR_COINS/SEMI_MAJOR_COINS съдържат 'BTC', 'ETH' и
+  // т.н., НЕ 'BTCUSDT'), но `symbol` тук е пълният watchlist символ
+  // ('BTCUSDT') - `MAJOR_COINS.has('BTCUSDT')` винаги е false, затова ВСЯКА
+  // монета (включително BTC) тихо падаше в 'minor' tier (най-строгите
+  // прагове: 8% OI/1.8x обем вместо 3%/1.3x за major). В Scanner UI
+  // (signal-scanner.html) този бъг го няма - там вече се подава coin.symbol
+  // (чист, без USDT). Поправка: чистим наставката ТУК, преди двете
+  // извиквания по-долу - byte-identical принцип не важи тук, защото UI-то
+  // никога не е имало бъга, само Worker-ът трябваше да го наследи погрешно.
+  const symbolNoUsdt = symbol.replace('USDT', '');
+  const oiMulti = calcOiMultiDelta(oiHist);
+  const volAccel = calcVolAcceleration(c1h, c4h);
+  const sparkChg1h = calcPriceChangePct(c1h, 1);
+  const sparkChg4h = calcPriceChangePct(c4h, 1);
+  const sparkStructureShift = calcStructureShift(c1h);
+  const sparkWallBias = wallBiasLong ? 'long' : sellWallDominant ? 'short' : null;
+  const sparkHtfAligned = trend4h.bull ? 'long' : trend4h.bear ? 'short' : null;
+  const sparkSqueeze = calcSqueezeCondition({
+    funding: fundingCycle, priceUp: sparkChg1h != null && sparkChg1h > 0,
+    oiUp: oiMulti.delta15m != null && oiMulti.delta15m > 0, volUp: volAccel.tier !== 'none',
+  });
+  const sparkExtension = calcPriceExtension(sparkChg1h, sparkChg4h);
+  const sparkScore = calcSparkScore({
+    symbol: symbolNoUsdt, oiDelta15m: oiMulti.delta15m, volAccel, chg1h: sparkChg1h,
+    structureShift: sparkStructureShift, squeeze: sparkSqueeze,
+    wallBias: sparkWallBias, htfAligned: sparkHtfAligned,
+  });
+  const sparkDirection = sparkScore.longScore >= sparkScore.shortScore ? 'long' : 'short';
+  const sparkMaxScore = Math.max(sparkScore.longScore, sparkScore.shortScore);
+  // Задължителен твърд фактор (виж бележката при calcSparkScore) - реално
+  // наблюдавани SPARK известия достигаха 4/7+ САМО от "меки", direction-
+  // neutral фактори (priceCompressed + структура/wall/HTF), докато OI/VOL
+  // ускорението изобщо не се е задействало - чист шум по време на тих пазар.
+  const sparkHasHardFactor = sparkDirection === 'long' ? sparkScore.hasHardFactorLong : sparkScore.hasHardFactorShort;
+  const sparkTier = getSparkTier(sparkMaxScore, sparkHasHardFactor);
+  // т.8 от предложението - "3/7 показва в скенера, 4/7 задейства alert" -
+  // WhatsApp известие пали само от 4/7 нагоре (spark/strongSpark/highProbability/
+  // extreme), НЕ на 3/7 (earlyWatch). getSparkTier вече връща 'none', ако
+  // sparkHasHardFactor е false, но проверяваме и тук изрично за защита.
+  const sparkKey = (sparkMaxScore >= 4 && sparkHasHardFactor && !sparkExtension.extended) ? `${sparkDirection}:${sparkTier}` : 'none';
+  const sparkFired = sparkCanFire(state, sparkKey);
+  if (sparkFired) markSparkFired(state, sparkKey);
+
+  // Taker buy/sell обем (виж calcTakerFlowDelta по-горе) - засега само се
+  // смята и връща, не участва в sparkKey/sparkFired/cyclePhase - инфраструктура
+  // за предстоящите IDEA 01/05/06 детектори (виж git history за плана).
+  const takerFlow = calcTakerFlowDelta(takerHist);
+
+  // ---- FLOW WARMING (виж дефинициите непосредствено след fetchTakerLongShortWorker
+  // по-горе) - реюзва вече изчислените oiMulti/volAccel/sparkChg1h (нула нови
+  // мрежови заявки), собствено, независимо известие/cooldown от SPARK.
+  const flowWarmingScore = calcFlowWarmingScore({
+    symbol: symbolNoUsdt, oiDelta15m: oiMulti.delta15m, takerDelta15m: takerFlow.delta15m,
+    volAccel, chg1h: sparkChg1h,
+  });
+  const flowWarmingDirection = flowWarmingScore.longScore >= flowWarmingScore.shortScore ? 'long' : 'short';
+  const flowWarmingMaxScore = Math.max(flowWarmingScore.longScore, flowWarmingScore.shortScore);
+  const flowWarmingHasHardFactor = flowWarmingDirection === 'long' ? flowWarmingScore.hasHardFactorLong : flowWarmingScore.hasHardFactorShort;
+  const flowWarmingTier = getFlowWarmingTier(flowWarmingMaxScore, flowWarmingHasHardFactor);
+  const flowWarmingKey = (flowWarmingMaxScore >= 3 && flowWarmingHasHardFactor) ? `${flowWarmingDirection}:${flowWarmingTier}` : 'none';
+  const flowWarmingFired = flowWarmingCanFire(state, flowWarmingKey, flowWarmingDirection);
+  if (flowWarmingFired) markFlowWarmingFired(state, flowWarmingKey, flowWarmingDirection);
+
+  // ---- TRAP (IDEA 01, виж дефинициите непосредствено след
+  // fetchTakerLongShortWorker по-горе) - реюзва вече изчислените c1hClosed
+  // (sweep detection на затворена свещ, огледално на SHIFT/CONFIRMED),
+  // oiDeltaPct/volAccel/takerFlow - нула нови мрежови заявки.
+  const sweep = calcLiquiditySweep(c1hClosed);
+  const trapScore = calcTrapScore({
+    symbol: symbolNoUsdt, sweepBullish: sweep.bullish, sweepBearish: sweep.bearish,
+    takerBuyPressure: takerFlow.buyPressureNow, takerDelta5m: takerFlow.delta5m,
+    oiDeltaPct, volAccel,
+  });
+  const trapDirection = trapScore.longScore >= trapScore.shortScore ? 'long' : 'short';
+  const trapMaxScore = Math.max(trapScore.longScore, trapScore.shortScore);
+  const trapHasHardFactor = trapDirection === 'long' ? trapScore.hasHardFactorLong : trapScore.hasHardFactorShort;
+  const trapTier = getTrapTier(trapMaxScore, trapHasHardFactor);
+  // "Жива" снимка на ТЕКУЩИЯ TRAP статус - за разлика от state.trap по-долу
+  // (hysteresis-гейтнат "кога за последно гръмна известието"), това поле се
+  // презаписва на ВСЕКИ tick, независимо дали е имало ново известие - чисто
+  // диагностично, четено само от Discovery TOP списъка (виж
+  // buildDiscoveryTopListMessage) за 🪤 маркировка. Никой threshold/gate не
+  // го чете обратно.
+  state.trapSnapshot = { tier: trapTier, direction: trapDirection, at: Date.now() };
+  // sweep candleTime (последната затворена 1ч свещ) - собствен key компонент,
+  // за да не се повтори известието на СЪЩАТА затворена свещ (огледално на
+  // candleTime конвенцията за структурните тагове, но с key вместо label).
+  const trapCandleTime = c1hClosed.length ? c1hClosed[c1hClosed.length - 1].openTime : null;
+  const trapKey = (trapMaxScore >= 3 && trapHasHardFactor) ? `${trapDirection}:${trapTier}:${trapCandleTime}` : 'none';
+  const trapFired = trapCanFire(state, trapKey, trapDirection);
+  if (trapFired) markTrapFired(state, trapKey, trapDirection);
+
+  // ---- RELOAD (IDEA 06, виж дефинициите непосредствено след getTrapTier
+  // по-горе) - реюзва вече изчислените impulse/price/volAccel/takerFlow, нула
+  // нови мрежови заявки. IMPULSE MEMORY (state.reloadWindow) е независима от
+  // sparkKey/flowWarmingKey/trapKey - собствено, изцяло отделно известие.
+  if (impulse.long || impulse.short) {
+    const dir = impulse.long ? 1 : -1;
+    const existing = state.reloadWindow;
+    // Ре-армираме САМО ако няма активен прозорец, той е изтекъл, или новият
+    // impulse е в ПРОТИВОПОЛОЖНА посока (flip) - ако вече следим impulse в
+    // СЪЩАТА посока, не нулираме прогреса му (pullback фазата) на всеки тик.
+    if (!existing || Date.now() >= existing.until || existing.dir !== dir) {
+      state.reloadWindow = { dir, extremePrice: price, until: Date.now() + RELOAD_MAX_HOURS * 3600000, phase: 'tracking' };
+    }
+  }
+  const reloadWindow = state.reloadWindow;
+  const reloadActive = !!reloadWindow && Date.now() < reloadWindow.until;
+  let reloadFired = false, reloadDirection = null;
+  if (reloadActive && price != null) {
+    // Докато сме във фаза 'tracking', extremePrice продължава да следва
+    // движението (нов екстремум) - "замръзва" чак когато реален pullback
+    // е засечен (виж calcReloadPhaseTransition).
+    if (reloadWindow.phase === 'tracking') {
+      if (reloadWindow.dir === 1 && price > reloadWindow.extremePrice) reloadWindow.extremePrice = price;
+      if (reloadWindow.dir === -1 && price < reloadWindow.extremePrice) reloadWindow.extremePrice = price;
+    }
+    const pullbackPct = calcReloadPullbackPct(reloadWindow.dir, reloadWindow.extremePrice, price);
+    if (calcReloadInvalidated(pullbackPct)) {
+      // Pullback-ът стана твърде дълбок - вече не е "контролиран" (IDEA 06
+      // изрично НЕ Е DCA модул) - забравяме impulse-а изцяло.
+      state.reloadWindow = null;
+    } else {
+      reloadWindow.phase = calcReloadPhaseTransition({ phase: reloadWindow.phase, pullbackPct });
+      const triggered = calcSecondImpulseTrigger({
+        phase: reloadWindow.phase, dir: reloadWindow.dir, extremePrice: reloadWindow.extremePrice,
+        price, volAccel, takerDelta5m: takerFlow.delta5m,
+      });
+      if (triggered) {
+        reloadFired = true;
+        reloadDirection = reloadWindow.dir === 1 ? 'long' : 'short';
+        state.reloadWindow = null; // веднъж отключен, забравяме - следващ RELOAD изисква нов IMPULSE
+      }
+    }
+  }
+
+  // ===================== VOLUME PROFILE ENGINE (обща основа за идеи 02/03/04) ==
+  // Строи се от вече изтеглените 200 дневни свещи (c1dClosed) - БЕЗ никакви
+  // допълнителни мрежови заявки/subrequests. Прозорец от последните 30
+  // затворени дни ("месечен" профил) - разумен баланс между актуалност и
+  // достатъчно данни за стабилен POC/Value Area. Резултатите засега само се
+  // връщат - следващите идеи (02/03/04) ще ги ползват за target/destination
+  // score и т.н., затова НЕ участват все още в checkMarketSignals по-долу.
+  const volumeProfile = buildVolumeProfile(c1dClosed.slice(-30));
+  const vpPoc = calcPOC(volumeProfile);
+  const vpValueArea = calcValueArea(volumeProfile);
+  const vpNodes = getHVNLVN(volumeProfile);
+
+  // IDEA 02 - "TARGET / DESTINATION SCORE" (виж calcTargetScore по-горе) -
+  // изцяло отделно известие, огледално на FLOW WARMING/TRAP. Строи се directly
+  // върху горния Volume Profile - POC е целта, HVN nodes-ите по-долу са само
+  // информативни допълнителни магнити (не влизат в score-а).
+  const targetScore = calcTargetScore({ price, poc: vpPoc, profileTotalVolume: volumeProfile?.totalVolume });
+  const targetTier = getTargetTier(targetScore.score, targetScore.distancePct);
+  const targetKey = targetTier !== 'none' ? `${targetScore.direction}:${targetTier}` : 'none';
+  const targetFired = targetCanFire(state, targetKey, targetScore.direction);
+  if (targetFired) markTargetFired(state, targetKey, targetScore.direction);
+  const targetMagnets = findNearestMagnets(price, targetScore.direction, targetScore.targetPrice, vpNodes.hvn);
+
+  // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore по-горе) -
+  // изцяло отделно известие, огледално на TRAP (ИМА hard factor изискване,
+  // за разлика от TARGET по-горе - потвърдено с потребителя).
+  const auctionScore = calcAuctionQualityScore({
+    poc: vpPoc, vah: vpValueArea ? vpValueArea.vah : null, val: vpValueArea ? vpValueArea.val : null,
+    oiDeltaPct, takerDelta: takerFlow.delta5m, volAccel,
+  });
+  const auctionDirection = auctionScore.longScore >= auctionScore.shortScore ? 'long' : 'short';
+  const auctionMaxScore = Math.max(auctionScore.longScore, auctionScore.shortScore);
+  const auctionHasHardFactor = auctionDirection === 'long' ? auctionScore.hasHardFactorLong : auctionScore.hasHardFactorShort;
+  const auctionTier = getAuctionQualityTier(auctionMaxScore, auctionHasHardFactor);
+  const auctionKey = auctionTier !== 'none' ? `${auctionDirection}:${auctionTier}` : 'none';
+  const auctionFired = auctionCanFire(state, auctionKey, auctionDirection);
+  if (auctionFired) markAuctionFired(state, auctionKey, auctionDirection);
+
+  // AUTO VAH/VAL STRUCTURE DETECTOR (виж calcVahValStructureEvent по-горе) -
+  // изцяло независим от TARGET/AUCTION - реизползва вече изтеглената c15Closed
+  // (структурен таймфрейм, лесно сменяем) и вече изчисления vpValueArea -
+  // БЕЗ никакви допълнителни мрежови заявки.
+  if (!state.vahStruct) state.vahStruct = {};
+  if (!state.valStruct) state.valStruct = {};
+  const structCandle = c15Closed.length ? c15Closed[c15Closed.length - 1] : null;
+  const vahEvent = calcVahValStructureEvent(state.vahStruct, structCandle, vpValueArea ? vpValueArea.vah : null);
+  const valEvent = calcVahValStructureEvent(state.valStruct, structCandle, vpValueArea ? vpValueArea.val : null);
+
+  // IDEA 04 - "VALUE MIGRATION" (виж calcValueMigrationScore по-горе) -
+  // изцяло отделно известие, огледално на TRAP/AUCTION. Строи се от c1h (ЖИВИ
+  // свещи, включително недовършената текуща - "днес" нарочно е незавършеният
+  // ден, виж спецификацията) - БЕЗ никакви допълнителни мрежови заявки.
+  const { today: migrationToday, yesterday: migrationYesterday } = getTodayYesterdayCandles(c1h);
+  const migrationScore = calcValueMigrationScore({
+    todayCandles: migrationToday, yesterdayCandles: migrationYesterday,
+    oiDeltaPct, takerDelta: takerFlow.delta5m, volAccel,
+  });
+  const migrationDirection = migrationScore.longScore >= migrationScore.shortScore ? 'long' : 'short';
+  const migrationMaxScore = Math.max(migrationScore.longScore, migrationScore.shortScore);
+  const migrationHasHardFactor = migrationDirection === 'long' ? migrationScore.hasHardFactorLong : migrationScore.hasHardFactorShort;
+  const migrationTier = getValueMigrationTier(migrationMaxScore, migrationHasHardFactor);
+  const migrationKey = migrationTier !== 'none' ? `${migrationDirection}:${migrationTier}` : 'none';
+  const migrationFired = migrationCanFire(state, migrationKey, migrationDirection);
+  if (migrationFired) markMigrationFired(state, migrationKey, migrationDirection);
+
+  // IDEA 08 - "LIQUIDATION GRAVITY" (виж calcLiquidationGravityScore по-горе) -
+  // изцяло отделно известие, огледално на TRAP/AUCTION/MIGRATION. Реизползва
+  // liquidationOrders (вече изтеглени по-горе за LIQUIDATION CASCADE) - БЕЗ
+  // никакви допълнителни мрежови заявки. Натрупва delta-та в state, после
+  // проверява дали цената наближава вече идентифициран силен клъстер.
+  accumulateLiquidationGravity(state, liquidationOrders);
+  const liqCluster = findNearestLiquidationCluster(state, price);
+  const liqGravityScore = calcLiquidationGravityScore({ price, cluster: liqCluster, oiDeltaPct, takerDelta: takerFlow.delta5m, volAccel });
+  const liqGravityDirection = liqGravityScore.longScore >= liqGravityScore.shortScore ? 'long' : 'short';
+  const liqGravityMaxScore = Math.max(liqGravityScore.longScore, liqGravityScore.shortScore);
+  const liqGravityHasHardFactor = liqGravityDirection === 'long' ? liqGravityScore.hasHardFactorLong : liqGravityScore.hasHardFactorShort;
+  const liqGravityTier = getLiquidationGravityTier(liqGravityMaxScore, liqGravityHasHardFactor);
+  const liqGravityKey = liqGravityTier !== 'none' ? `${liqGravityDirection}:${liqGravityTier}` : 'none';
+  const liqGravityFired = liqGravityCanFire(state, liqGravityKey, liqGravityDirection);
+  if (liqGravityFired) markLiqGravityFired(state, liqGravityKey, liqGravityDirection);
+  // COINGLASS LIQUIDATION DIAGNOSTICS (shadow) - само записва в `liqdiag:`
+  // KV; не чете/пише `state`, не влияе на никоя стойност в този return.
+  if (liqDiagFetchPromise) {
+    await runLiqShadowDiagnostics(env, symbol, liqDiagFetchPromise, {
+      price, oiDeltaPct, takerDelta: takerFlow.delta5m, volAccel,
+      legacyBuyUsd: liquidationCascade.buySumUsd, legacySellUsd: liquidationCascade.sellSumUsd,
+    });
+  }
+
+  // ENTRY ENGINE - ЕТАП 1: "SETUP" (виж calcSetupState по-горе) - реюзва вече
+  // изчислените TARGET/VAH/VAL/TRAP/AUCTION/MIGRATION резултати по-горе, БЕЗ
+  // никакви допълнителни мрежови заявки.
+  const setupState = calcSetupState({
+    targetDirection: targetScore.direction, targetTier,
+    vahLastEventType: state.vahStruct.lastEventType, valLastEventType: state.valStruct.lastEventType,
+    trapDirection, trapTier, auctionDirection, auctionTier, migrationDirection, migrationTier,
+  });
+  const setupFired = setupCanFire(state, setupState.direction);
+  if (setupFired) markSetupFired(state, setupState.direction, setupState.score, price);
+  if (!setupState.direction) state.setup = null; // деактивирано - следваща активация ще пали НАНОВО
+
+  // STAGE DIRECTION COUNTS (diagnostic-only, виж incrementStageDirectionCount
+  // по-горе) - best-effort read-modify-write на ЕДИН споделен KV brojач,
+  // изолиран в try/catch - failure тук НИКОГА не бива да чупи SETUP/ARMED/
+  // ENTRY логиката по-долу.
+  if (setupFired && env.ALERT_STATE) {
+    try {
+      const raw = await env.ALERT_STATE.get('entryenginestagecounts');
+      const counts = incrementStageDirectionCount(raw ? JSON.parse(raw) : null, 'setup', setupState.direction);
+      await env.ALERT_STATE.put('entryenginestagecounts', JSON.stringify(counts));
+    } catch (e) { /* observability only - никога не бива да чупи CORE */ }
+  }
+
+  // ENTRY ENGINE - ЕТАП 2: "ARMED" (виж calcArmedTrigger по-горе) - чисто
+  // structure/price-action, БЕЗ momentum/CVD/OI (за Етап 3). Реюзва вече
+  // изтеглената c5Closed - БЕЗ нови мрежови заявки. ARMED е sticky - веднъж
+  // достигнат, остава активен докато SETUP не се деактивира/смени посока
+  // (проверката по-долу), или изтече ARMED_EXPIRY_HOURS.
+  if (!state.swingStruct) state.swingStruct = {};
+  updateSwingStructure(state.swingStruct, c5Closed);
+  if (!setupState.direction || (state.armed && state.armed.direction !== setupState.direction)) {
+    state.armed = null; // SETUP деактивиран или смени посока -> RESET към IDLE
+  }
+  if (state.armed && (Date.now() - state.armed.at) >= ARMED_EXPIRY_HOURS * 3600000) {
+    state.armed = null; // expiry - твърде стар ARMED без дошъл ENTRY TRIGGER
+  }
+  let armedFired = false;
+  if (setupState.direction && !state.armed) {
+    const lastClosed5m = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+    const armedDirection = calcArmedTrigger(setupState.direction, state.swingStruct, lastClosed5m);
+    if (armedDirection) {
+      // priceAtArm е ЧИСТО информационен (за контекст в известията) - НЕ
+      // участва в chase protection (виж calcEntryTrigger/isTooExtended по-горе
+      // и дискусията защо currentSwingReference е правилната референция).
+      // MR RE-ARM DIAGNOSTIC TELEMETRY (виж calcArmedTriggerSource по-горе и
+      // discussion-а "дали многократните ENTRY известия са полезни или шум")
+      // - calcArmedTrigger вече е решил (ред по-горе, непроменен) дали да
+      // армираме; тук САМО наблюдаваме КОЙ клон е избран и дали структурата
+      // е същата като предходния ARM в тоя episode. Нищо от това не участва
+      // в самото ARM решение (виж условие 7 - no influence on fire gate).
+      const triggerSource = calcArmedTriggerSource(setupState.direction, state.swingStruct, lastClosed5m);
+      const structuralReferenceAtArm = armedDirection === 'short'
+        ? (state.swingStruct.lastSwingLow ? state.swingStruct.lastSwingLow.price : null)
+        : (state.swingStruct.lastSwingHigh ? state.swingStruct.lastSwingHigh.price : null);
+      // state.setup е гарантирано non-null тук (setupState.direction е truthy
+      // - виж проверката по-горе, което значи markSetupFired вече е минал или
+      // state.setup вече съществува от предходен tick); defensive fallback
+      // само за стари persisted state обекти отпреди тая промяна, в случай че
+      // reArmCount/lastArmStructRef липсват - виж markSetupFired по-горе.
+      const prevArmStructRef = (state.setup && state.setup.lastArmStructRef != null) ? state.setup.lastArmStructRef : null;
+      const structRefUnchanged = (prevArmStructRef != null && structuralReferenceAtArm != null)
+        ? (structuralReferenceAtArm === prevArmStructRef)
+        : null;
+      if (state.setup) {
+        state.setup.lastArmStructRef = structuralReferenceAtArm;
+        state.setup.reArmCount = (state.setup.reArmCount ?? 0) + 1;
+      }
+      state.armed = {
+        direction: armedDirection, at: Date.now(), priceAtArm: price,
+        triggerSource, structuralReferenceAtArm, structRefUnchanged,
+        reArmCount: state.setup ? state.setup.reArmCount : null,
+      };
+      armedFired = true;
+      // STAGE DIRECTION COUNTS (diagnostic-only) - виж коментара при SETUP по-горе.
+      if (env.ALERT_STATE) {
+        try {
+          const raw = await env.ALERT_STATE.get('entryenginestagecounts');
+          const counts = incrementStageDirectionCount(raw ? JSON.parse(raw) : null, 'armed', armedDirection);
+          await env.ALERT_STATE.put('entryenginestagecounts', JSON.stringify(counts));
+        } catch (e) { /* observability only - никога не бива да чупи CORE */ }
+      }
+    }
+  }
+  const armedDirection = state.armed ? state.armed.direction : null;
+  const armedLowerHigh = calcLowerHigh(state.swingStruct);
+  const armedHigherLow = calcHigherLow(state.swingStruct);
+  const armedStructureLossDown = calcStructureLossDown(state.swingStruct, c5Closed.length ? c5Closed[c5Closed.length - 1] : null);
+  const armedStructureReclaimUp = calcStructureReclaimUp(state.swingStruct, c5Closed.length ? c5Closed[c5Closed.length - 1] : null);
+
+  // ENTRY ENGINE - ЕТАП 3: "ENTRY TRIGGER" (виж calcEntryTrigger по-горе) -
+  // изчислява се САМО докато ARMED е активен. Реюзва вече изтеглените c5Closed/
+  // c15Closed + вече изчислените FLOW WARMING/TRAP/trend4h/emaFilter - БЕЗ нови
+  // мрежови заявки. ENTRY/MISSED консумират ARMED (сядат в state.armed=null) -
+  // едностранно събитие на епизод, огледално на самия state machine дизайн.
+  let entryResult = { status: 'none' };
+  // PR #104 - BOTH QUALITY: пази record.at на MR telemetry записа от ТОЗИ tick
+  // (ако е създаден), за да може TC блокът по-долу да го patch-не с bothQuality,
+  // ако TC СЪЩО влезе в ENTRY в СЪЩИЯ tick (виж classifyBothQuality по-горе).
+  let mrTelemetryRecordAt = null;
+  if (state.armed) {
+    const entryDirection = state.armed.direction;
+    const atr5m = calcATR(c5Closed, 14);
+    const atr15m = calcATR(c15Closed, 14);
+    const structRef = entryDirection === 'short'
+      ? (state.swingStruct.lastSwingLow ? state.swingStruct.lastSwingLow.price : null)
+      : (state.swingStruct.lastSwingHigh ? state.swingStruct.lastSwingHigh.price : null);
+    const flowVeto = calcFlowVeto({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
+    const flowBoost = calcFlowBoost({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
+    const htfAligned = entryDirection === 'long' ? (trend4h.bull || emaFilter.bull) : (trend4h.bear || emaFilter.bear);
+    const lastClosed5mCandle = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+    entryResult = calcEntryTrigger({
+      direction: entryDirection,
+      candle5m: lastClosed5mCandle, atr5m,
+      candle15m: c15Closed.length ? c15Closed[c15Closed.length - 1] : null, atr15m,
+      structRef, flowVeto, flowBoost, htfAligned,
+    });
+    // TELEMETRY - записва се за entry/missed/veto (виж buildTelemetryRecord
+    // по-горе), НЕЗАВИСИМО от гейт логиката по-долу - чисто observability.
+    if (entryResult.status === 'entry' || entryResult.status === 'missed' || entryResult.status === 'veto') {
+      const decision = entryResult.status === 'entry' ? 'confirmed' : entryResult.status;
+      const record = buildTelemetryRecord({
+        symbol, direction: entryDirection, decision,
+        setupScore: setupState.score, setupBreakdown: setupState.breakdown,
+        armedAt: state.armed.at,
+        structRef: entryResult.structRef ?? structRef,
+        triggerClose: entryResult.triggerClose, atr5m,
+        triggerRange: lastClosed5mCandle ? (lastClosed5mCandle.high - lastClosed5mCandle.low) : null,
+        confirmation15m: entryResult.confirmation15m,
+        flowState: calcFlowState(flowVeto, flowBoost),
+        trapTier, trapDirection, flowWarmingTier, flowWarmingDirection,
+        entryScore: entryResult.score,
+        setupMode: 'mean_reversion', htfAligned: entryResult.htfAligned,
+        setupAt: state.setup ? state.setup.at : null,
+        targetScore: targetScore.score, targetTier, targetDirection: targetScore.direction,
+        // MR RE-ARM DIAGNOSTIC TELEMETRY (виж wiring-а в ARM формирането
+        // по-горе) - четени от state.armed, стампвани тук преди state.armed
+        // да бъде консумиран (null-нат) по-долу при entry/missed резолюция.
+        reArmCount: state.armed.reArmCount, triggerSource: state.armed.triggerSource,
+        structuralReferenceAtArm: state.armed.structuralReferenceAtArm,
+        structRefUnchanged: state.armed.structRefUnchanged,
+      });
+      entryResult.entryQualityScore = record.entryQualityScore;
+      entryResult.entryQualityTier = record.entryQualityTier;
+      mrTelemetryRecordAt = record.at; // PR #104 - виж коментара при декларацията по-горе
+      if (env.ALERT_STATE) {
+        // setupMode-суфикс в KV ключа - предпазва от презаписване, ако
+        // MEAN REVERSION и TREND CONTINUATION произведат telemetry запис за
+        // СЪЩИЯ symbol в СЪЩАТА милисекунда (record.at) - виж паралелния
+        // TREND CONTINUATION блок по-долу.
+        const telemetryKey = `telemetry:${symbol}:${record.at}:${record.setupMode}`;
+        await env.ALERT_STATE.put(telemetryKey, JSON.stringify(record));
+        if (decision === 'confirmed' || decision === 'missed') {
+          if (!state.pendingOutcomes) state.pendingOutcomes = [];
+          state.pendingOutcomes.push({
+            key: telemetryKey, horizons: buildPendingOutcomeHorizons(record.at),
+            entryPrice: record.triggerClose, direction: entryDirection,
+            entryAt: record.at, atr5m, // PR #103 PATH DIAGNOSTICS (MFE/MAE) - виж updateExcursion
+          });
+        }
+      }
+    }
+    if (entryResult.status === 'entry' || entryResult.status === 'missed') {
+      entryResult.direction = entryDirection;
+      entryResult.priceAtArm = state.armed.priceAtArm; // само за контекст в известието
+      state.armed = null; // епизодът приключва (ENTRY или MISSED) - ново SETUP->ARMED е нужно за следващ опит
+    }
+  }
+
+  // ═══ TREND CONTINUATION SETUP/ARMED/ENTRY (виж calcTrendContinuationSetupState
+  // по-горе) - огледален wiring на MEAN REVERSION блока по-горе, върху ОТДЕЛНИ
+  // state слотове (state.trendSetup/state.trendArmed), с реюзвани СЪЩИТЕ
+  // calcArmedTrigger/calcEntryTrigger pure функции (без дублирана логика).
+  // Никога не пипа state.setup/state.armed/entryResult (MEAN REVERSION) -
+  // двата режима могат да са едновременно активни, дори в противоположни
+  // посоки (документиран SUI случай: TARGET SHORT + TREND CONTINUATION LONG
+  // едновременно, часове наред).
+  const trendSetupState = calcTrendContinuationSetupState({
+    direction: confidence.direction, confident: confidence.confident,
+    trapDirection, trapTier, auctionDirection, auctionTier, migrationDirection, migrationTier,
+  });
+  const trendSetupFired = trendSetupCanFire(state, trendSetupState.direction);
+  if (trendSetupFired) markTrendSetupFired(state, trendSetupState.direction, trendSetupState.score, price);
+  // PR #105 - TC LIFECYCLE TELEMETRY: SETUP CREATED - на СЪЩИЯ edge-trigger
+  // момент като WhatsApp SETUP известието (trendSetupFired), diagnostic-only.
+  if (trendSetupFired && env.ALERT_STATE) {
+    const tcSetupRecord = buildTcSetupCreatedRecord({
+      symbol, direction: trendSetupState.direction, price,
+      setupScore: trendSetupState.score, confidenceMajority: confidence.majority,
+      // PR #141 review fix (TIMESTAMP IDENTITY) - канoничният timestamp,
+      // вече записан в state.trendSetup.at от markTrendSetupFired() 1 ред
+      // по-горе, НЕ нов независим Date.now() извикване.
+      at: state.trendSetup ? state.trendSetup.at : null,
+    });
+    await env.ALERT_STATE.put(`tclifecycle:${symbol}:${tcSetupRecord.at}:setup_created`, JSON.stringify(tcSetupRecord));
+  }
+  if (!trendSetupState.direction) state.trendSetup = null;
+
+  // PR #105 - TC LIFECYCLE TELEMETRY: ARMED RESET (confidence_lost/
+  // direction_changed) - пазим СТАРИЯ state.trendArmed ПРЕДИ да го нулираме,
+  // за да запишем armedDurationMin/pctMoveFromArm/atrMoveFromArm за епизода,
+  // който приключва тук. trendArmedResetReason се смята ПЪРВО, после се
+  // прилага reset-а - byte-идентично поведение на предишното единично if
+  // (state.trendArmed завършва null в двата случая), само добавя diagnostic
+  // reason преди мутацията.
+  const prevTrendArmed = state.trendArmed;
+  let trendArmedResetReason = null;
+  if (prevTrendArmed) {
+    if (!trendSetupState.direction) trendArmedResetReason = 'confidence_lost';
+    else if (prevTrendArmed.direction !== trendSetupState.direction) trendArmedResetReason = 'direction_changed';
+  }
+  if (trendArmedResetReason) {
+    state.trendArmed = null;
+    if (env.ALERT_STATE) {
+      const resetRecord = buildTcArmedResetRecord({
+        symbol, direction: prevTrendArmed.direction, armedAt: prevTrendArmed.at,
+        priceAtArm: prevTrendArmed.priceAtArm, reason: trendArmedResetReason, price,
+        atrAtArm: prevTrendArmed.atrAtArm,
+      });
+      await env.ALERT_STATE.put(`tclifecycle:${symbol}:${resetRecord.at}:armed_reset`, JSON.stringify(resetRecord));
+    }
+  }
+  if (state.trendArmed && (Date.now() - state.trendArmed.at) >= ARMED_EXPIRY_HOURS * 3600000) {
+    // PR #105 - TC LIFECYCLE TELEMETRY: ARMED RESET (expired_6h)
+    if (env.ALERT_STATE) {
+      const expiredRecord = buildTcArmedResetRecord({
+        symbol, direction: state.trendArmed.direction, armedAt: state.trendArmed.at,
+        priceAtArm: state.trendArmed.priceAtArm, reason: 'expired_6h', price,
+        atrAtArm: state.trendArmed.atrAtArm,
+      });
+      await env.ALERT_STATE.put(`tclifecycle:${symbol}:${expiredRecord.at}:armed_reset`, JSON.stringify(expiredRecord));
+    }
+    state.trendArmed = null;
+  }
+  let trendArmedFired = false;
+  if (trendSetupState.direction && !state.trendArmed) {
+    const lastClosed5mForTrend = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+    const trendArmedDirectionCandidate = calcArmedTrigger(trendSetupState.direction, state.swingStruct, lastClosed5mForTrend);
+    if (trendArmedDirectionCandidate) {
+      // PR #105 - TC LIFECYCLE TELEMETRY: ATRAtArm/structuralReference - четем
+      // вече наличните c5Closed/state.swingStruct малко по-рано от обичайното
+      // (иначе се смятат чак в ENTRY TRIGGER блока по-долу) - чисто
+      // преместване на READ, БЕЗ нова мрежова заявка, БЕЗ промяна на
+      // ARMED/ENTRY логиката.
+      const atr5mAtArm = calcATR(c5Closed, 14);
+      const structuralReferenceAtArm = trendArmedDirectionCandidate === 'short'
+        ? (state.swingStruct.lastSwingLow ? state.swingStruct.lastSwingLow.price : null)
+        : (state.swingStruct.lastSwingHigh ? state.swingStruct.lastSwingHigh.price : null);
+      // TELEMETRY INTEGRITY FIX (виж "ENTRY TELEMETRY INTEGRITY" одита) -
+      // state.trendArmed.setupAt липсваше тук, въпреки че СЪЩАТА стойност
+      // (state.trendSetup.at) вече се подаваше коректно на
+      // buildTcArmedCreatedRecord() 2 реда по-долу за tclifecycle: записа.
+      // Резултат: редът, който чете state.trendArmed.setupAt при ENTRY
+      // EVALUATION (виж "setupAt: state.trendArmed.setupAt" по-долу в тоя
+      // файл), винаги четеше undefined -> episodeId винаги null за ВСИЧКИ
+      // trend_continuation telemetry записи (потвърдено с production
+      // /telemetry данни: unknownEpisode.count доминиран от TC записи).
+      // Чисто diagnostic поле - НЕ се чете от никоя SETUP/ARMED/ENTRY gate
+      // логика (state.trendArmed.setupAt не участва в calcArmedTrigger/
+      // calcEntryTrigger/trendArmedResetReason по-долу) - нулева промяна в
+      // ENTRY ENGINE решенията.
+      state.trendArmed = {
+        direction: trendArmedDirectionCandidate, at: Date.now(), priceAtArm: price,
+        atrAtArm: (atr5mAtArm > 0) ? atr5mAtArm : null, // PR #105 - чисто информационен, виж коментара по-горе
+        setupAt: state.trendSetup ? state.trendSetup.at : null,
+      };
+      trendArmedFired = true;
+      if (env.ALERT_STATE) {
+        const armedRecord = buildTcArmedCreatedRecord({
+          symbol, direction: trendArmedDirectionCandidate, priceAtArm: price,
+          structuralReference: structuralReferenceAtArm, atrAtArm: atr5mAtArm,
+          setupAt: state.trendSetup ? state.trendSetup.at : null,
+          // PR #141 review fix (TIMESTAMP IDENTITY) - канoничният timestamp,
+          // вече записан в state.trendArmed.at няколко реда по-горе, НЕ нов
+          // независим Date.now() извикване (виж коментара по-горе за
+          // пълния root cause).
+          at: state.trendArmed.at,
+        });
+        await env.ALERT_STATE.put(`tclifecycle:${symbol}:${armedRecord.at}:armed_created`, JSON.stringify(armedRecord));
+      }
+    }
+  }
+  const trendArmedDirection = state.trendArmed ? state.trendArmed.direction : null;
+
+  let trendEntryResult = { status: 'none' };
+  if (state.trendArmed) {
+    const entryDirection = state.trendArmed.direction;
+    const atr5m = calcATR(c5Closed, 14);
+    const atr15m = calcATR(c15Closed, 14);
+    const structRef = entryDirection === 'short'
+      ? (state.swingStruct.lastSwingLow ? state.swingStruct.lastSwingLow.price : null)
+      : (state.swingStruct.lastSwingHigh ? state.swingStruct.lastSwingHigh.price : null);
+    const flowVeto = calcFlowVeto({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
+    const flowBoost = calcFlowBoost({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
+    const htfAligned = entryDirection === 'long' ? (trend4h.bull || emaFilter.bull) : (trend4h.bear || emaFilter.bear);
+    const lastClosed5mCandle = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+    trendEntryResult = calcEntryTrigger({
+      direction: entryDirection,
+      candle5m: lastClosed5mCandle, atr5m,
+      candle15m: c15Closed.length ? c15Closed[c15Closed.length - 1] : null, atr15m,
+      structRef, flowVeto, flowBoost, htfAligned,
+    });
+    // PR #105 - TC LIFECYCLE TELEMETRY: смята се веднага след calcEntryTrigger,
+    // СПОДЕЛЕНО между ENTRY EVALUATION записа по-долу и терминалния ARMED
+    // RESET запис (entry_confirmed/entry_missed, виж по-долу) - една смятана
+    // стойност, реюзвана, а не дублирана математика. null за status:'none'
+    // (няма evaluation този tick).
+    let tcTimeFromArmMin = null, tcPctMoveFromArm = null, tcAtrMoveFromArm = null;
+    if (trendEntryResult.status !== 'none') {
+      tcTimeFromArmMin = (Date.now() - state.trendArmed.at) / 60000;
+      tcPctMoveFromArm = calcOutcomePct(entryDirection, state.trendArmed.priceAtArm, trendEntryResult.triggerClose);
+      tcAtrMoveFromArm = pctExcursionToAtrRatio(tcPctMoveFromArm, state.trendArmed.priceAtArm, state.trendArmed.atrAtArm);
+    }
+    // PR #104 - BOTH QUALITY: по тук entryResult (MEAN REVERSION) е ВЕЧЕ
+    // напълно финализиран (блокът по-горе завърши) - можем безопасно да
+    // проверим дали TC СЪЩО влиза в ENTRY в СЪЩИЯ tick (винаги в
+    // MODE_OVERLAP_WINDOW_MS - виж коментара при константата). Само
+    // маркиране - НЕ hard veto, entryResult/trendEntryResult статусите по-горе
+    // остават непроменени.
+    const bothEntryThisTick = entryResult.status === 'entry' && trendEntryResult.status === 'entry';
+    const bothQuality = bothEntryThisTick ? classifyBothQuality(setupState.score, trendSetupState.score) : null;
+    if (bothEntryThisTick) {
+      entryResult.bothQuality = bothQuality;
+      trendEntryResult.bothQuality = bothQuality;
+    }
+    if (trendEntryResult.status === 'entry' || trendEntryResult.status === 'missed' || trendEntryResult.status === 'veto') {
+      const decision = trendEntryResult.status === 'entry' ? 'confirmed' : trendEntryResult.status;
+      const record = buildTelemetryRecord({
+        symbol, direction: entryDirection, decision,
+        setupScore: trendSetupState.score, setupBreakdown: trendSetupState.breakdown,
+        armedAt: state.trendArmed.at,
+        structRef: trendEntryResult.structRef ?? structRef,
+        triggerClose: trendEntryResult.triggerClose, atr5m,
+        triggerRange: lastClosed5mCandle ? (lastClosed5mCandle.high - lastClosed5mCandle.low) : null,
+        confirmation15m: trendEntryResult.confirmation15m,
+        flowState: calcFlowState(flowVeto, flowBoost),
+        trapTier, trapDirection, flowWarmingTier, flowWarmingDirection,
+        entryScore: trendEntryResult.score,
+        setupMode: 'trend_continuation', htfAligned: trendEntryResult.htfAligned,
+        bothQuality,
+        timeFromArmMin: tcTimeFromArmMin, pctMoveFromArm: tcPctMoveFromArm, atrMoveFromArm: tcAtrMoveFromArm,
+        setupAt: state.trendArmed.setupAt,
+        targetScore: targetScore.score, targetTier, targetDirection: targetScore.direction,
+      });
+      trendEntryResult.entryQualityScore = record.entryQualityScore;
+      trendEntryResult.entryQualityTier = record.entryQualityTier;
+      if (env.ALERT_STATE) {
+        const telemetryKey = `telemetry:${symbol}:${record.at}:${record.setupMode}`;
+        await env.ALERT_STATE.put(telemetryKey, JSON.stringify(record));
+        if (decision === 'confirmed' || decision === 'missed') {
+          if (!state.pendingOutcomes) state.pendingOutcomes = [];
+          state.pendingOutcomes.push({
+            key: telemetryKey, horizons: buildPendingOutcomeHorizons(record.at),
+            entryPrice: record.triggerClose, direction: entryDirection,
+            entryAt: record.at, atr5m, // PR #103 PATH DIAGNOSTICS (MFE/MAE) - виж updateExcursion
+          });
+        }
+        // PR #104 - MR записът (по-горе) е бил записан ПРЕДИ да знаем дали TC
+        // СЪЩО ще влезе - patch-ваме го тук със същия bothQuality (fetch-merge-
+        // put, огледално на resolvePendingOutcomeHorizons wiring-а по-долу).
+        if (bothEntryThisTick && mrTelemetryRecordAt != null) {
+          const mrTelemetryKey = `telemetry:${symbol}:${mrTelemetryRecordAt}:mean_reversion`;
+          const rawMr = await env.ALERT_STATE.get(mrTelemetryKey);
+          if (rawMr) {
+            const mrRecord = JSON.parse(rawMr);
+            mrRecord.bothQuality = bothQuality;
+            await env.ALERT_STATE.put(mrTelemetryKey, JSON.stringify(mrRecord));
+          }
+        }
+      }
+    }
+    if (trendEntryResult.status === 'entry' || trendEntryResult.status === 'missed') {
+      trendEntryResult.direction = entryDirection;
+      trendEntryResult.priceAtArm = state.trendArmed.priceAtArm; // само за контекст в известието
+      // PR #105 - TC LIFECYCLE TELEMETRY: ARMED RESET (entry_confirmed/
+      // entry_missed) - реюзва tcTimeFromArmMin/tcPctMoveFromArm/
+      // tcAtrMoveFromArm, вече изчислени по-горе - без дублирана математика,
+      // за да съвпадат точно с ENTRY EVALUATION записа за същия момент.
+      if (env.ALERT_STATE) {
+        const terminalReason = trendEntryResult.status === 'entry' ? 'entry_confirmed' : 'entry_missed';
+        const terminalResetRecord = {
+          kind: 'armed_reset', symbol, direction: entryDirection, at: Date.now(),
+          armedAt: state.trendArmed.at, reason: terminalReason,
+          price: trendEntryResult.triggerClose, armedDurationMin: tcTimeFromArmMin,
+          pctMoveFromArm: tcPctMoveFromArm, atrMoveFromArm: tcAtrMoveFromArm,
+        };
+        await env.ALERT_STATE.put(`tclifecycle:${symbol}:${terminalResetRecord.at}:armed_reset`, JSON.stringify(terminalResetRecord));
+      }
+      state.trendArmed = null; // само СВОЯ слот - state.armed (MEAN REVERSION) остава непокътнат
+    }
+  }
+
+  // TELEMETRY - довършва "чакащите" outcome записи (+5м/+15м/+30м/+60м
+  // хоризонти, виж resolvePendingOutcomeHorizons по-горе) за ТАЗИ монета,
+  // реюзвайки вече изчислената `price` от тази обиколка - БЕЗ никакви
+  // допълнителни мрежови заявки. Изцяло observability, не влияе на ENTRY.
+  if (state.pendingOutcomes && state.pendingOutcomes.length && env.ALERT_STATE) {
+    const stillPending = [];
+    // PR #103 PATH DIAGNOSTICS (MFE/MAE) - последната вече изтеглена затворена
+    // 5м свещ на ТАЗИ монета/tick (БЕЗ нова мрежова заявка), за да актуализираме
+    // running MFE/MAE на всеки pending outcome ПРЕДИ да проверим кои хоризонти
+    // са due (виж updateExcursion по-горе).
+    const lastClosed5mForExcursion = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+    for (const p of state.pendingOutcomes) {
+      updateExcursion(p, lastClosed5mForExcursion);
+      const { updates, allResolved } = resolvePendingOutcomeHorizons(p, price);
+      if (Object.keys(updates).length) {
+        const raw = await env.ALERT_STATE.get(p.key);
+        if (raw) {
+          const rec = JSON.parse(raw);
+          Object.assign(rec, updates);
+          await env.ALERT_STATE.put(p.key, JSON.stringify(rec));
+        }
+      }
+      if (!allResolved) stillPending.push(p);
+    }
+    state.pendingOutcomes = stillPending;
+  }
+
+  await saveSymbolState(env, symbol, state);
+
+  return {
+    newFired: newFired.map(sig => sig.label),
+    activeFired: activeSignals.map(sig => sig.label),
+    price, support, resistance, ...confidence,
+    cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore,
+    sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore,
+    sparkOiDelta5m: oiMulti.delta5m, sparkOiDelta15m: oiMulti.delta15m, sparkOiDelta1h: oiMulti.delta1h,
+    sparkVolRatio: volAccel.ratio, sparkChg1h, sparkChg4h, sparkExtended: sparkExtension.extended,
+    takerBuyPressure: takerFlow.buyPressureNow, takerDelta5m: takerFlow.delta5m,
+    takerDelta15m: takerFlow.delta15m, takerDelta1h: takerFlow.delta1h,
+    flowWarmingKey, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore,
+    trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct,
+    reloadFired, reloadDirection,
+    vpPoc: vpPoc ? vpPoc.price : null,
+    vpVah: vpValueArea ? vpValueArea.vah : null,
+    vpVal: vpValueArea ? vpValueArea.val : null,
+    vpHvn: vpNodes.hvn, vpLvn: vpNodes.lvn,
+    targetFired, targetTier, targetDirection: targetScore.direction, targetScore: targetScore.score,
+    targetDistancePct: targetScore.distancePct, targetLevelStrengthPct: targetScore.levelStrengthPct,
+    targetPrice: targetScore.targetPrice, targetMagnets,
+    auctionFired, auctionTier, auctionDirection, auctionMaxScore,
+    auctionWidthPct: auctionScore.widthPct, auctionSkewRatio: auctionScore.skewRatio,
+    migrationFired, migrationTier, migrationDirection, migrationMaxScore,
+    migrationPct: migrationScore.migrationPct, migrationTodayPoc: migrationScore.todayPoc, migrationYesterdayPoc: migrationScore.yesterdayPoc,
+    liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore,
+    liqGravityDistancePct: liqGravityScore.distancePct, liqGravityClusterPrice: liqGravityScore.clusterPrice, liqGravityClusterUsd: liqGravityScore.clusterUsd,
+    vahEvent, valEvent,
+    setupFired, setupDirection: setupState.direction, setupScore: setupState.score, setupBreakdown: setupState.breakdown,
+    armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp,
+    entryResult,
+    trendSetupFired, trendSetupDirection: trendSetupState.direction, trendSetupScore: trendSetupState.score, trendSetupBreakdown: trendSetupState.breakdown,
+    trendArmedFired, trendArmedDirection,
+    trendEntryResult,
+  };
+}
+
+// ---- Пазарни сигнали следене (извиква се от scheduled()) -------------------
+// За разлика от checkDcaLevels(), сканира ВСИЧКИ записи от WATCHLIST -
+// entryPrice/side не са нужни тук (следим монетата, не конкретна позиция).
+// btcFlowContextOverride (DISCOVERY RADAR - Stage E) - опционален, добавен
+// БЕЗ да пипа стария call site (checkMarketSignals(env) от CORE си остава
+// байт-идентичен по поведение). Позволява на DISCOVERY-driven извикването
+// (различен watchlist, БЕЗ BTCUSDT в него - виж updateDiscoveryPromotion) да
+// преизползва ПОСЛЕДНИЯ реален BTC контекст от CORE-ния run (виж
+// persistBtcFlowContext по-долу), вместо да пада на neutral default само
+// защото BTCUSDT никога не е позиция 0 в pool-а.
+// Извлечена от checkMarketSignals (виж по-долу) - реалния scan + всички
+// независими известия за ЕДИН символ в едно cron изпълнение, байт-идентична
+// логика на преди рефакторинга (виж discussion-а: 35 символа последователно
+// удряха Cloudflare-овия wall-time лимит за scheduled(), ~24с wall само за
+// ~180мс реален CPU - чисто мрежово чакане). btcFlowContext се подава и се
+// връща (опреснен само когато pos е BTCUSDT) - позволява на checkMarketSignals
+// да обработи BTC последователно първи, а останалите паралелно на партиди.
+// sendWhatsApp вече е безопасен при паралелни извиквания (виж whatsAppChain
+// по-горе) - scheduled() вече пуска 6-те top-level задачи паралелно без
+// проблем за точно същата причина.
+async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
+    try {
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult, trendSetupFired, trendSetupDirection, trendSetupScore, trendSetupBreakdown, trendArmedFired, trendArmedDirection, trendEntryResult } = await scanSymbolSignals(env, pos.symbol);
+      if (pos.symbol === 'BTCUSDT') {
+        btcFlowContext = {
+          hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
+          oiDelta15m: sparkOiDelta15m, volRatio: sparkVolRatio,
+        };
+        if (env.ALERT_STATE) await env.ALERT_STATE.put('btcflowcontext', JSON.stringify(btcFlowContext));
+      }
+      // MIN_NOTIFY_SCORE - самотен слаб сигнал вече не праща цяло известие,
+      // само защото нещо е "активно" (виж бележката при MIN_NOTIFY_SCORE).
+      // ACTIVE SIGNAL MEMORY (т.4 от спецификацията) - стари сигнали от паметта
+      // могат да УСИЛЯТ резултата (влизат в longScore/shortScore чрез
+      // activeFired), но САМИ по себе си НЕ могат да породят ново известие -
+      // задължително трябва да има поне един НОВ сигнал (newFired) в този тик.
+      if (newFired.length > 0 && majority >= MIN_NOTIFY_SCORE) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const longShort = await fetchLongShortWorker(env, pos.symbol);
+        const lines = [`🔥 ${symbolNoUsdt}`];
+        if (price != null) lines.push(`💰 Цена: ${formatPrice(price)} USD`);
+        // Три ясни състояния (виж спецификацията, т.13, вече на точкова база -
+        // виж SIGNAL_WEIGHTS/SIGNAL_FAMILY_MAX): A) ясна посока + достатъчно
+        // точки (>= MIN_TP_SCORE) -> Посока+Сигнали%+Точки+TP1-5; B) ясна
+        // посока, но под MIN_TP_SCORE -> същото без TP, вместо това
+        // предупреждение; C) смесени сигнали (ratio не минава) -> "СМЕСЕНИ
+        // СИГНАЛИ", без TP. "% от сигналите"/"100% увереност" НЕ се пише
+        // никъде - процентът е ясно надписан "Сигнали: LONG X% / SHORT Y%",
+        // не вероятност за успех.
+        if (direction && ratioOK) {
+          lines.push(`📍 Посока: ${direction === 'long' ? 'LONG 🔵' : 'SHORT 🔴'}`);
+          lines.push(`📊 Сигнали: LONG ${longPct}% / SHORT ${shortPct}%`);
+          lines.push(`✅ Точки: ${longScore.toFixed(2)} LONG / ${shortScore.toFixed(2)} SHORT`);
+          if (enoughScore) {
+            if (price != null) {
+              calcTakeProfitLevels(price, direction).forEach((tp, i) => lines.push(`🎯 TP${i + 1}: ${formatPrice(tp)} USD`));
+            }
+          } else {
+            lines.push(`⚠️ Само ${majority.toFixed(2)} точки — TP не се показва`);
+          }
+        } else {
+          lines.push(`⚠️ СМЕСЕНИ СИГНАЛИ`);
+          lines.push(`📊 Сигнали: LONG ${longPct}% / SHORT ${shortPct}%`);
+          lines.push(`✅ Точки: ${longScore.toFixed(2)} LONG / ${shortScore.toFixed(2)} SHORT`);
+        }
+        if (resistance != null) lines.push(`🔺 Съпротива: ${formatPrice(resistance)} USD`);
+        if (support != null) lines.push(`🔻 Подкрепа: ${formatPrice(support)} USD`);
+        if (longShort) lines.push(`⚖️ Long/Short: ${longShort.longPct}% / ${longShort.shortPct}%`);
+        lines.push('──────────');
+        // Две отделни секции (т.17) - "Нов сигнал" е ПРИЧИНАТА за това известие
+        // точно сега; "Активни потвърждения" са по-стари сигнали от паметта
+        // (виж ACTIVE SIGNAL MEMORY), които все още усилват точковия резултат,
+        // но сами не биха пратили известие - за да е ясно кое е новото.
+        lines.push('🆕 Нов сигнал:');
+        lines.push(...newFired);
+        const previouslyActive = activeFired.filter(label => !newFired.includes(label));
+        if (previouslyActive.length > 0) {
+          lines.push('🧠 Активни потвърждения:');
+          lines.push(...previouslyActive);
+        }
+        batch.push(lines.join('\n'));
+      }
+      // IDEA 02 - "TARGET / DESTINATION SCORE" (виж calcTargetScore по-горе) -
+      // изцяло отделно известие, огледално на FLOW WARMING/TRAP. POC е целта
+      // (mean-reversion магнит), HVN nodes-ите по пътя са само информативни
+      // допълнителни магнити - НЕ влизат в score-а. Score-ът е чисто
+      // разстояние+сила на нивото, БЕЗ OI/CVD hard factor изискване (потвърдено
+      // изрично с потребителя - виж дискусията за идея 02).
+      if (targetFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const targetLines = [
+          `${TARGET_LABELS[targetTier]} ${symbolNoUsdt} ${targetDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `TARGET SCORE: ${targetScore}/5`,
+          `POC (цел): ${formatPrice(targetPrice)} USD · Разстояние: ${fmtPct(targetDistancePct)}`,
+          `Сила на нивото: ${targetLevelStrengthPct != null ? targetLevelStrengthPct.toFixed(1) + '%' : '--'} от обема`,
+        ];
+        if (targetMagnets.length) {
+          targetLines.push(`Магнити по пътя: ${targetMagnets.map(m => formatPrice(m.price)).join(' → ')}`);
+        }
+        targetLines.push(`⚠️ Ориентировъчна цел (mean-reversion) - НЕ Е entry сигнал`);
+        batch.push(targetLines.join('\n'));
+      }
+      // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore по-горе) -
+      // изцяло отделно известие, огледално на TRAP. Тясна+скосена Value Area,
+      // потвърдена от OI/CVD в посоката на скоса - "IMBALANCED/TREND" пазар,
+      // не двупосочен/balanced.
+      if (auctionFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const auctionLines = [
+          `${AUCTION_LABELS[auctionTier]} ${symbolNoUsdt} ${auctionDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `AUCTION SCORE: ${auctionMaxScore}/4`,
+          `Value Area ширина: ${auctionWidthPct != null ? auctionWidthPct.toFixed(1) + '%' : '--'} от POC · Skew: ${auctionSkewRatio != null ? (auctionSkewRatio * 200).toFixed(0) + '%' : '--'}`,
+          `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
+          `⚠️ Тесен/скосен профил - вероятен trend режим, НЕ Е entry сигнал сам по себе си`,
+        ];
+        batch.push(auctionLines.join('\n'));
+      }
+      // IDEA 04 - "VALUE MIGRATION" (виж calcValueMigrationScore по-горе) -
+      // изцяло отделно известие, огледално на TRAP/AUCTION. Сравнява POC на
+      // днешния (незавършен) профил с вчерашния (затворен), потвърдено от
+      // OI/CVD в посоката на миграцията.
+      if (migrationFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const migrationLines = [
+          `${MIGRATION_LABELS[migrationTier]} ${symbolNoUsdt} ${migrationDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `VALUE MIGRATION SCORE: ${migrationMaxScore}/4`,
+          `Вчерашен POC: ${formatPrice(migrationYesterdayPoc)} USD → Днешен POC: ${formatPrice(migrationTodayPoc)} USD (${fmtPct(migrationPct)})`,
+          `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
+          `⚠️ Value migration - НЕ Е entry сигнал сам по себе си`,
+        ];
+        batch.push(migrationLines.join('\n'));
+      }
+      // IDEA 08 - "LIQUIDATION GRAVITY" (виж calcLiquidationGravityScore
+      // по-горе) - изцяло отделно известие, огледално на TRAP/AUCTION/
+      // MIGRATION. Профилът е ХИПОТЕЗА за тестване (натрупан от реални
+      // станали ликвидации, НЕ прогнозен heatmap) - дали цена, отдалечена от
+      // зона с много исторически ликвидации, се връща пак там, предстои да
+      // видим емпирично.
+      if (liqGravityFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const liqGravityLines = [
+          `${LIQ_GRAVITY_LABELS[liqGravityTier]} ${symbolNoUsdt} ${liqGravityDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `LIQUIDATION GRAVITY SCORE: ${liqGravityMaxScore}/4`,
+          `Клъстер: ${formatPrice(liqGravityClusterPrice)} USD (${liqGravityClusterUsd != null ? Math.round(liqGravityClusterUsd).toLocaleString('en-US') : '--'} USD натрупани) · Разстояние: ${fmtPct(liqGravityDistancePct)}`,
+          `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
+          `⚠️ Хипотеза за тестване (историческа ликвидационна зона) - НЕ Е entry сигнал`,
+        ];
+        batch.push(liqGravityLines.join('\n'));
+      }
+      // AUTO VAH/VAL STRUCTURE DETECTOR (виж calcVahValStructureEvent по-горе) -
+      // изцяло отделни известия, независими от TARGET (не се гейтват едно
+      // друго). Ако TARGET има активен tier за същата монета, показваме го
+      // информативно - конвергенцията (напр. TARGET SHORT + VAH REJECTION) е
+      // точно комбинацията, която си заслужава наблюдение (виж дискусията).
+      const symbolNoUsdt = pos.symbol.replace('USDT', '');
+      const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+      for (const [ev, levelName] of [[vahEvent, 'VAH'], [valEvent, 'VAL']]) {
+        if (!ev.fired) continue;
+        const labelKey = `${levelName.toLowerCase()}:${ev.eventType}`;
+        const lines = [
+          `${VAHVAL_LABELS[labelKey]} ${symbolNoUsdt}`,
+          `${levelName} ниво: ${formatPrice(ev.level)} USD · Разстояние при close: ${ev.distancePct.toFixed(2)}%`,
+          `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
+        ];
+        if (targetTier !== 'none') {
+          lines.push(`🎯 TARGET: ${targetDirection === 'long' ? 'LONG' : 'SHORT'} ${targetTier.toUpperCase()} (за същата монета)`);
+        }
+        lines.push(`⚠️ Структурно събитие - НЕ Е entry сигнал сам по себе си`);
+        batch.push(lines.join('\n'));
+      }
+      // ENTRY ENGINE - ЕТАП 1: "SETUP" (виж calcSetupState по-горе) - ПЪРВИЯТ
+      // слой от последователността TARGET -> SETUP -> ARMED -> ENTRY
+      // CONFIRMED. Все още НЕ Е entry - означава само "тази монета вече
+      // заслужава внимание". Пали САМО при нова активация/смяна на посоката
+      // (виж setupCanFire), не при промяна на quality score-а.
+      if (setupFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const b = setupBreakdown;
+        const setupLines = [
+          `👀 SETUP ${setupDirection === 'long' ? 'LONG' : 'SHORT'} ${symbolNoUsdt}`,
+          `Base: TARGET + VAH/VAL ${setupDirection === 'long' ? 'reclaim' : 'rejection'} ✓`,
+          `TRAP: ${b.trap ? '✓' : '—'}`,
+          `AUCTION QUALITY: ${b.auction ? '✓' : '—'}`,
+          `VALUE MIGRATION: ${b.migration ? '✓' : '—'}`,
+          `SETUP QUALITY: ${setupScore}/5`,
+          `⚠️ Все още НЕ Е entry - следи за развитие (Етап 2: ARMED)`,
+        ];
+        batch.push(setupLines.join('\n'));
+      }
+      // ENTRY ENGINE - ЕТАП 2: "ARMED" (виж calcArmedTrigger по-горе) - чисто
+      // структурно, sticky (не трепка при всяка промяна на swing точките).
+      // Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3).
+      if (armedFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const reasons = [];
+        if (armedDirection === 'short') {
+          if (armedLowerHigh) reasons.push('Lower High потвърден');
+          if (armedStructureLossDown) reasons.push('Structure loss (5м close под swing low)');
+        } else {
+          if (armedHigherLow) reasons.push('Higher Low потвърден');
+          if (armedStructureReclaimUp) reasons.push('Structure reclaim (5м close над swing high)');
+        }
+        const armedLines = [
+          `⚡ ARMED ${armedDirection === 'long' ? 'LONG' : 'SHORT'} ${symbolNoUsdt}`,
+          reasons.join(' + '),
+          `⚠️ Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3)`,
+        ];
+        batch.push(armedLines.join('\n'));
+      }
+      // ENTRY ENGINE - ЕТАП 3: "ENTRY TRIGGER" (виж calcEntryTrigger по-горе) -
+      // финалният преход: 🔥 ENTRY CONFIRMED ("ТОВА Е ВХОД") или ⚠️ ENTRY
+      // MISSED (посоката е вярна, но цената вече е избягала твърде далеч от
+      // структурата - WAIT RETEST, бъдещ Етап 4).
+      if (entryResult.status === 'entry' || entryResult.status === 'missed') {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const dirLabel = entryResult.direction === 'long' ? 'LONG' : 'SHORT';
+        if (entryResult.status === 'entry') {
+          // Козметично форматиране (по искане на потребителя) - целта е
+          // финалният ENTRY CONFIRMED да се набива на очи сред останалите
+          // WhatsApp известия (SETUP/ARMED/PHASE CYCLE и т.н.), защото това е
+          // единственият момент с конкретна входна цена за forward тестване.
+          // Данните вътре са same - само визуалният layout е нов.
+          const entryLines = [
+            `🚨🚨🚨 ENTRY NOW — CONFIRMED 🚨🚨🚨`,
+            ``,
+            `🔥 ${symbolNoUsdt}`,
+            entryResult.direction === 'long' ? '🔵 LONG' : '🔴 SHORT',
+            ``,
+            `🔄 MODE: MEAN REVERSION`,
+            ``,
+            `💰 ENTRY: ${formatPrice(entryResult.triggerClose)} USD`,
+            `⭐ ENTRY SCORE: ${entryResult.score}/5`,
+            ``,
+            `5M TRIGGER: ✓`,
+            `15M CONFIRMATION: ${entryResult.confirmation15m ? '✓' : '—'}`,
+            `FLOW: ${entryResult.flowBoost ? '✓' : '—'}`,
+            `HTF CONTEXT: ${entryResult.htfAligned ? '✓' : '—'}`,
+            // PR #104/#119 - BOTH QUALITY (виж classifyBothQuality по-горе) -
+            // маркиране за ВСЯКА TC+MR same-tick BOTH комбинация (не само
+            // tc3_mr3) - данните показват, че всички both комбинации
+            // исторически се представят по-добре от самостоятелните TC/MR.
+            ...(entryResult.bothQuality != null ? [``, `🌟 BOTH QUALITY: ${entryResult.bothQuality === 'degraded' ? 'DEGRADED (tc3_mr3)' : 'NORMAL'} (TC+MR едновременно на символа)`] : []),
+            ``,
+            // PR #112 - ENTRY QUALITY TIER (виж classifyEntryQuality по-горе) -
+            // observation-only score/tier, показан тук само информативно (НЕ
+            // гейт/филтър на кои сигнали се пращат - decision логиката е same).
+            `🏆 QUALITY TIER: ${entryResult.entryQualityTier ?? '—'} (score ${entryResult.entryQualityScore ?? '—'})`,
+            ``,
+            `⚠️ MAX CHASE: ${formatPrice(entryResult.structRef)} USD`,
+          ];
+          // PR #119 - D-tier confirmed входове исторически се представят
+          // по-слабо (виж entryQualityStats) - НЕ се пращат в WhatsApp, но
+          // ENTRY decision/telemetry логиката по-горе е напълно непроменена
+          // (записът вече е в records/pending outcomes независимо от това).
+          if (entryResult.entryQualityTier !== 'D') {
+            batch.push(entryLines.join('\n'));
+          }
+        } else {
+          const missedLines = [
+            `⚠️ ENTRY MISSED ${symbolNoUsdt}`,
+            dirLabel,
+            `Цената вече е твърде отдалечена от структурата (${formatPrice(entryResult.structRef)} USD)`,
+            `Trigger close: ${formatPrice(entryResult.triggerClose)} USD`,
+            `WAIT RETEST`,
+          ];
+          batch.push(missedLines.join('\n'));
+        }
+      }
+      // TREND CONTINUATION SETUP/ARMED/ENTRY - огледални известия на MEAN
+      // REVERSION блоковете по-горе, но управлявани от НАПЪЛНО отделни booleans
+      // (trendSetupFired/trendArmedFired/trendEntryResult) - структурно не могат
+      // да потиснат/overwrite-нат известие на противоположния mode, защото не
+      // споделят hysteresis/cooldown state с mean_reversion блоковете.
+      if (trendSetupFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const b = trendSetupBreakdown;
+        const trendSetupLines = [
+          `👀 SETUP ${trendSetupDirection === 'long' ? 'LONG' : 'SHORT'} ${symbolNoUsdt} (TREND CONTINUATION)`,
+          `Base: confident direction majority ✓`,
+          `TRAP: ${b.trap ? '✓' : '—'}`,
+          `AUCTION QUALITY: ${b.auction ? '✓' : '—'}`,
+          `VALUE MIGRATION: ${b.migration ? '✓' : '—'}`,
+          `SETUP QUALITY: ${trendSetupScore}/5`,
+          `⚠️ Все още НЕ Е entry - следи за развитие (Етап 2: ARMED)`,
+        ];
+        batch.push(trendSetupLines.join('\n'));
+      }
+      if (trendArmedFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const trendArmedLines = [
+          `⚡ ARMED ${trendArmedDirection === 'long' ? 'LONG' : 'SHORT'} ${symbolNoUsdt} (TREND CONTINUATION)`,
+          `⚠️ Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3)`,
+        ];
+        batch.push(trendArmedLines.join('\n'));
+      }
+      if (trendEntryResult.status === 'entry' || trendEntryResult.status === 'missed') {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const dirLabel = trendEntryResult.direction === 'long' ? 'LONG' : 'SHORT';
+        if (trendEntryResult.status === 'entry') {
+          // Козметично форматиране (виж бележката при mean_reversion ENTRY
+          // CONFIRMED по-горе) - огледално, само MODE-редът е различен.
+          const entryLines = [
+            `🚨🚨🚨 ENTRY NOW — CONFIRMED 🚨🚨🚨`,
+            ``,
+            `🔥 ${symbolNoUsdt}`,
+            trendEntryResult.direction === 'long' ? '🔵 LONG' : '🔴 SHORT',
+            ``,
+            `📈 MODE: TREND CONTINUATION`,
+            ``,
+            `💰 ENTRY: ${formatPrice(trendEntryResult.triggerClose)} USD`,
+            `⭐ ENTRY SCORE: ${trendEntryResult.score}/5`,
+            ``,
+            `5M TRIGGER: ✓`,
+            `15M CONFIRMATION: ${trendEntryResult.confirmation15m ? '✓' : '—'}`,
+            `FLOW: ${trendEntryResult.flowBoost ? '✓' : '—'}`,
+            `HTF CONTEXT: ${trendEntryResult.htfAligned ? '✓' : '—'}`,
+            // PR #104/#119 - BOTH QUALITY (виж classifyBothQuality по-горе) -
+            // маркиране за ВСЯКА TC+MR same-tick BOTH комбинация (не само
+            // tc3_mr3) - данните показват, че всички both комбинации
+            // исторически се представят по-добре от самостоятелните TC/MR.
+            ...(trendEntryResult.bothQuality != null ? [``, `🌟 BOTH QUALITY: ${trendEntryResult.bothQuality === 'degraded' ? 'DEGRADED (tc3_mr3)' : 'NORMAL'} (TC+MR едновременно на символа)`] : []),
+            ``,
+            // PR #112 - ENTRY QUALITY TIER (виж classifyEntryQuality по-горе) -
+            // observation-only score/tier, показан тук само информативно (НЕ
+            // гейт/филтър на кои сигнали се пращат - decision логиката е same).
+            `🏆 QUALITY TIER: ${trendEntryResult.entryQualityTier ?? '—'} (score ${trendEntryResult.entryQualityScore ?? '—'})`,
+            ``,
+            `⚠️ MAX CHASE: ${formatPrice(trendEntryResult.structRef)} USD`,
+          ];
+          // PR #119 - D-tier confirmed входове исторически се представят
+          // по-слабо (виж entryQualityStats) - НЕ се пращат в WhatsApp, но
+          // ENTRY decision/telemetry логиката по-горе е напълно непроменена
+          // (записът вече е в records/pending outcomes независимо от това).
+          if (trendEntryResult.entryQualityTier !== 'D') {
+            batch.push(entryLines.join('\n'));
+          }
+        } else {
+          const missedLines = [
+            `⚠️ ENTRY MISSED ${symbolNoUsdt} (TREND CONTINUATION)`,
+            dirLabel,
+            `Цената вече е твърде отдалечена от структурата (${formatPrice(trendEntryResult.structRef)} USD)`,
+            `Trigger close: ${formatPrice(trendEntryResult.triggerClose)} USD`,
+            `WAIT RETEST`,
+          ];
+          batch.push(missedLines.join('\n'));
+        }
+      }
+      // PHASE CYCLE ENGINE - изцяло отделно известие от горното, независимо
+      // от MIN_NOTIFY_SCORE/newFired на класическия LONG/SHORT поток. Праща се
+      // САМО при реална смяна на фазата (виж cyclePhaseCanFire в scanSymbolSignals).
+      if (cyclePhaseChanged) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const cycleLines = [
+          `🔮 ЦИКЪЛ: ${symbolNoUsdt}`,
+          `Фаза: ${PHASE_LABELS[cyclePhase]}`,
+          `LONG SCORE: ${cycleLongScore}/9`,
+          `SHORT SCORE: ${cycleShortScore}/9`,
+        ];
+        batch.push(cycleLines.join('\n'));
+      }
+      // SPARK - ранно откриване ПРЕДИ импулса (виж бележката при
+      // calcSparkScore по-горе). Изцяло отделно известие, огледално на
+      // "🔮 ЦИКЪЛ" - праща се САМО при нов/променен активен SPARK сигнал
+      // (sparkFired, виж sparkCanFire), никога при изчистване ('none' не
+      // може да е sparkKey, който предизвиква firing - виж scanSymbolSignals).
+      if (sparkFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        // IDEA 07 - "RELATIVE FLOW" - добавен ред към вече съществуващото SPARK
+        // известие (не ново отделно съобщение, за да не създава нов спам поток -
+        // виж git history за коментара за EARLY WATCH спама). SHADOW MODE -
+        // чисто информативно, не влияе на sparkFired/sparkKey firing логиката.
+        const relativeFlow = calcRelativeFlow({
+          coinHasHardFactor: sparkTier !== 'none', coinDirection: sparkDirection,
+          btcHasHardFactor: btcFlowContext.hasHardFactor, btcDirection: btcFlowContext.direction,
+          coinOiDelta15m: sparkOiDelta15m, btcOiDelta15m: btcFlowContext.oiDelta15m,
+          coinVolRatio: sparkVolRatio, btcVolRatio: btcFlowContext.volRatio,
+        });
+        const sparkLines = [
+          `${SPARK_LABELS[sparkTier]} ${symbolNoUsdt} ${sparkDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `SPARK SCORE: ${sparkMaxScore}/7`,
+          `OI 5м: ${fmtPct(sparkOiDelta5m)} · OI 15м: ${fmtPct(sparkOiDelta15m)} · OI 1ч: ${fmtPct(sparkOiDelta1h)}`,
+          `VOL 1ч/4ч ср.: ${sparkVolRatio != null ? sparkVolRatio.toFixed(2) + 'x' : '--'} · Цена 1ч: ${fmtPct(sparkChg1h)}`,
+        ];
+        if (RELATIVE_FLOW_LABELS[relativeFlow.classification]) {
+          sparkLines.push(`${RELATIVE_FLOW_LABELS[relativeFlow.classification]} спрямо BTC`);
+        }
+        sparkLines.push(`⚠️ Все още НЕ Е entry - следи за развитие`);
+        batch.push(sparkLines.join('\n'));
+      }
+      // FLOW WARMING (IDEA 05, виж calcFlowWarmingScore по-горе) - изцяло
+      // отделно известие, огледално на SPARK/"🔮 ЦИКЪЛ" - праща се САМО при
+      // нов/променен активен flow warming сигнал (flowWarmingFired, виж
+      // flowWarmingCanFire), независимо от sparkFired/sparkKey - целта е да
+      // хване монети, при които OI+CVD вече ускоряват заедно, ПРЕДИ SPARK
+      // да е събрал достатъчно "меки" точки, за да гръмне.
+      if (flowWarmingFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const flowWarmingLines = [
+          `${FLOW_WARMING_LABELS[flowWarmingTier]} ${symbolNoUsdt} ${flowWarmingDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `FLOW WARMING SCORE: ${flowWarmingMaxScore}/4`,
+          `OI 15м: ${fmtPct(sparkOiDelta15m)} · CVD (taker) 15м: ${fmtPct(takerDelta15m)}`,
+          `VOL 1ч/4ч ср.: ${sparkVolRatio != null ? sparkVolRatio.toFixed(2) + 'x' : '--'} · Цена 1ч: ${fmtPct(sparkChg1h)}`,
+          `⚠️ Все още НЕ Е entry - следи за развитие`,
+        ];
+        batch.push(flowWarmingLines.join('\n'));
+        // Лека diagnostic telemetry бройка (виж discussion-а - колко често
+        // реално прекосява прага FLOW WARMING, особено за major монети) -
+        // СЪЩИЯ гейт като самото известие (flowWarmingFired, hysteresis-
+        // гейтнат edge-trigger), не пресмята нищо допълнително, нула нови
+        // мрежови заявки. Собствен try/catch - грешка тук не бива да спира
+        // самото известие по-горе (вече е в batch-а).
+        if (env.ALERT_STATE) {
+          try {
+            const flowWarmingEventRecord = {
+              symbol: pos.symbol, direction: flowWarmingDirection, tier: flowWarmingTier,
+              score: flowWarmingMaxScore, oiDelta15m: sparkOiDelta15m, takerDelta15m,
+              volRatio: sparkVolRatio, chg1h: sparkChg1h, coinTier: getSparkCoinTier(symbolNoUsdt),
+              // Цената от СЪЩИЯ market snapshot (последната затворена 5м свещ,
+              // виж `price` в scanSymbolSignals), вече изчислена - нула нови
+              // мрежови заявки. Валидирана (краен, положителен number) - при
+              // невалидна стойност пазим null, НЕ блокираме известието по-горе
+              // (то вече е в batch-а, независимо от тази проверка). За бъдеща
+              // FLOW WARMING -> SETUP -> ARMED -> ENTRY съпоставка (lead time
+              // + % движение на цената) - виж discussion-а.
+              price: (Number.isFinite(price) && price > 0) ? price : null,
+              at: Date.now(),
+            };
+            await env.ALERT_STATE.put(`flowwarmingevent:${pos.symbol}:${flowWarmingEventRecord.at}`, JSON.stringify(flowWarmingEventRecord));
+          } catch (e) { console.error(`FLOW WARMING event telemetry write error: ${e.message}`); }
+        }
+      }
+      // TRAP (IDEA 01, виж calcTrapScore по-горе) - изцяло отделно известие,
+      // огледално на SPARK/FLOW WARMING. ИЗРИЧНО НЕ Е entry сигнал (виж
+      // предупредителния ред по-долу) - само ранно предупреждение за
+      // потенциален капан (sweep + reclaim + CVD поглъщане на противоположния
+      // агресивен поток) - потвърждаването/невалидирането му идва от
+      // следващото реално движение, не от самия TRAP сигнал.
+      if (trapFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+        const trapLines = [
+          `${TRAP_LABELS[trapTier]} ${symbolNoUsdt} ${trapDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `TRAP SCORE: ${trapMaxScore}/4`,
+          `OI: ${fmtPct(oiDeltaPct)} · CVD (taker) 5м: ${fmtPct(takerDelta5m)}`,
+          `⚠️ САМО ранно предупреждение - НЕ Е entry сигнал, изчакай потвърждение`,
+        ];
+        batch.push(trapLines.join('\n'));
+      }
+      // RELOAD (IDEA 06, виж calcSecondImpulseTrigger по-горе) - изцяло
+      // отделно известие. За разлика от SPARK/FLOW WARMING/TRAP, това е
+      // реален, независим сигнал за ВТОРИ вход (не DCA, не просто watch) -
+      // IMPULSE MEMORY (state.reloadWindow) вече е потвърдила контролиран
+      // pullback + reclaim + обем + CVD преди да гръмне.
+      if (reloadFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        const reloadLines = [
+          `🔁 RELOAD ${symbolNoUsdt} ${reloadDirection === 'long' ? '▲ LONG' : '▼ SHORT'}`,
+          `Втори вход след контролиран pullback (IMPULSE MEMORY)`,
+        ];
+        if (price != null) reloadLines.push(`Цена: ${formatPrice(price)} USD`);
+        reloadLines.push(`⚠️ Провери графиката преди вход - независим сигнал, не DCA`);
+        batch.push(reloadLines.join('\n'));
+      }
+    } catch (e) { console.error(`Signal scan error for ${pos.symbol}: ${e.message}`); }
+  return btcFlowContext;
+}
+
+// IDEA 07 - "RELATIVE FLOW" (виж calcRelativeFlow по-горе) - BTC трябва да се
+// обработи ПРЕДИ останалите (резултатът му се преизползва от тях в СЪЩИЯ тик,
+// виж processWatchlistSymbol по-горе) - затова винаги първо, последователно,
+// сам. Останалите символи вече НЕ са задължени да чакат един друг (единствената
+// реална зависимост беше BTC), затова се обработват паралелно на партиди -
+// виж SYMBOL_CHUNK_SIZE по-долу защо партиди, не всички наведнъж.
+async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOverride = null) {
+  let btcFlowContext = btcFlowContextOverride || { hasHardFactor: false, direction: 'long', oiDelta15m: null, volRatio: null };
+  const btcPos = watchlist.find((p) => p.symbol === 'BTCUSDT');
+  const restPositions = btcPos ? watchlist.filter((p) => p.symbol !== 'BTCUSDT') : watchlist;
+  // batch - локален за ТОВА извикване на checkMarketSignals (НЕ module-scope),
+  // защото runDiscoveryFullAnalysis вика checkMarketSignals ВТОРИ път (за
+  // pool watchlist-а) паралелно на този основен извикване (виж Promise.all в
+  // scheduled()) - споделен масив би разбъркал известията на двете отделни
+  // извиквания. Виж flushWhatsAppBatch по-горе защо изобщо батчваме.
+  const batch = [];
+  if (btcPos) {
+    btcFlowContext = await processWatchlistSymbol(env, btcPos, btcFlowContext, batch);
+  }
+  // SYMBOL_CHUNK_SIZE - предпазливо избран (виж discussion-а) - паралелизира
+  // символите на малки партиди вместо "всички наведнъж", за да не претовари
+  // env.RELAY_URL с рязък burst от конкурентни заявки (всеки символ прави ~12
+  // fetch-а към релея в 2 вълни). Може да се вдигне по-късно след наблюдение.
+  const SYMBOL_CHUNK_SIZE = 6;
+  for (let i = 0; i < restPositions.length; i += SYMBOL_CHUNK_SIZE) {
+    const chunk = restPositions.slice(i, i + SYMBOL_CHUNK_SIZE);
+    await Promise.all(chunk.map((pos) => processWatchlistSymbol(env, pos, btcFlowContext, batch)));
+  }
+  await flushWhatsAppBatch(env, batch);
+}
+
+// ---- Macro SQUEEZE следене (извиква се от scheduled()) ---------------------
+// Вариант 2 от предложението "ПРЕДЛОЖЕНИЯ ЗА СЛЕДВАЩА АКТУАЛИЗАЦИЯ" (Priority 1,
+// FINAL STATE ENGINE) - Scanner UI (calcSignal() в signal-logic.js) и Worker-ът
+// мерят фундаментално различни неща (macro/funding-базирано срещу candle-
+// детектори + SIGNAL_WEIGHTS), затова пълно обединяване в единна логика не е
+// прост рефакторинг (виж PR #56). Вместо да пипаме съществуващите детектори/
+// SIGNAL_WEIGHTS/SIGNAL_FAMILY_MAX/cooldown-и, Worker-ът получава ТОЧНО СЪЩАТА
+// SQUEEZE проверка като Scanner UI-то (funding rate + балансирани Long/Short
+// позиции), напълно отделна и независима от съществуващия LONG/SHORT поток -
+// собствен KV state ключ (macrosqueeze:SYMBOL, не sigstate:SYMBOL), собствен
+// cooldown, собствено WhatsApp известие. НЕ участва в MIN_NOTIFY_SCORE/
+// newFired/longScore/shortScore на checkMarketSignals по-горе.
+const MACRO_SQUEEZE_FUNDING_MIN = 0.06; // същия праг като calcSignal() в signal-logic.js:570
+const MACRO_SQUEEZE_BALANCE_MAX_DEV = 15; // |longPct-50| < 15, същия праг
+// Funding rate се обновява на Binance на всеки 8ч, а не при всеки 5-мин cron
+// тик - 4ч cooldown е достатъчен да не спамва многократно, докато условието
+// остане вярно между две funding обновявания.
+const MACRO_SQUEEZE_COOLDOWN_MIN = 240;
+
+function macroSqueezeCanFire(state) {
+  const s = state.macroSqueezeCooldown;
+  if (!s) return true;
+  return (Date.now() - s.at) >= MACRO_SQUEEZE_COOLDOWN_MIN * 60000;
+}
+function markMacroSqueezeFired(state) {
+  state.macroSqueezeCooldown = { at: Date.now() };
+}
+async function loadMacroSqueezeState(env, symbol) {
+  if (!env.ALERT_STATE) return {};
+  const raw = await env.ALERT_STATE.get(`macrosqueeze:${symbol}`);
+  return raw ? JSON.parse(raw) : {};
+}
+async function saveMacroSqueezeState(env, symbol, state) {
+  if (!env.ALERT_STATE) return;
+  await env.ALERT_STATE.put(`macrosqueeze:${symbol}`, JSON.stringify(state));
+}
+
+async function checkMacroSqueeze(env, watchlist = WATCHLIST) {
+  for (const pos of watchlist) {
+    try {
+      const [funding, longShort] = await Promise.all([
+        fetchFundingWorker(env, pos.symbol),
+        fetchLongShortWorker(env, pos.symbol),
+      ]);
+      if (funding == null || !longShort) continue;
+      const longPct = parseFloat(longShort.longPct);
+      const isSqueeze = funding > MACRO_SQUEEZE_FUNDING_MIN && Math.abs(longPct - 50) < MACRO_SQUEEZE_BALANCE_MAX_DEV;
+      if (!isSqueeze) continue;
+      const state = await loadMacroSqueezeState(env, pos.symbol);
+      if (!macroSqueezeCanFire(state)) continue;
+      const symbolNoUsdt = pos.symbol.replace('USDT', '');
+      const lines = [
+        '🟡 SQUEEZE',
+        symbolNoUsdt,
+        `⚡ Funding: ${funding.toFixed(4)}%`,
+        `⚖️ Long/Short: ${longShort.longPct}% / ${longShort.shortPct}%`,
+        '──────────',
+        'Натрупване/напрежение (екстремен funding + балансирани позиции), без ясна LONG/SHORT посока още',
+      ];
+      await sendWhatsApp(env, lines.join('\n'));
+      markMacroSqueezeFired(state);
+      await saveMacroSqueezeState(env, pos.symbol, state);
+    } catch (e) { console.error(`Macro squeeze check error for ${pos.symbol}: ${e.message}`); }
+  }
+}
+
+// ---- DCA ниво следене (извиква се от scheduled()) --------------------------
+async function checkDcaLevels(env, watchlist = WATCHLIST) {
+  for (const pos of watchlist) {
+    if (!pos.entryPrice || !pos.side) continue;
+    try {
+      const r = await fetchWithTimeout(`${env.RELAY_URL}/ticker?symbol=${pos.symbol}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+      const d = await r.json();
+      const price = parseFloat(d.price);
+      if (!price) continue;
+      const symbolNoUsdt = pos.symbol.replace('USDT','');
+      const steps = calcDCALevels(pos.entryPrice, pos.side, symbolNoUsdt);
+      for (const step of steps) {
+        if (step.step === 0) continue; // ВХОД е референтна точка, не тригер
+        const crossed = pos.side === 'long' ? price <= step.levelPrice : price >= step.levelPrice;
+        if (!crossed) continue;
+        const kvKey = `dca:${pos.symbol}:${step.step}`;
+        const last = env.ALERT_STATE ? await env.ALERT_STATE.get(kvKey) : null;
+        if (last && (Date.now() - parseInt(last, 10)) < DCA_ALERT_COOLDOWN_MS) continue;
+        const dirLabel = pos.side === 'long' ? 'LONG' : 'SHORT';
+        await sendWhatsApp(env, `📉 ${symbolNoUsdt} (${dirLabel}) достигна ${step.label}\nЦена: ${formatPrice(price)} USD\nНиво: ${formatPrice(step.levelPrice)} USD\nСредна цена след ниво: ${formatPrice(step.avgPrice)} USD`);
+        if (env.ALERT_STATE) await env.ALERT_STATE.put(kvKey, String(Date.now()));
+      }
+    } catch (e) { console.error(`DCA check error for ${pos.symbol}: ${e.message}`); }
+  }
+}
+
+// Класифицира реакция на ЕДНА (последната затворена) 15м свещ спрямо
+// зададена ръчна зона [levelLow, levelHigh] - виж бележката при
+// PRICE_LEVELS_WATCHLIST по-горе за пълния контекст на 'reclaim'/'rejection'.
+function calcLevelReaction(candle, levelLow, levelHigh) {
+  if (!candle || levelLow == null || levelHigh == null) return 'none';
+  if (candle.close > levelHigh) return 'reclaim';
+  if (candle.high >= levelLow && candle.close < levelLow) return 'rejection';
+  return 'none';
+}
+
+// Чете последно записаното PRICE LEVEL състояние от KV. Поддържа и стария
+// формат (`reaction:openTime`, plain string) за backward-compat веднага след
+// deploy - връща само reaction частта, timestamp-ът не участва в dedup-а.
+function parsePriceLevelState(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.reaction === 'string') return parsed.reaction;
+  } catch (e) { /* стар формат - "reaction:openTime" plain string */ }
+  const legacyMatch = /^(reclaim|rejection)/.exec(raw);
+  return legacyMatch ? legacyMatch[1] : null;
+}
+
+// State-transition dedup (НЕ cooldown) - известие само при РЕАЛНА смяна на
+// състоянието спрямо последно записаното, независимо колко свещи е траяло:
+// NEUTRAL/REJECTION -> RECLAIM = SEND, RECLAIM -> RECLAIM = NO SEND,
+// RECLAIM -> REJECTION = SEND, REJECTION -> REJECTION = NO SEND,
+// REJECTION -> RECLAIM = SEND. Cooldown умишлено не се ползва - той само би
+// скрил проблема и след изтичането му непроменено състояние пак би пратило.
+function shouldNotifyPriceLevel(lastReaction, reaction) {
+  return lastReaction !== reaction;
+}
+
+// ---- Ръчни ценови нива следене (извиква се от scheduled()) -----------------
+// Worker-only (огледално на checkDcaLevels по-горе - собствен KV namespace
+// `pricelevel:`, НЕ споделя `sigstate:` с scanSymbolSignals, за да няма race
+// condition между двете паралелни ctx.waitUntil извиквания в scheduled()).
+async function checkPriceLevels(env, watchlist = PRICE_LEVELS_WATCHLIST) {
+  for (const lvl of watchlist) {
+    try {
+      const k15 = await fetchKlinesWorker(env, lvl.symbol, '15m', 3);
+      const c15 = klinesToCandles(k15);
+      const c15Closed = c15.slice(0, -1);
+      if (!c15Closed.length) continue;
+      const lastClosed = c15Closed[c15Closed.length - 1];
+      const reaction = calcLevelReaction(lastClosed, lvl.levelLow, lvl.levelHigh);
+      if (reaction === 'none') continue;
+      const kvKey = `pricelevel:${lvl.symbol}:${lvl.levelLow}`;
+      const stored = env.ALERT_STATE ? await env.ALERT_STATE.get(kvKey) : null;
+      const lastReaction = parsePriceLevelState(stored);
+      if (!shouldNotifyPriceLevel(lastReaction, reaction)) continue; // същото състояние - вече известено
+      const symbolNoUsdt = lvl.symbol.replace('USDT', '');
+      const label = lvl.label || 'зона';
+      const zoneStr = `${formatPrice(lvl.levelLow)}–${formatPrice(lvl.levelHigh)} USD`;
+      const lines = reaction === 'reclaim'
+        ? [`🟩 RECLAIM ${symbolNoUsdt}`, `15м свещ затвори НАД ${label} (${zoneStr})`, `Close: ${formatPrice(lastClosed.close)} USD`]
+        : [`🟥 REJECTION ${symbolNoUsdt}`, `Цената тества ${label} (${zoneStr}), но 15м свещ затвори обратно под нея`, `Close: ${formatPrice(lastClosed.close)} USD`];
+      await sendWhatsApp(env, lines.join('\n'));
+      // timestamp-ът (openTime на свещта) се пази само за бъдещ анализ - не
+      // участва в dedup решението (виж shouldNotifyPriceLevel по-горе).
+      if (env.ALERT_STATE) await env.ALERT_STATE.put(kvKey, JSON.stringify({ reaction, at: lastClosed.openTime }));
+    } catch (e) { console.error(`Price level check error for ${lvl.symbol}: ${e.message}`); }
+  }
+}
+
+// ---- DISCOVERY RADAR (Stage B) - чисти scoring функции ---------------------
+// Архитектура (обсъдена в чата, не тук): отделен, ВРЕМЕНЕН pre-filter слой
+// преди CORE WATCHLIST - сканира целия пазар евтино (relay bulk /ticker24hr,
+// виж Stage A), намира до 6 кандидата с необичайна/ускоряваща се активност,
+// и само за тях пуска пълния (скъп) анализ (scanSymbolSignals/checkMarketSignals
+// - непроменени). CORE WATCHLIST, ENTRY ENGINE и всички съществуващи прагове
+// НЕ се пипат тук. Тая секция е Stage B: САМО чисти функции, БЕЗ wiring в
+// scheduled() - снемане на bulk данни, KV persistence и cron интеграция идват
+// в следващи Stages (C+).
+//
+// Договорка за реда на извикване (виж пълния конвейер в Stage C):
+//   1. metrics     = calcDiscoverySnapshotMetrics(prevSnapshot, currSnapshot)
+//   2. activity    = calcDiscoveryActivityScore(metrics, oldBaseline)   <- oldBaseline е ПРЕДИ тоя tick
+//   3. direction   = calcDiscoveryDirection(metrics)
+//   4. confidence  = calcDiscoveryConfidence(metrics, oldBaseline, direction)
+//   5. newBaseline = updateDiscoveryBaseline(oldBaseline, metrics, direction) <- пази се за следващия tick
+//
+// v1 умишлено НЕ ползва funding/premiumIndex (виж чата - orязан scope) и
+// умишлено няма "финални" калибрирани прагове - константите по-долу са
+// начална точка за калибрация след реална telemetry, не постоянни стойности.
+const DISCOVERY_BASELINE_EMA_ALPHA = 0.3; // тежест на новия tick в rolling средната на монетата
+const DISCOVERY_MIN_BASELINE_TICKS = 3; // под толкова тикове baseline-ът се счита за "все още узряващ"
+const DISCOVERY_ACTIVITY_MAX_SCORE = 5;
+
+// Сурови delta метрики между ДВА последователни bulk /ticker24hr snapshot-а
+// за ЕДНА монета. Нищо стателно, нищо мрежово - чисто аритметика. curr.high/
+// curr.low са rolling 24ч стойности (не "интервален" high/low), затова
+// newHigh/newLow тук значат "точно в тоя snapshot е зададен НОВ 24ч екстремум"
+// - директен, чист сигнал за "накъде точно сега", без нужда от допълнителни
+// заявки за истински интервален range.
+function calcDiscoverySnapshotMetrics(prev, curr) {
+  if (!prev || !curr) return null;
+  const volumeDelta = curr.quoteVolume - prev.quoteVolume;
+  const countDelta = curr.count - prev.count;
+  const priceDeltaPct = prev.price > 0 ? ((curr.price - prev.price) / prev.price) * 100 : 0;
+  const rangePct = curr.price > 0 ? ((curr.high - curr.low) / curr.price) * 100 : 0;
+  const newHigh = curr.high > prev.high;
+  const newLow = curr.low < prev.low;
+  return { volumeDelta, countDelta, priceDeltaPct, rangePct, newHigh, newLow };
+}
+
+// Пази rolling (EMA) собствена база на монетата - volumeRatio/countRatio се
+// смятат СПРЯМО СОБСТВЕНАТА история на монетата, никога спрямо други монети
+// (малка монета никога не може честно да се сравнява по абсолютен обем с
+// BTC). Извиква се СЛЕД score/direction/confidence за тоя tick (виж
+// договорката по-горе) - връща НОВИЯ baseline за следващия tick, не мутира
+// подадения.
+function updateDiscoveryBaseline(baseline, metrics, direction) {
+  const b = baseline || {
+    ticks: 0, avgVolumeDelta: 0, avgCountDelta: 0, avgRangePct: 0,
+    lastVolumeDelta: null, lastRangePct: null, prevRangePct: null, lastDirection: null,
+  };
+  if (!metrics) return b;
+  const volumeDeltaClamped = Math.max(0, metrics.volumeDelta);
+  const countDeltaClamped = Math.max(0, metrics.countDelta);
+  const alpha = b.ticks === 0 ? 1 : DISCOVERY_BASELINE_EMA_ALPHA; // първи tick - директно сядане, не EMA
+  return {
+    ticks: b.ticks + 1,
+    avgVolumeDelta: b.avgVolumeDelta + alpha * (volumeDeltaClamped - b.avgVolumeDelta),
+    avgCountDelta: b.avgCountDelta + alpha * (countDeltaClamped - b.avgCountDelta),
+    avgRangePct: b.avgRangePct + alpha * (metrics.rangePct - b.avgRangePct),
+    lastVolumeDelta: volumeDeltaClamped,
+    prevRangePct: b.lastRangePct,
+    lastRangePct: metrics.rangePct,
+    lastDirection: direction,
+  };
+}
+
+// DISCOVERY ACTIVITY SCORE - "колко необичайна/ускоряваща се е активността",
+// НЕ посока. volumeRatio/countRatio = тоя tick спрямо СОБСТВЕНАТА rolling
+// средна (null, ако baseline-ът още няма история). acceleration = тоя tick
+// delta-та е по-голяма от ПРЕДИШНАТА delta (втора производна - истинско
+// ускорение, не просто "голямо е"). compressionExpansion = диапазонът се е
+// свивал (baseline.prevRangePct -> baseline.lastRangePct) и СЕГА се разширява
+// (baseline.lastRangePct -> metrics.rangePct) - класическата "coiled spring"
+// сигнатура.
+function calcDiscoveryActivityScore(metrics, baseline) {
+  if (!metrics) {
+    return {
+      score: 0, acceleration: false, compressionExpansion: false,
+      wasCompressing: false, nowExpanding: false, volumeRatio: null, countRatio: null,
+    };
+  }
+  const hasBaseline = !!(baseline && baseline.ticks > 0);
+  const volumeRatio = hasBaseline && baseline.avgVolumeDelta > 0
+    ? Math.max(0, metrics.volumeDelta) / baseline.avgVolumeDelta : null;
+  const countRatio = hasBaseline && baseline.avgCountDelta > 0
+    ? Math.max(0, metrics.countDelta) / baseline.avgCountDelta : null;
+  const acceleration = !!(hasBaseline && baseline.lastVolumeDelta != null && baseline.lastVolumeDelta > 0
+    && metrics.volumeDelta > baseline.lastVolumeDelta);
+  // Разбити на отделни полета (не само крайния compressionExpansion boolean) -
+  // telemetry-то трябва да пази СУРОВИТЕ trigger metrics, за да можем после да
+  // разберем ЗАЩО дадена монета е получила дадения score, не само колко е бил.
+  const wasCompressing = !!(hasBaseline && baseline.lastRangePct != null && baseline.prevRangePct != null
+    && baseline.lastRangePct < baseline.prevRangePct);
+  const nowExpanding = !!(hasBaseline && baseline.lastRangePct != null && metrics.rangePct > baseline.lastRangePct);
+  const compressionExpansion = wasCompressing && nowExpanding;
+
+  let score = 0;
+  if (volumeRatio != null) score += Math.min(2, volumeRatio);
+  if (countRatio != null) score += Math.min(1, countRatio * 0.5);
+  if (acceleration) score += 1;
+  if (compressionExpansion) score += 1;
+  score = Math.min(DISCOVERY_ACTIVITY_MAX_SCORE, score);
+
+  return { score, acceleration, compressionExpansion, wasCompressing, nowExpanding, volumeRatio, countRatio };
+}
+
+// DISCOVERY DIRECTION - LONG/SHORT/NEUTRAL. Умишлено НЕ от priceChangePercent
+// сам по себе си - изисква посоката на цената в СЪЩИЯ прозорец да СЪВПАДА с
+// коя страна на диапазона се е разширила (нов high при качване, нов low при
+// падане). Ако не съвпадат (или няма ясен нов екстремум) -> NEUTRAL, валидна
+// класификация сама по себе си (BUILD-UP без ясна посока още).
+function calcDiscoveryDirection(metrics) {
+  if (!metrics) return 'neutral';
+  const priceUp = metrics.priceDeltaPct > 0;
+  const priceDown = metrics.priceDeltaPct < 0;
+  if (priceUp && metrics.newHigh && !metrics.newLow) return 'long';
+  if (priceDown && metrics.newLow && !metrics.newHigh) return 'short';
+  return 'neutral';
+}
+
+// DISCOVERY CONFIDENCE (0-1) - колко убедителна е класификацията, НЕЗАВИСИМО
+// от Activity Score. v1 умишлено БЕЗ funding модификатор (виж чата - orязан
+// scope, funding идва по-късно като допълнение). Фактори: (а) достатъчно
+// история за да имаме доверие в baseline-а, (б) посоката е ясна (не neutral),
+// (в) наказание, ако посоката точно СЕГА се е обърнала спрямо предишния
+// snapshot (флип-флоп = ниско доверие дори при висок Activity).
+function calcDiscoveryConfidence(metrics, baseline, direction) {
+  if (!metrics) return 0;
+  let confidence = 0;
+  const hasEnoughHistory = !!(baseline && baseline.ticks >= DISCOVERY_MIN_BASELINE_TICKS);
+  if (hasEnoughHistory) confidence += 0.4;
+  if (direction !== 'neutral') confidence += 0.3;
+  const priorDirection = baseline ? baseline.lastDirection : null;
+  const flipped = !!(priorDirection && direction !== 'neutral' && priorDirection !== 'neutral' && priorDirection !== direction);
+  if (flipped) confidence -= 0.3;
+  return Math.max(0, Math.min(1, confidence));
+}
+
+// ---- DISCOVERY RADAR (Stage C) - bulk fetch + 15-мин gate + persistence ---
+// Свързва Stage B чистите функции с реални данни: relay bulk /ticker24hr
+// (Stage A - целия пазар в 1 заявка) + KV persistence на snapshot/baseline
+// състоянието на монета. Пуска се на ВСЕКИ CORE cron tick (5 мин), но
+// вътрешно е no-op освен на всеки ~3-ти тик (DISCOVERY_RADAR_INTERVAL_MIN) -
+// същия KV-timestamp gate патерн като HYSTERESIS_COOLDOWN_MIN/
+// VAHVAL_REARM_COOLDOWN_MIN. Все още БЕЗ pool ranking/eviction (Stage D) и
+// БЕЗ FULL ANALYSIS wiring (Stage E) - тук само сканираме и пазим score-овете.
+const DISCOVERY_RADAR_INTERVAL_MIN = 15; // v1 начална точка - виж чата (5м прекалено шумно за rolling 24ч delta, 30м прекалено бавно)
+
+async function fetchMarketWideTicker24hrWorker(env) {
+  const r = await fetchWithTimeout(`${env.RELAY_URL}/ticker24hr?token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+  if (!r.ok) throw new Error(`bulk /ticker24hr HTTP ${r.status}`);
+  return await r.json();
+}
+
+// Филтрира bulk отговора до DISCOVERY "вселената": само USDT-M perpetual (без
+// quarterly/delivery контракти, разпознаваеми по "_" в символа), без монетите
+// вече в CORE WATCHLIST (те си имат пълно 24/7 покритие - DISCOVERY е само за
+// ОСТАНАЛИЯ пазар). Пропуска редове с невалидни/липсващи числови полета, без
+// throw.
+function filterDiscoveryUniverse(bulkTicker, coreSymbols) {
+  const coreSet = new Set(coreSymbols);
+  const bySymbol = {};
+  if (!Array.isArray(bulkTicker)) return bySymbol;
+  for (const t of bulkTicker) {
+    if (!t || typeof t.symbol !== 'string') continue;
+    if (!t.symbol.endsWith('USDT') || t.symbol.includes('_')) continue;
+    if (coreSet.has(t.symbol)) continue;
+    const price = parseFloat(t.lastPrice);
+    const quoteVolume = parseFloat(t.quoteVolume);
+    const count = parseFloat(t.count);
+    const high = parseFloat(t.highPrice);
+    const low = parseFloat(t.lowPrice);
+    if (![price, quoteVolume, count, high, low].every(Number.isFinite)) continue;
+    bySymbol[t.symbol] = { price, quoteVolume, count, high, low };
+  }
+  return bySymbol;
+}
+
+// Чиста функция: открива символи, присъстващи в текущия universe snapshot, но
+// отсъстващи в предишния (~DISCOVERY_RADAR_INTERVAL_MIN мин по-рано) - т.е.
+// нов listing на борсата. isFirstSnapshot пази от фалшив "всичко е ново" flood
+// при самия първи tick (когато изобщо няма предишен snapshot). maxFlood пази
+// от временен glitch на борсата/relay (масово изчезване+връщане на символи в
+// bulk отговора не би трябвало да се третира като истински listing бум).
+function detectNewDiscoveryListings(prevBySymbol, currBySymbol, isFirstSnapshot, maxFlood = 10) {
+  if (isFirstSnapshot) return [];
+  const prevSet = new Set(Object.keys(prevBySymbol || {}));
+  const newSymbols = Object.keys(currBySymbol || {}).filter((s) => !prevSet.has(s));
+  if (newSymbols.length > maxFlood) return [];
+  return newSymbols;
+}
+
+// Чиста функция: форматира WhatsApp известие за новооткрити listing-и. null
+// при празен списък (без известие).
+function buildNewListingMessage(newSymbols, currBySymbol) {
+  if (!newSymbols.length) return null;
+  const lines = ['🆕 НОВ LISTING ОТКРИТ'];
+  for (const symbol of newSymbols) {
+    const price = currBySymbol[symbol]?.price;
+    const priceStr = Number.isFinite(price) ? price : '--';
+    lines.push(`${symbol} - цена ${priceStr}`);
+  }
+  return lines.join('\n');
+}
+
+// Гейтнато обновяване (извиква се от scheduled() на всеки CORE тик, но реално
+// работи само на ~DISCOVERY_RADAR_INTERVAL_MIN мин). Собствени KV ключове
+// (discoverysnapshot/discoverybaseline/discoveryscores) - не споделя нищо със
+// sigstate:/pricelevel:/macrosqueeze:, за да няма race condition. Собствен
+// try/catch на най-горно ниво - грешка тук (напр. relay недостъпен) не бива
+// да чупи error видимостта на другите, вече работещи проверки в Promise.all.
+async function updateDiscoverySnapshotState(env, watchlist = WATCHLIST) {
+  try {
+    if (!env.ALERT_STATE || !env.RELAY_URL) return;
+    const rawState = await env.ALERT_STATE.get('discoverysnapshot');
+    const state = rawState ? JSON.parse(rawState) : { at: 0, bySymbol: {} };
+    const now = Date.now();
+    if (now - state.at < DISCOVERY_RADAR_INTERVAL_MIN * 60000) return; // още не е време
+
+    const bulk = await fetchMarketWideTicker24hrWorker(env);
+    const coreSymbols = watchlist.map((w) => w.symbol);
+    const currBySymbol = filterDiscoveryUniverse(bulk, coreSymbols);
+
+    const newListings = detectNewDiscoveryListings(state.bySymbol, currBySymbol, state.at === 0);
+    const newListingMessage = buildNewListingMessage(newListings, currBySymbol);
+    if (newListingMessage) await sendWhatsApp(env, newListingMessage);
+
+    const rawBaseline = await env.ALERT_STATE.get('discoverybaseline');
+    const baselines = rawBaseline ? JSON.parse(rawBaseline) : {};
+
+    const newBaselines = {};
+    const newScores = {};
+    for (const [symbol, curr] of Object.entries(currBySymbol)) {
+      const prev = state.bySymbol[symbol];
+      const metrics = calcDiscoverySnapshotMetrics(prev, curr);
+      const oldBaseline = baselines[symbol] || null;
+      const direction = calcDiscoveryDirection(metrics);
+      if (metrics) {
+        const activity = calcDiscoveryActivityScore(metrics, oldBaseline);
+        const confidence = calcDiscoveryConfidence(metrics, oldBaseline, direction);
+        newScores[symbol] = {
+          score: activity.score, acceleration: activity.acceleration, compressionExpansion: activity.compressionExpansion,
+          wasCompressing: activity.wasCompressing, nowExpanding: activity.nowExpanding,
+          volumeRatio: activity.volumeRatio, countRatio: activity.countRatio,
+          direction, confidence, price: curr.price, at: now,
+        };
+      }
+      newBaselines[symbol] = updateDiscoveryBaseline(oldBaseline, metrics, direction);
+    }
+
+    await env.ALERT_STATE.put('discoverysnapshot', JSON.stringify({ at: now, bySymbol: currBySymbol }));
+    await env.ALERT_STATE.put('discoverybaseline', JSON.stringify(newBaselines));
+    await env.ALERT_STATE.put('discoveryscores', JSON.stringify(newScores));
+
+    // FIRST QUALIFYING WAKE-UP (Етап 2, виж updateDiscoveryWakeups по-горе) -
+    // ФАЗА A, ПРЕДИ pool ъпдейта - за да може computeDiscoveryPoolUpdate да
+    // знае (през wakeupBySymbol) кои от днешните нови pool кандидати вече имат
+    // по-ранно "будене", и да стампира immutable снимката му. null при грешка
+    // (виж коментара в updateDiscoveryWakeups) - {} подадено на pool-а,
+    // финализацията по-долу се прескача изцяло, за да не презапише
+    // discoverywakeupactive с грешни данни.
+    const wakeupActiveAfterPhaseA = await updateDiscoveryWakeups(env, newScores, now);
+
+    // Pool-ъпдейтът тръгва СЛЕД като score-овете вече са трайно записани по-горе
+    // (дори ако тук долу гръмне нещо, score-овете за тоя tick не се губят) - и
+    // само когато реално е имало нов radar tick (не на всеки 5-мин CORE tick),
+    // за да не брои weakTicks/TTL по-често от истинския ~15-мин radar interval.
+    const { newPool } = await updateDiscoveryPool(env, newScores, now, wakeupActiveAfterPhaseA || {});
+
+    // ФАЗА B, СЛЕД pool ъпдейта - затваря wake-up наблюденията, промотирани в
+    // pool-а тоя тик (discovery_promoted), и пише финалния discoverywakeupactive.
+    // Прескача се изцяло, ако Фаза A е гръмнала (wakeupActiveAfterPhaseA===null) -
+    // виж бележката по-горе.
+    if (wakeupActiveAfterPhaseA) {
+      await finalizeDiscoveryWakeupPromotions(env, wakeupActiveAfterPhaseA, newPool || [], now);
+    }
+  } catch (e) { console.error(`DISCOVERY RADAR snapshot update error: ${e.message}`); }
+}
+
+// ---- DISCOVERY RADAR (Stage D) - pool ranking/eviction ---------------------
+// Управлява DISCOVERY_POOL (макс. DISCOVERY_POOL_MAX_SIZE монети): ranking по
+// Activity Score (не "първите намерени"), TTL + weak-score eviction, и твърда
+// защита - монета с активно ENTRY ENGINE състояние (SETUP или ARMED, виж
+// sigstate:{symbol}) НЕ може да отпадне нито от TTL, нито от слаб score, нито
+// от ranking displacement. FULL ANALYSIS (Stage E, виж runDiscoveryFullAnalysis
+// по-долу) Е wire-нат в scheduled() - pool членовете РЕАЛНО минават през
+// пълната SETUP/ARMED/ENTRY верига на всеки CORE tick, защитата тук вече
+// активно пази реални, не само синтетични sigstate записи.
+const DISCOVERY_POOL_MAX_SIZE = 5; // намалено от 6 - по-фокусиран pool върху най-силните кандидати
+const DISCOVERY_POOL_TTL_MS = 48 * 3600000; // 48ч - начална точка (виж чата), не финална
+const DISCOVERY_WEAK_SCORE_THRESHOLD = 1; // Activity Score под това ниво се брои "слаб" tick
+const DISCOVERY_WEAK_TICK_LIMIT = 4; // толкова ПОРЕДНИ слаби тика (~1ч при 15-мин radar interval) -> eviction
+
+// Твърдата защита - "заключена" монета (активен SETUP или ARMED) никога не
+// отпада, независимо от TTL/score/ranking. sigstate е точно това, което
+// loadSymbolState(env, symbol) връща (виж по-горе) - state.setup/state.armed
+// са обекти при активно състояние, null иначе.
+function isDiscoveryPoolMemberLocked(sigstate) {
+  return !!(sigstate && (sigstate.setup || sigstate.armed));
+}
+
+// Чиста orchestrator функция - взима текущия pool + тазтиковите score-ове +
+// кои symbol-и в pool-а са заключени, връща новия pool + списък изгонени (с
+// причина). Три отделни, независими начина за напускане на pool-а:
+//   - 'ttl_expired'  - изтекъл TTL (само НЕзаключени)
+//   - 'weak_score'   - DISCOVERY_WEAK_TICK_LIMIT поредни слаби тика (само НЕзаключени)
+//   - 'displaced'    - нов/друг кандидат с по-висок Activity Score е заел
+//                      мястото му при ranking-а (само НЕзаключени, и само за
+//                      кандидати, които РЕАЛНО вече са били в pool-а - нов
+//                      кандидат, който просто не е бил избран тоя tick, не се
+//                      брои за "изгонен", защото никога не е влизал)
+// Заключените членове ВИНАГИ пазят слота си - остатъчният капацитет
+// (maxSize - брой заключени) се конкурира само измежду НЕзаключените
+// оцелели + новите кандидати, ранкирани по Activity Score низходящо.
+function computeDiscoveryPoolUpdate({ currentPool, scoresBySymbol, lockedSymbols, now, config, wakeupBySymbol = {} }) {
+  const isLocked = (symbol) => !!(lockedSymbols && lockedSymbols.has(symbol));
+
+  const ttlSurvivors = [];
+  const ttlOrWeakExited = [];
+  for (const member of currentPool) {
+    const scoreEntry = scoresBySymbol[member.symbol];
+    if (isLocked(member.symbol)) {
+      ttlSurvivors.push({
+        ...member, locked: true,
+        lastScore: scoreEntry ? scoreEntry.score : member.lastScore,
+        lastDirection: scoreEntry ? scoreEntry.direction : member.lastDirection,
+        lastConfidence: scoreEntry ? scoreEntry.confidence : member.lastConfidence,
+      });
+      continue;
+    }
+    const isWeakTick = !scoreEntry || scoreEntry.score < config.weakScoreThreshold;
+    const refreshed = {
+      ...member, locked: false,
+      weakTicks: isWeakTick ? (member.weakTicks || 0) + 1 : 0,
+      lastScore: scoreEntry ? scoreEntry.score : member.lastScore,
+      lastDirection: scoreEntry ? scoreEntry.direction : member.lastDirection,
+      lastConfidence: scoreEntry ? scoreEntry.confidence : member.lastConfidence,
+    };
+    if (now - member.enteredAt >= config.ttlMs) { ttlOrWeakExited.push({ ...refreshed, exitReason: 'ttl_expired' }); continue; }
+    if (refreshed.weakTicks >= config.weakTickLimit) { ttlOrWeakExited.push({ ...refreshed, exitReason: 'weak_score' }); continue; }
+    ttlSurvivors.push(refreshed);
+  }
+
+  const lockedMembers = ttlSurvivors.filter((m) => m.locked);
+  const unlockedSurvivors = ttlSurvivors.filter((m) => !m.locked);
+  const survivorSymbols = new Set(ttlSurvivors.map((m) => m.symbol));
+  // Символ, изгонен ТОЧНО тоя tick (TTL/weak-score), НЕ бива веднага да се
+  // третира като "нов кандидат" само защото пак присъства в scoresBySymbol -
+  // иначе TTL/weak-score изгонването реално никога не се случва, докато
+  // score-ът му е достатъчно добър за ranking-а.
+  const justExitedSymbols = new Set(ttlOrWeakExited.map((m) => m.symbol));
+  const newCandidates = Object.keys(scoresBySymbol)
+    .filter((symbol) => !survivorSymbols.has(symbol) && !isLocked(symbol) && !justExitedSymbols.has(symbol))
+    .map((symbol) => ({
+      symbol, enteredAt: now, weakTicks: 0, locked: false,
+      lastScore: scoresBySymbol[symbol].score, lastDirection: scoresBySymbol[symbol].direction,
+      lastConfidence: scoresBySymbol[symbol].confidence,
+      // Immutable "снимка" от МОМЕНТА на влизане в pool-а (за разлика от
+      // last* по-горе, които се презаписват всеки tick) - DISCOVERY EPISODE
+      // TELEMETRY (Stage F) се нуждае от ОРИГИНАЛНАТА цена/score/посока/
+      // увереност, не от най-скорошните.
+      discoveryPrice: scoresBySymbol[symbol].price, discoveryScore: scoresBySymbol[symbol].score,
+      discoveryDirection: scoresBySymbol[symbol].direction, discoveryConfidence: scoresBySymbol[symbol].confidence,
+      // FIRST QUALIFYING WAKE-UP (Етап 2, виж updateDiscoveryWakeupState по-долу) -
+      // ако символът влиза в pool-а с вече активно wake-up наблюдение, пазим
+      // immutable снимка на МОМЕНТА на първото пресичане на qualifying прага
+      // (може да е много по-рано от самия pool entry) - wakeupBySymbol вече е
+      // изчислен ПРЕДИ тоя tick's updateDiscoveryPool извикване (виж
+      // updateDiscoverySnapshotState). null, ако символът няма активно
+      // wake-up (влязъл директно в pool-а без засечено "будене").
+      wakeupAt: wakeupBySymbol[symbol] ? wakeupBySymbol[symbol].firstQualifyingAt : null,
+      wakeupPrice: wakeupBySymbol[symbol] ? wakeupBySymbol[symbol].firstQualifyingPrice : null,
+      wakeupScore: wakeupBySymbol[symbol] ? wakeupBySymbol[symbol].initialScore : null,
+      wakeupConfidence: wakeupBySymbol[symbol] ? wakeupBySymbol[symbol].confidence : null,
+    }));
+
+  const openSlots = Math.max(0, config.maxSize - lockedMembers.length);
+  const ranked = [...unlockedSurvivors, ...newCandidates]
+    .sort((a, b) => (b.lastScore ?? -Infinity) - (a.lastScore ?? -Infinity));
+  // RANK TRACKING (diagnostic-only, не участва в ranking-а самия) - 1-based
+  // позиция СЛЕД тазтиковия ranking + предишната позиция (null за нов член),
+  // за да виждаме движение #5->#2 и т.н. при периодичния TOP списък.
+  const kept = ranked.slice(0, openSlots).map((m, idx) => ({ ...m, prevRank: m.rank ?? null, rank: idx + 1 }));
+  const displaced = ranked.slice(openSlots)
+    .filter((m) => unlockedSurvivors.includes(m))
+    .map((m) => ({ ...m, exitReason: 'displaced' }));
+
+  return { newPool: [...lockedMembers, ...kept], exited: [...ttlOrWeakExited, ...displaced] };
+}
+
+// Форматира периодичния TOP списък (виж updateDiscoveryPool по-долу) -
+// pool-ът вече Е сортиран по rank (1 = най-висок Activity Score), locked
+// членове (виж isDiscoveryPoolMemberLocked - реално активни с wire-натия
+// Stage E, не само синтетично тествани) се показват последни, без rank
+// movement (не участват в ranking-а).
+// trapBySymbol - { symbol: { tier, direction } } снимка от state.trapSnapshot
+// (виж scanSymbolSignals) за текущите pool членове - ЧИСТО диагностична
+// 🪤 маркировка до монети с активен TRAP WATCH/CONFIRMED В МОМЕНТА на
+// снимката. Не участва в ranking/eviction/score по никакъв начин - само
+// визуално съпоставя вече съществуващото TRAP известие с TOP списъка.
+// lockedDirectionBySymbol - { symbol: 'long'|'short' } РЕАЛНАТА SETUP/ARMED
+// посока (от sigstate.armed/setup.direction) САМО за заключените членове -
+// за разлика от m.lastDirection (Discovery-ниво calcDiscoveryDirection,
+// нарочно строга/рядко извън "neutral"), това е точно посоката, показана в
+// самите ARMED/ENTRY известия. НЕзаключените продължават да ползват
+// m.lastDirection непроменено - за тях "neutral" си е коректна информация
+// (все още няма ясен пробив), не заместваме нищо.
+function buildDiscoveryTopListMessage(pool, trapBySymbol = {}, lockedDirectionBySymbol = {}) {
+  if (!pool.length) return null;
+  const unlockedSorted = pool.filter((m) => !m.locked).sort((a, b) => (a.rank ?? Infinity) - (b.rank ?? Infinity));
+  // Заключените НЕ се конкурират за слот (виж computeDiscoveryPoolUpdate),
+  // затова никога не получават rank/prevRank там - тук само ги подреждаме
+  // ПОМЕЖДУ СИ по същата вече съществуваща Activity Score (lastScore, освежава
+  // се всеки tick независимо от lock статуса) за показна номерация,
+  // продължаваща от незаключените - БЕЗ движение (↑/↓/🆕), защото реда им
+  // помежду им не се следи tick-to-tick като при незаключените.
+  const lockedSorted = pool.filter((m) => m.locked).sort((a, b) => (b.lastScore ?? -Infinity) - (a.lastScore ?? -Infinity));
+  const lines = [`📡 DISCOVERY TOP ${pool.length}`];
+  const trapSuffix = (symbol) => {
+    const trap = trapBySymbol[symbol];
+    if (!trap || (trap.tier !== 'watch' && trap.tier !== 'confirmed')) return '';
+    return ` 🪤 TRAP ${trap.direction === 'long' ? '▲' : '▼'}`;
+  };
+  const dirIcon = (direction) => (direction === 'long' ? '🟢' : direction === 'short' ? '🔴' : '⚪');
+  for (const m of unlockedSorted) {
+    let movement;
+    if (m.prevRank == null) movement = '🆕 нов';
+    else if (m.rank < m.prevRank) movement = `↑ от #${m.prevRank}`;
+    else if (m.rank > m.prevRank) movement = `↓ от #${m.prevRank}`;
+    else movement = '→ без промяна';
+    const score = m.lastScore != null ? m.lastScore.toFixed(1) : '--';
+    lines.push(`#${m.rank} ${dirIcon(m.lastDirection)} ${m.symbol.replace('USDT', '')} - score ${score} (${movement})${trapSuffix(m.symbol)}`);
+  }
+  lockedSorted.forEach((m, idx) => {
+    const num = unlockedSorted.length + idx + 1;
+    const score = m.lastScore != null ? m.lastScore.toFixed(1) : '--';
+    const direction = lockedDirectionBySymbol[m.symbol] ?? m.lastDirection;
+    lines.push(`#${num} 🔒 ${dirIcon(direction)} ${m.symbol.replace('USDT', '')} - score ${score} (заключен слот - активен SETUP/ARMED)${trapSuffix(m.symbol)}`);
+  });
+  return lines.join('\n');
+}
+
+// Wiring: чете/пише discoverypool в KV, чете sigstate само за текущите (макс.
+// DISCOVERY_POOL_MAX_SIZE) pool членове, за да прецени locked статуса им -
+// собствен try/catch, за да не завлече вече записаните score-ове по-горе,
+// ако тук нещо гръмне.
+// wakeupBySymbol (Етап 2, default {} - запазва 100% стария сигнатура/behavior
+// за всеки съществуващ caller/тест, който не го подава) - само за immutable
+// снимка на новите pool кандидати (виж computeDiscoveryPoolUpdate по-горе),
+// не участва в ranking/eviction логиката по никакъв начин.
+async function updateDiscoveryPool(env, scoresBySymbol, now = Date.now(), wakeupBySymbol = {}) {
+  if (!env.ALERT_STATE) return { newPool: null, exited: [] };
+  try {
+    const rawPool = await env.ALERT_STATE.get('discoverypool');
+    const currentPool = rawPool ? JSON.parse(rawPool) : [];
+
+    const lockedSymbols = new Set();
+    const trapBySymbol = {};
+    const lockedDirectionBySymbol = {};
+    for (const member of currentPool) {
+      const sigstate = await loadSymbolState(env, member.symbol);
+      if (isDiscoveryPoolMemberLocked(sigstate)) {
+        lockedSymbols.add(member.symbol);
+        // ARMED е по-напреднал етап от SETUP - предпочитаме посоката му, щом я има.
+        const direction = sigstate.armed?.direction ?? sigstate.setup?.direction;
+        if (direction) lockedDirectionBySymbol[member.symbol] = direction;
+      }
+      if (sigstate && sigstate.trapSnapshot) trapBySymbol[member.symbol] = sigstate.trapSnapshot;
+    }
+
+    const { newPool, exited } = computeDiscoveryPoolUpdate({
+      currentPool, scoresBySymbol, lockedSymbols, now, wakeupBySymbol,
+      config: {
+        maxSize: DISCOVERY_POOL_MAX_SIZE, ttlMs: DISCOVERY_POOL_TTL_MS,
+        weakScoreThreshold: DISCOVERY_WEAK_SCORE_THRESHOLD, weakTickLimit: DISCOVERY_WEAK_TICK_LIMIT,
+      },
+    });
+
+    await env.ALERT_STATE.put('discoverypool', JSON.stringify(newPool));
+    if (exited.length) {
+      console.log(`DISCOVERY RADAR pool exits: ${exited.map((e) => `${e.symbol}(${e.exitReason})`).join(', ')}`);
+      await markDiscoveryEpisodesExited(env, exited, now);
+    }
+    // Периодичен TOP списък (виж discussion-а - rank + движение #5->#2 и т.н.)
+    // Пуска се само тук, на реалния ~DISCOVERY_RADAR_INTERVAL_MIN gate (НЕ на
+    // всеки 5-мин CORE tick) - едно известие на radar tick, не на watchlist tick.
+    const topListMessage = buildDiscoveryTopListMessage(newPool, trapBySymbol, lockedDirectionBySymbol);
+    if (topListMessage) await sendWhatsApp(env, topListMessage);
+    return { newPool, exited };
+  } catch (e) { console.error(`DISCOVERY RADAR pool update error: ${e.message}`); return { newPool: null, exited: [] }; }
+}
+
+// ---- DISCOVERY RADAR (Stage D.5) - FIRST QUALIFYING WAKE-UP ---------------
+// Етап 2 (виж discussion-а "EARLY DISCOVERY -> MARKET INTENT") - открива
+// МОМЕНТА, в който символ, ОЩЕ извън DISCOVERY_POOL (Stage D), за ПЪРВИ път
+// пресича вече съществуващия DISCOVERY_WEAK_SCORE_THRESHOLD (>=, СЪЩАТА
+// граница като "не-слаб" тик в computeDiscoveryPoolUpdate по-горе - БЕЗ нов
+// праг). Собствен KV ключ (discoverywakeupactive - един консолидиран обект,
+// огледално на discoverypool), собствен try/catch - диагностична грешка тук
+// НЕ бива да прекъсва Discovery Radar-а (виж updateDiscoverySnapshotState
+// wiring-а по-долу). ЧИСТО observability - нищо по-долу/по-горе не чете тия
+// записи обратно, нулево влияние върху SETUP/ARMED/ENTRY/scoring/cooldown.
+//
+// LOOK-AHEAD BIAS - firstQualifyingAt е РЕАЛНИЯТ Date.now() в момента на тоя
+// radar tick (forward-only, никога не се "връща назад"). maxFavorablePct/
+// maxAdversePct се смятат САМО от scoresBySymbol[symbol].price (lastPrice,
+// семплиран на всеки ~15-мин тик) - НИКОГА от борсовия 24ч high/low (виж
+// filterDiscoveryUniverse) - last price би замърсил "наблюдавано от
+// wake-up-а насам" с екстремум ОТПРЕДИ firstQualifyingAt. Следствие: тия
+// стойности НЕ са intrabar high/low, а дискретни ~15-мин снимки.
+//
+// Чиста функция - direction-aware % движение спрямо firstQualifyingPrice.
+// За 'short' wake-up "favorable" е спад (знакът се обръща). За 'neutral'
+// (calcDiscoveryDirection може да върне 'neutral') няма implied посока за
+// търговия - третира се по конвенция като 'long' (favorable=нагоре), само
+// етикет за агрегация, НЕ предположение за бъдещо движение (виж Уточнение №5).
+function calcWakeupMovePct(direction, firstPrice, currentPrice) {
+  if (!(firstPrice > 0) || !Number.isFinite(currentPrice)) return null;
+  const rawPct = ((currentPrice - firstPrice) / firstPrice) * 100;
+  return direction === 'short' ? -rawPct : rawPct;
+}
+
+// Чиста reducer функция, огледална на computeDiscoveryPoolUpdate по-горе -
+// приема текущия активен wake-up блок + тазтиковите Discovery score-ове,
+// връща новия активен блок + списък затворени (ttl_expired/weak_score).
+// discovery_promoted затваряне НЕ е тук - изисква newPool-а от
+// updateDiscoveryPool, който на тоя етап още не съществува (виж
+// closeWakeupsPromotedToPool + wiring-а в updateDiscoverySnapshotState).
+function updateDiscoveryWakeupState(activeBySymbol, scoresBySymbol, now, config) {
+  const active = { ...(activeBySymbol || {}) };
+  const closed = [];
+  for (const symbol of Object.keys(active)) {
+    const entry = active[symbol];
+    const scoreEntry = scoresBySymbol[symbol];
+    const qualifies = !!scoreEntry && scoreEntry.score >= config.weakScoreThreshold;
+    const updated = { ...entry };
+    if (qualifies) {
+      updated.weakTicks = 0;
+      updated.lastPrice = scoreEntry.price;
+      const movePct = calcWakeupMovePct(entry.direction, entry.firstQualifyingPrice, scoreEntry.price);
+      if (movePct != null) {
+        if (updated.maxFavorablePct == null || movePct > updated.maxFavorablePct) {
+          updated.maxFavorablePct = movePct; updated.maxFavorableAt = now;
+        }
+        if (updated.maxAdversePct == null || movePct < updated.maxAdversePct) {
+          updated.maxAdversePct = movePct; updated.maxAdverseAt = now;
+        }
+      }
+    } else {
+      updated.weakTicks = (entry.weakTicks || 0) + 1;
+      if (scoreEntry) updated.lastPrice = scoreEntry.price;
+    }
+    // TTL проверката е ПЪРВА - дори ако символът точно тоя тик ОЩЕ qualifies
+    // (weakTicks вече е 0 по-горе), 48ч капът затваря наблюдението и (виж
+    // новите qualifying по-долу) веднага отваря НОВО, прясно "будене" - съзнателно,
+    // bounds размера на ЕДНО наблюдение, не губи продължаващата активност.
+    if (now - entry.firstQualifyingAt >= config.ttlMs) {
+      closed.push({ symbol, entry: updated, closeReason: 'ttl_expired' });
+      delete active[symbol];
+      continue;
+    }
+    if (updated.weakTicks >= config.weakTickLimit) {
+      closed.push({ symbol, entry: updated, closeReason: 'weak_score' });
+      delete active[symbol];
+      continue;
+    }
+    active[symbol] = updated;
+  }
+  for (const [symbol, scoreEntry] of Object.entries(scoresBySymbol)) {
+    if (active[symbol]) continue; // вече активен (или току-що презатворен и презастартиран по-долу е friendly fire - виж бележката за TTL по-горе)
+    if (scoreEntry.score >= config.weakScoreThreshold) {
+      active[symbol] = {
+        symbol, firstQualifyingAt: now, firstQualifyingPrice: scoreEntry.price,
+        initialScore: scoreEntry.score, direction: scoreEntry.direction, confidence: scoreEntry.confidence,
+        weakTicks: 0, lastPrice: scoreEntry.price,
+        maxFavorablePct: 0, maxFavorableAt: now, maxAdversePct: 0, maxAdverseAt: now,
+      };
+    }
+  }
+  return { active, closed };
+}
+
+// DISCOVERY PROMOTION затваряне - СЛЕД updateDiscoveryPool (нуждае се от
+// newPool-а). Чиста функция - символ с активно wake-up наблюдение, който вече
+// присъства в newPool, се третира като "промотиран" (единствения начин да е
+// нов pool член е computeDiscoveryPoolUpdate по-горе, който вече е консумирал
+// снимката му през wakeupBySymbol - виж wiring-а).
+function closeWakeupsPromotedToPool(activeBySymbol, newPool, now) {
+  const active = { ...(activeBySymbol || {}) };
+  const closed = [];
+  const poolSymbols = new Set((newPool || []).map((m) => m.symbol));
+  for (const symbol of Object.keys(active)) {
+    if (poolSymbols.has(symbol)) {
+      closed.push({ symbol, entry: active[symbol], closeReason: 'discovery_promoted' });
+      delete active[symbol];
+    }
+  }
+  return { active, closed };
+}
+
+// Чист builder - трайният архивен запис (виж Уточнение №1 - "неуспешните
+// wake-up наблюдения не изчезват без следа"). Не дублира firstQualifyingPrice
+// екстремум цени - maxFavorablePct/maxAdversePct + firstQualifyingPrice +
+// direction са достатъчни за реконструкция (price = firstQualifyingPrice *
+// (1 + signedPct/100), виж calcWakeupMovePct за знаковата конвенция).
+function buildWakeupArchiveRecord(entry, closedAt, closeReason, reachedDiscoveryPool) {
+  return {
+    symbol: entry.symbol, firstQualifyingAt: entry.firstQualifyingAt, firstQualifyingPrice: entry.firstQualifyingPrice,
+    initialScore: entry.initialScore, direction: entry.direction, confidence: entry.confidence,
+    closedAt, closeReason, reachedDiscoveryPool,
+    observedMovement: {
+      maxFavorablePct: entry.maxFavorablePct, maxFavorableAt: entry.maxFavorableAt,
+      maxAdversePct: entry.maxAdversePct, maxAdverseAt: entry.maxAdverseAt,
+      lastPrice: entry.lastPrice,
+    },
+  };
+}
+
+// Чист summary builder за /discovery-wakeup ендпойнта по-долу - само
+// механични брояци (closeReason/reachedDiscoveryPool/direction), БЕЗ
+// SUCCESSFUL/FAILED/EXPIRED етикети (виж Уточнение №5 - "първо наблюдения,
+// после закономерности" - тия категории изискват праг за "значимо движение",
+// който съзнателно не въвеждаме тук, преди да имаме реални данни за калибрация).
+function buildDiscoveryWakeupSummary(archiveRecords, truncated) {
+  const summary = {
+    recordsAnalyzed: archiveRecords.length, truncated: !!truncated,
+    byCloseReason: { ttl_expired: 0, weak_score: 0, discovery_promoted: 0 },
+    byReachedDiscoveryPool: { true: 0, false: 0 },
+    byDirection: { long: 0, short: 0, neutral: 0 },
+  };
+  for (const r of archiveRecords) {
+    if (summary.byCloseReason[r.closeReason] != null) summary.byCloseReason[r.closeReason]++;
+    const reachedKey = r.reachedDiscoveryPool ? 'true' : 'false';
+    summary.byReachedDiscoveryPool[reachedKey]++;
+    if (summary.byDirection[r.direction] != null) summary.byDirection[r.direction]++;
+  }
+  return summary;
+}
+
+// Пише архивните записи за затворените wake-up-и (един KV ключ per случай,
+// discoverywakeuparchive:{symbol}:{firstQualifyingAt} - firstQualifyingAt е
+// episode-ID-то, огледално на discoveryepisode:{symbol}:{enteredAt}).
+// Неуспешен PUT (виж заданието "при неуспешен archive PUT активният запис не
+// бива да бъде окончателно премахнат") - връща списъка на НЕуспешните, за да
+// може caller-ът да ги върне обратно в active блока за повторен опит на
+// следващия тик (той самия ОЩЕ не е записал нищо на тоя етап).
+async function archiveClosedWakeups(env, closedList, reachedDiscoveryPool) {
+  const failed = [];
+  for (const c of closedList) {
+    try {
+      const key = `discoverywakeuparchive:${c.symbol}:${c.entry.firstQualifyingAt}`;
+      const record = buildWakeupArchiveRecord(c.entry, Date.now(), c.closeReason, reachedDiscoveryPool);
+      await env.ALERT_STATE.put(key, JSON.stringify(record));
+    } catch (e) {
+      console.error(`DISCOVERY WAKEUP archive error for ${c.symbol}: ${e.message}`);
+      failed.push(c);
+    }
+  }
+  return failed;
+}
+
+// Фаза A (ПРЕДИ updateDiscoveryPool) - чете discoverywakeupactive, прилага
+// updateDiscoveryWakeupState (нови qualifying + ttl/weak_score затваряния),
+// архивира затворените. Връща null при грешка (вместо {}) - caller-ът НЕ
+// бива да запише празен/грешен blob върху вече натрупаните активни
+// наблюдения само защото тая стъпка е гръмнала (виж discussion-а "диагностична
+// грешка не бива да изтрива KV състояние").
+async function updateDiscoveryWakeups(env, scoresBySymbol, now) {
+  if (!env.ALERT_STATE) return null;
+  try {
+    const raw = await env.ALERT_STATE.get('discoverywakeupactive');
+    const currentActive = raw ? JSON.parse(raw) : {};
+    const { active, closed } = updateDiscoveryWakeupState(currentActive, scoresBySymbol, now, {
+      weakScoreThreshold: DISCOVERY_WEAK_SCORE_THRESHOLD, weakTickLimit: DISCOVERY_WEAK_TICK_LIMIT, ttlMs: DISCOVERY_POOL_TTL_MS,
+    });
+    const failed = await archiveClosedWakeups(env, closed, false);
+    for (const f of failed) active[f.symbol] = f.entry;
+    return active;
+  } catch (e) { console.error(`DISCOVERY WAKEUP update error: ${e.message}`); return null; }
+}
+
+// Фаза B (СЛЕД updateDiscoveryPool) - затваря промотираните, архивира ги,
+// и пише ЕДИНСТВЕНИЯ финален PUT на discoverywakeupactive за тоя тик (един
+// GET + един PUT на целия тик, независимо от броя активни наблюдения -
+// виж Уточнение №4/KV разходи).
+async function finalizeDiscoveryWakeupPromotions(env, activeAfterPhaseA, newPool, now) {
+  if (!env.ALERT_STATE) return;
+  try {
+    const { active, closed } = closeWakeupsPromotedToPool(activeAfterPhaseA, newPool, now);
+    const failed = await archiveClosedWakeups(env, closed, true);
+    for (const f of failed) active[f.symbol] = f.entry;
+    await env.ALERT_STATE.put('discoverywakeupactive', JSON.stringify(active));
+  } catch (e) { console.error(`DISCOVERY WAKEUP promotion finalize error: ${e.message}`); }
+}
+
+// Пренася Stage D-то вече изчислено exited[] (ttl_expired/weak_score/
+// displaced) в съответните discoveryepisode: записи - НЕ пипа
+// computeDiscoveryPoolUpdate/ranking-а по никакъв начин, само чете резултата
+// му. Именуването се мапва към точно трите стойности от заявката
+// (ttl_expired -> "ttl", останалите непроменени). Собствен try/catch на
+// символ - счупен episode запис не бива да развали останалите.
+const DISCOVERY_EXIT_REASON_MAP = { ttl_expired: 'ttl', weak_score: 'weak_score', displaced: 'displaced' };
+async function markDiscoveryEpisodesExited(env, exitedMembers, now) {
+  for (const m of exitedMembers) {
+    try {
+      const episodeKey = `discoveryepisode:${m.symbol}:${m.enteredAt}`;
+      const raw = await env.ALERT_STATE.get(episodeKey);
+      if (!raw) continue; // episode-ът още не е бил създаден (FULL ANALYSIS не е стигнал до тая монета) - няма какво да маркираме
+      const episode = JSON.parse(raw);
+      const mappedReason = DISCOVERY_EXIT_REASON_MAP[m.exitReason] || m.exitReason;
+      const updated = applyDiscoveryEpisodeExit(episode, mappedReason, now);
+      if (updated !== episode) await env.ALERT_STATE.put(episodeKey, JSON.stringify(updated));
+    } catch (e) { console.error(`DISCOVERY RADAR episode exit marking error for ${m.symbol}: ${e.message}`); }
+  }
+}
+
+// ---- DISCOVERY RADAR (Stage E) - FULL ANALYSIS wiring ----------------------
+// Пуска СЪЩАТА, напълно непроменена checkMarketSignals/scanSymbolSignals
+// верига (TARGET/TRAP/AUCTION/MIGRATION/VAH-VAL/CYCLE/SPARK/ENTRY ENGINE) за
+// текущите DISCOVERY_POOL членове - нулев нов логически риск, само различен
+// watchlist подаден. За разлика от updateDiscoverySnapshotState/
+// updateDiscoveryPool (гейтнати на ~15 мин), тук се пуска на ВСЕКИ CORE cron
+// tick (5 мин) - членството в pool-а се решава рядко (Stage D), но веднъж
+// избрана, монетата се следи със СЪЩАТА честота като CORE WATCHLIST, за да не
+// изостава ENTRY ENGINE прецизността ѝ (5м trigger candle, 15м confirmation).
+// Приема, че pool-ът МОЖЕ да е до ~5 мин остарял спрямо последния Stage D
+// ъпдейт (двете вървят паралелно в Promise.all, не последователно) - дребно,
+// самокоригиращо се разминаване на следващия tick, приемливо на фона на
+// вече съществуващата ~5-мин "davност" на BTC контекста по-долу.
+async function runDiscoveryFullAnalysis(env, watchlist = WATCHLIST) {
+  try {
+    if (!env.ALERT_STATE) return;
+    const rawPool = await env.ALERT_STATE.get('discoverypool');
+    const pool = rawPool ? JSON.parse(rawPool) : [];
+    if (!pool.length) return;
+    // Explicit dedup guard (defense-in-depth) - filterDiscoveryUniverse (Stage
+    // C) вече изключва CORE символите при влизане в pool-а, но тук пак
+    // филтрираме - за да не разчитаме СИГУРНОСТТА "един symbol никога не се
+    // анализира два пъти в един цикъл" единствено на коректността на друг,
+    // по-раншен stage. Дори ако CORE WATCHLIST/pool-ът се разминат по някаква
+    // бъдеща причина, тоя ред гарантира нулево дублиране тук и сега.
+    const coreSymbols = new Set(watchlist.map((w) => w.symbol));
+    const dedupedPool = pool.filter((m) => !coreSymbols.has(m.symbol));
+    if (!dedupedPool.length) return;
+    const rawBtc = await env.ALERT_STATE.get('btcflowcontext');
+    const btcFlowContext = rawBtc ? JSON.parse(rawBtc) : null; // null -> checkMarketSignals пада на neutral default (виж по-горе)
+    const poolWatchlist = dedupedPool.map((m) => ({ symbol: m.symbol }));
+    await checkMarketSignals(env, poolWatchlist, btcFlowContext);
+    // Stage F - ХРОНОЛОГИЧНО СЛЕД FULL ANALYSIS по-горе (не отделен Promise.all
+    // запис), за да вижда най-пресните sigstate/telemetry от тик-а, който
+    // току-що приключи, вместо да рискува ~5-мин race condition.
+    await updateDiscoveryEpisodes(env, dedupedPool);
+  } catch (e) { console.error(`DISCOVERY RADAR full analysis error: ${e.message}`); }
+}
+
+// ---- DISCOVERY RADAR (Stage F) - discovery episode telemetry --------------
+// Свързва целия lifecycle DISCOVERY -> SETUP -> ARMED -> ENTRY -> OUTCOME в
+// ЕДНО проследимо "episode" гнездо на symbol (собствен KV namespace
+// discoveryepisode:{symbol}:{enteredAt} - enteredAt е и episode ID, и
+// DISCOVERY timestamp-а, вече пазен от Stage D pool member-а). ЧИСТО
+// telemetry - нито един праг/gate/notification по-горе не чете тия записи
+// обратно. Всички данни идват от вече съществуващи, вече изчислени
+// източници - НУЛА нови мрежови заявки:
+//   - discovery: discoveryPrice/discoveryScore/discoveryDirection/
+//     discoveryConfidence от самия pool member (Stage D, вече immutable)
+//   - setup: sigstate.setup.{at,price} - price добавен в markSetupFired
+//     по-горе (чисто описателно поле, никой threshold/gate не го чете)
+//   - armed: sigstate.armed.{at,priceAtArm} - priceAtArm вече съществуваше
+//     отпреди (ENTRY TRIGGER контекст), само го четем тук
+//   - entry/outcome: съществуващият telemetry:{symbol}:{at} запис
+//     (buildTelemetryRecord/finalizePendingOutcomes по-горе) - четем го, не
+//     го променяме
+
+// Първи (най-ранен) SETUP след DISCOVERY - еднократно, никога не се презаписва.
+// liveActivityScore/liveConfidence (PR #101) - member.lastScore/lastConfidence
+// от discoverypool (Stage D), които вече се преизчисляват на ВСЕКИ tick за
+// ranking-а - НЕ е ново изчисление само за telemetry, само четем вече
+// съществуваща "жива" стойност в момента на SETUP-а (за разлика от
+// discovery.activityScore, който е immutable снимка от МОМЕНТА на влизане в pool-а).
+function applyDiscoveryEpisodeSetup(episode, sigstate, liveActivityScore, liveConfidence) {
+  if (episode.setup || !sigstate || !sigstate.setup) return episode;
+  const at = sigstate.setup.at;
+  const setupPrice = sigstate.setup.price ?? null;
+  const leadTimeSetupMin = (at - episode.discovery.at) / 60000;
+  const pctMoveToSetup = (setupPrice != null && episode.discovery.price > 0)
+    ? ((setupPrice - episode.discovery.price) / episode.discovery.price) * 100 : null;
+  return {
+    ...episode, setup: { at, price: setupPrice },
+    derived: {
+      ...episode.derived, leadTimeSetupMin, pctMoveToSetup,
+      activityScoreAtSetup: liveActivityScore ?? null,
+      confidenceAtSetup: liveConfidence ?? null,
+    },
+    status: 'setup',
+  };
+}
+
+// Първи (най-ранен) ARMED след DISCOVERY - еднократно, никога не се презаписва.
+function applyDiscoveryEpisodeArmed(episode, sigstate) {
+  if (episode.armed || !sigstate || !sigstate.armed) return episode;
+  const at = sigstate.armed.at;
+  const armedPrice = sigstate.armed.priceAtArm ?? null;
+  const leadTimeArmedMin = (at - episode.discovery.at) / 60000;
+  const pctMoveToArmed = (armedPrice != null && episode.discovery.price > 0)
+    ? ((armedPrice - episode.discovery.price) / episode.discovery.price) * 100 : null;
+  return {
+    ...episode, armed: { at, price: armedPrice },
+    derived: { ...episode.derived, leadTimeArmedMin, pctMoveToArmed },
+    status: 'armed',
+  };
+}
+
+// Първо ENTRY/MISSED/VETO телеметрично събитие след DISCOVERY - еднократно.
+// ATR-нормализираният price travel (atrMoveToEntry) се смята САМО тук, защото
+// atr5m е вече изчислен и записан в СЪЩЕСТВУВАЩИЯ telemetry запис - никакъв
+// нов fetch, точно за SETUP/ARMED нямаме готов ATR под ръка, затова там няма
+// ATR-нормализирана метрика (умишлено, виж заявката).
+// liveActivityScore/liveConfidence (PR #101) - виж коментара при
+// applyDiscoveryEpisodeSetup по-горе, идентична логика тук за ENTRY момента.
+function applyDiscoveryEpisodeEntry(episode, entryTelemetryRecord, liveActivityScore, liveConfidence) {
+  if (episode.entry || !entryTelemetryRecord) return episode;
+  const {
+    at, decision, triggerClose: entryPrice, entryScore, atr5m, chaseDistanceAtrRatio,
+    outcome5m, outcome15m, outcome30m, outcome60m, outcome240m, setupMode, episodeId,
+  } = entryTelemetryRecord;
+  const leadTimeEntryMin = (at - episode.discovery.at) / 60000;
+  const pctMoveToEntry = (entryPrice != null && episode.discovery.price > 0)
+    ? ((entryPrice - episode.discovery.price) / episode.discovery.price) * 100 : null;
+  const atrMoveToEntry = (atr5m > 0 && entryPrice != null && episode.discovery.price != null)
+    ? Math.abs(entryPrice - episode.discovery.price) / atr5m : null;
+  return {
+    ...episode,
+    entry: {
+      at, price: entryPrice, decision, entryScore: entryScore ?? null,
+      atr5m: atr5m ?? null, chaseDistanceAtrRatio: chaseDistanceAtrRatio ?? null,
+      // Multi-horizon (PR #101, огледално на основната ENTRY telemetry) -
+      // всичките пет тръгват null тук (outcome механизмът ги попълва по-
+      // късно, виж applyDiscoveryEpisodeOutcome по-долу), пазени ОТДЕЛНО по
+      // decision (confirmed срещу missed) чрез самото entry.decision поле -
+      // никога не се смесват в агрегацията (виж buildDiscoveryEpisodeSummary).
+      // outcome240m (4ч) добавен по-късно (виж discussion-а) - 1d остава за след наблюдение.
+      outcome5m: outcome5m ?? null, outcome15m: outcome15m ?? null,
+      outcome30m: outcome30m ?? null, outcome60m: outcome60m ?? null,
+      outcome240m: outcome240m ?? null,
+      // Пазим setupMode, за да можем по-късно да пресъздадем ТОЧНИЯ KV ключ
+      // (telemetry:{symbol}:{at}:{setupMode}, виж updateDiscoveryEpisodes по-долу)
+      // - иначе outcome refresh-ът никога няма да намери записа.
+      setupMode: setupMode ?? null,
+      // DISCOVERY -> CORE LINK (виж discussion-а "episode clustering") -
+      // entryTelemetryRecord вече носи episodeId (buildTelemetryRecord
+      // по-горе) - четем го директно тук, нулево ново изчисление/заявка.
+      // Еднократно, никога не се презаписва (огледално на entry по-горе) -
+      // еднозначен линк към ENTRY ENGINE episode-а (виж discussion-а за
+      // edge cases при повторен Discovery pool entry/нов CORE episode).
+      entryEpisodeId: episodeId ?? null,
+    },
+    derived: {
+      ...episode.derived, leadTimeEntryMin, pctMoveToEntry, atrMoveToEntry,
+      activityScoreAtEntry: liveActivityScore ?? null,
+      confidenceAtEntry: liveConfidence ?? null,
+    },
+    // 'veto' няма смислен outcome за измерване (нищо не е отворено) - завършваме
+    // епизода веднага. 'confirmed' И 'missed' (PR #101 - missed е "counterfactual
+    // chase" наблюдение, вече проследено от resolvePendingOutcomeHorizons/wiring-а
+    // в scanSymbolSignals) чакат съществуващия multi-horizon outcome механизъм.
+    status: (decision === 'confirmed' || decision === 'missed') ? 'entry_pending_outcome' : 'complete',
+  };
+}
+
+// Опреснява outcome5m/15m/30m/60m/240m от СЪЩИЯ вече записан entry telemetry
+// запис, веднъж щом съществуващият multi-horizon outcome механизъм
+// (resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals) ги попълни -
+// чисто четене, никаква нова логика за самите outcome стойности. Episode-ът
+// минава в 'complete' едва след като ВСИЧКИТЕ 5 хоризонта са резолвнати
+// (outcome240m последен) - до тогава остава 'entry_pending_outcome', за да
+// продължи updateDiscoveryEpisodes да го опреснява.
+function applyDiscoveryEpisodeOutcome(episode, freshRecord) {
+  if (!episode.entry || (episode.entry.decision !== 'confirmed' && episode.entry.decision !== 'missed') || !freshRecord) {
+    return episode;
+  }
+  const entry = { ...episode.entry };
+  let changed = false;
+  for (const field of ['outcome5m', 'outcome15m', 'outcome30m', 'outcome60m', 'outcome240m']) {
+    if (entry[field] == null && freshRecord[field] != null) { entry[field] = freshRecord[field]; changed = true; }
+  }
+  if (!changed) return episode;
+  const allResolved = entry.outcome5m != null && entry.outcome15m != null && entry.outcome30m != null
+    && entry.outcome60m != null && entry.outcome240m != null;
+  return { ...episode, entry, status: allResolved ? 'complete' : episode.status };
+}
+
+// Маркира КОГА и ЗАЩО символът реално е напуснал DISCOVERY_POOL (Stage D
+// eviction) - чисто описателно поле, ОРТОГОНАЛНО на setup/armed/entry
+// прогреса (виж classifyDiscoveryEpisodePoolStatus по-долу за точно как се
+// разделят "напусна БЕЗ прогрес" от "прогресира, ПОСЛЕ напусна"). Еднократно
+// - не презаписва вече маркиран exit. НЕ променя ranking/eviction логиката
+// на Stage D по никакъв начин - само чете вече изчисления resultat оттам.
+function applyDiscoveryEpisodeExit(episode, exitReason, now) {
+  if (episode.exitedAt != null) return episode;
+  return { ...episode, exitedAt: now, exitReason };
+}
+
+// Разделя episode-ите на точно трите категории от заявката:
+//   - 'progressed'          - стигнал поне SETUP (независимо дали после е
+//                              напуснал pool-а - прогресът НЕ се отменя от exit)
+//   - 'exited_before_setup'  - напуснал pool-а БЕЗ никога да стигне SETUP
+//   - 'active'               - все още в pool-а, все още има шанс
+function classifyDiscoveryEpisodePoolStatus(episode) {
+  if (episode.setup || episode.armed || episode.entry) return 'progressed';
+  if (episode.exitedAt != null) return 'exited_before_setup';
+  return 'active';
+}
+
+// Построява НАЧАЛНИЯ episode запис от pool member-а (Stage D discoveryPrice/
+// discoveryScore/discoveryDirection/discoveryConfidence - immutable снимка
+// от момента на влизане в pool-а).
+function buildDiscoveryEpisode(poolMember) {
+  return {
+    symbol: poolMember.symbol,
+    enteredAt: poolMember.enteredAt,
+    discovery: {
+      at: poolMember.enteredAt, price: poolMember.discoveryPrice ?? null,
+      activityScore: poolMember.discoveryScore ?? null, direction: poolMember.discoveryDirection ?? null,
+      confidence: poolMember.discoveryConfidence ?? null,
+    },
+    setup: null, armed: null, entry: null,
+    // FIRST QUALIFYING WAKE-UP (Етап 2) - immutable снимка на момента, в
+    // който символът ПЪРВО пресякъл DISCOVERY_WEAK_SCORE_THRESHOLD, ПРЕДИ да
+    // влезе в pool-а (poolMember.wakeupAt - виж computeDiscoveryPoolUpdate/
+    // wakeupBySymbol stamping-а по-горе). null, ако символът е влязъл в
+    // pool-а директно, без предходно засечено "будене" (напр. qualifying
+    // прага пресечен в СЪЩИЯ тик, в който pool-ът има свободен слот).
+    wakeup: poolMember.wakeupAt != null ? {
+      at: poolMember.wakeupAt, price: poolMember.wakeupPrice ?? null,
+      score: poolMember.wakeupScore ?? null, confidence: poolMember.wakeupConfidence ?? null,
+    } : null,
+    // activityScoreAtDiscovery/confidenceAtDiscovery (PR #101) - чист alias на
+    // discovery.activityScore/confidence по-горе, държан и тук за да живеят
+    // ВСИЧКИТЕ "At*" evolution снимки (Discovery/Setup/Entry) в ЕДНО общо
+    // гнездо (derived) - прави delta изчисленията в buildDiscoveryEpisodeSummary
+    // еднообразни, без нужда да четем от две различни места.
+    derived: {
+      activityScoreAtDiscovery: poolMember.discoveryScore ?? null,
+      confidenceAtDiscovery: poolMember.discoveryConfidence ?? null,
+    },
+    status: 'discovery',
+  };
+}
+
+// Намира ПЪРВИЯ (най-ранен) telemetry:{symbol}:* запис с at >= sinceAt - без
+// да тегли стойностите на всички кандидати, само листва ключовете (евтино),
+// сортира по вградения в самия ключ timestamp, после чете САМО избрания.
+async function findFirstEntryTelemetryRecord(env, symbol, sinceAt) {
+  const listResult = await env.ALERT_STATE.list({ prefix: `telemetry:${symbol}:` });
+  const candidates = (listResult.keys || [])
+    .map((k) => ({ name: k.name, at: parseInt(k.name.split(':')[2], 10) }))
+    .filter((c) => Number.isFinite(c.at) && c.at >= sinceAt)
+    .sort((a, b) => a.at - b.at);
+  if (!candidates.length) return null;
+  const raw = await env.ALERT_STATE.get(candidates[0].name);
+  return raw ? JSON.parse(raw) : null;
+}
+
+// Wiring: за всеки текущ (дедупликиран, виж runDiscoveryFullAnalysis) pool
+// член - зарежда/създава episode-а, напредва setup/armed от sigstate,
+// намира/опреснява entry+outcome от съществуващия telemetry:. Собствен
+// try/catch НА СИМВОЛ (един счупен episode не бива да спре останалите).
+async function updateDiscoveryEpisodes(env, pool) {
+  if (!env.ALERT_STATE || !pool || !pool.length) return;
+  for (const member of pool) {
+    try {
+      const episodeKey = `discoveryepisode:${member.symbol}:${member.enteredAt}`;
+      const rawEpisode = await env.ALERT_STATE.get(episodeKey);
+      let episode = rawEpisode ? JSON.parse(rawEpisode) : buildDiscoveryEpisode(member);
+      if (episode.status === 'complete') continue;
+
+      const sigstate = await loadSymbolState(env, member.symbol);
+      episode = applyDiscoveryEpisodeSetup(episode, sigstate, member.lastScore, member.lastConfidence);
+      episode = applyDiscoveryEpisodeArmed(episode, sigstate);
+
+      if (!episode.entry) {
+        const entryRecord = await findFirstEntryTelemetryRecord(env, member.symbol, episode.discovery.at);
+        episode = applyDiscoveryEpisodeEntry(episode, entryRecord, member.lastScore, member.lastConfidence);
+      } else if (episode.status === 'entry_pending_outcome' && episode.entry.setupMode) {
+        // Bug fix: telemetry KV ключът вече включва setupMode суфикс (виж
+        // PR #98) - без него този GET винаги връщаше null и outcome-ът никога
+        // не се опресняваше за episode-и, чийто entry е бил записан след тази
+        // промяна. Стари episode-и без записан entry.setupMode (отпреди фикса)
+        // остават permanently pending - приемливо, самоограничаващо се (виж
+        // прецедента с "phantom active" episode-и от миграции по-рано).
+        const rawTelemetry = await env.ALERT_STATE.get(`telemetry:${member.symbol}:${episode.entry.at}:${episode.entry.setupMode}`);
+        const freshRecord = rawTelemetry ? JSON.parse(rawTelemetry) : null;
+        episode = applyDiscoveryEpisodeOutcome(episode, freshRecord);
+      }
+
+      await env.ALERT_STATE.put(episodeKey, JSON.stringify(episode));
+    } catch (e) { console.error(`DISCOVERY RADAR episode update error for ${member.symbol}: ${e.message}`); }
+  }
+}
+
+// Lifetime (мин) на ЕДИН episode, изчислен само за вече напуснали pool-а
+// (exitedAt зададен) - чисто описателна метрика, никаква логика не я чете
+// обратно.
+function calcDiscoveryEpisodeLifetimeMin(episode) {
+  if (episode.exitedAt == null || episode.enteredAt == null) return null;
+  return (episode.exitedAt - episode.enteredAt) / 60000;
+}
+
+// Стандартна линейна интерполация - sortedValues ТРЯБВА да е вече сортиран
+// възходящо. Връща null за празен масив.
+function calcPercentile(sortedValues, p) {
+  if (!sortedValues.length) return null;
+  const idx = (p / 100) * (sortedValues.length - 1);
+  const lower = Math.floor(idx), upper = Math.ceil(idx);
+  if (lower === upper) return sortedValues[lower];
+  return sortedValues[lower] + (sortedValues[upper] - sortedValues[lower]) * (idx - lower);
+}
+
+// avg/median/p25/p75 на масив от lifetimeMin стойности - null полета при
+// празен вход (без throw).
+function calcLifetimeStats(lifetimes) {
+  if (!lifetimes.length) return { avgLifetimeMin: null, medianLifetimeMin: null, p25LifetimeMin: null, p75LifetimeMin: null };
+  const sorted = [...lifetimes].sort((a, b) => a - b);
+  return {
+    avgLifetimeMin: lifetimes.reduce((a, b) => a + b, 0) / lifetimes.length,
+    medianLifetimeMin: calcPercentile(sorted, 50),
+    p25LifetimeMin: calcPercentile(sorted, 25),
+    p75LifetimeMin: calcPercentile(sorted, 75),
+  };
+}
+
+// Средни Stage B discovery-time метрики (activityScore/confidence) +
+// direction разпределение за подадена група episode-и - реюзвано за
+// progressedVsDisplaced по-долу.
+function summarizeDiscoveryGroup(episodes) {
+  let activityScoreSum = 0, activityScoreCount = 0, confidenceSum = 0, confidenceCount = 0;
+  const byDirection = { long: 0, short: 0, neutral: 0 };
+  for (const ep of episodes) {
+    const disc = ep.discovery || {};
+    if (disc.activityScore != null) { activityScoreSum += disc.activityScore; activityScoreCount++; }
+    if (disc.confidence != null) { confidenceSum += disc.confidence; confidenceCount++; }
+    if (byDirection[disc.direction] != null) byDirection[disc.direction]++;
+  }
+  return {
+    count: episodes.length,
+    avgActivityScore: activityScoreCount ? activityScoreSum / activityScoreCount : null,
+    avgConfidence: confidenceCount ? confidenceSum / confidenceCount : null,
+    byDirection,
+  };
+}
+
+// avg/win-rate за произволно entry.<field> измежду подадените episode-и -
+// огледално на buildOutcomeStatsForField (телеметрия по-горе), само че четено
+// от episode.entry вместо direct record полета - реюзвано за outcomeByHorizon
+// по-долу (PR #101).
+function buildDiscoveryOutcomeStatsForField(episodes, field) {
+  let sum = 0, count = 0, wins = 0;
+  for (const ep of episodes) {
+    const v = ep.entry ? ep.entry[field] : null;
+    if (v != null) { sum += v; count++; if (v > 0) wins++; }
+  }
+  return { count, avgOutcomePct: count ? sum / count : null, winRatePct: count ? (wins / count) * 100 : null };
+}
+
+// Агрегира вече заредени/филтрирани discoveryepisode: записи (чисто
+// in-memory, БЕЗ KV достъп тук - виж /discovery-episodes ендпойнта по-долу),
+// огледално на buildTelemetrySummary по-горе.
+function buildDiscoveryEpisodeSummary(episodes) {
+  const summary = {
+    total: episodes.length,
+    byStatus: { discovery: 0, setup: 0, armed: 0, entry_pending_outcome: 0, complete: 0 },
+    // Отговаря директно на хипотезата от заявката - "active" все още има
+    // шанс, "exited_before_setup" е напуснал pool-а БЕЗ прогрес (виж
+    // classifyDiscoveryEpisodePoolStatus по-горе), "progressed" стигнал е
+    // поне SETUP (прогресът НЕ се отменя от по-късен pool exit).
+    byPoolStatus: { active: 0, exited_before_setup: 0, progressed: 0 },
+    byExitReason: { ttl: 0, weak_score: 0, displaced: 0 }, // само измежду exited_before_setup
+    bySymbol: {},
+    avgLeadTimeSetupMin: null, avgLeadTimeArmedMin: null, avgLeadTimeEntryMin: null,
+    avgPctMoveToSetup: null, avgPctMoveToArmed: null, avgPctMoveToEntry: null,
+    avgAtrMoveToEntry: null,
+    outcome: { count: 0, avgOutcomePct: null, winRatePct: null },
+    // Колко реално време (мин) е получил един DISCOVERY кандидат, преди да
+    // напусне pool-а БЕЗ да стигне SETUP - само измежду exited_before_setup
+    // (не и "прогресирал, после напуснал" - за тях въпросът "получи ли
+    // достатъчно време" вече е неактуален, стигнал е SETUP). Чисто
+    // observability - НЕ участва в ranking/eviction/thresholds.
+    lifetime: {
+      avgLifetimeMin: null, medianLifetimeMin: null, p25LifetimeMin: null, p75LifetimeMin: null,
+      byExitReason: { ttl: null, weak_score: null, displaced: null },
+    },
+  };
+  const acc = {
+    leadSetup: [], leadArmed: [], leadEntry: [], pctSetup: [], pctArmed: [], pctEntry: [], atrEntry: [], outcomes: [],
+    lifetimesAll: [], lifetimesByReason: { ttl: [], weak_score: [], displaced: [] },
+  };
+  for (const ep of episodes) {
+    if (summary.byStatus[ep.status] != null) summary.byStatus[ep.status]++;
+    const poolStatus = classifyDiscoveryEpisodePoolStatus(ep);
+    summary.byPoolStatus[poolStatus]++;
+    if (poolStatus === 'exited_before_setup') {
+      if (summary.byExitReason[ep.exitReason] != null) summary.byExitReason[ep.exitReason]++;
+      const lifetimeMin = calcDiscoveryEpisodeLifetimeMin(ep);
+      if (lifetimeMin != null) {
+        acc.lifetimesAll.push(lifetimeMin);
+        if (acc.lifetimesByReason[ep.exitReason]) acc.lifetimesByReason[ep.exitReason].push(lifetimeMin);
+      }
+    }
+    summary.bySymbol[ep.symbol] = (summary.bySymbol[ep.symbol] || 0) + 1;
+    const d = ep.derived || {};
+    if (d.leadTimeSetupMin != null) acc.leadSetup.push(d.leadTimeSetupMin);
+    if (d.leadTimeArmedMin != null) acc.leadArmed.push(d.leadTimeArmedMin);
+    if (d.leadTimeEntryMin != null) acc.leadEntry.push(d.leadTimeEntryMin);
+    if (d.pctMoveToSetup != null) acc.pctSetup.push(d.pctMoveToSetup);
+    if (d.pctMoveToArmed != null) acc.pctArmed.push(d.pctMoveToArmed);
+    if (d.pctMoveToEntry != null) acc.pctEntry.push(d.pctMoveToEntry);
+    if (d.atrMoveToEntry != null) acc.atrEntry.push(d.atrMoveToEntry);
+    if (ep.entry && ep.entry.decision === 'confirmed' && ep.entry.outcome15m != null) acc.outcomes.push(ep.entry.outcome15m);
+  }
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  summary.avgLeadTimeSetupMin = avg(acc.leadSetup);
+  summary.avgLeadTimeArmedMin = avg(acc.leadArmed);
+  summary.avgLeadTimeEntryMin = avg(acc.leadEntry);
+  summary.avgPctMoveToSetup = avg(acc.pctSetup);
+  summary.avgPctMoveToArmed = avg(acc.pctArmed);
+  summary.avgPctMoveToEntry = avg(acc.pctEntry);
+  summary.avgAtrMoveToEntry = avg(acc.atrEntry);
+  summary.outcome.count = acc.outcomes.length;
+  summary.outcome.avgOutcomePct = avg(acc.outcomes);
+  summary.outcome.winRatePct = acc.outcomes.length ? (acc.outcomes.filter((o) => o > 0).length / acc.outcomes.length) * 100 : null;
+  summary.lifetime = {
+    ...calcLifetimeStats(acc.lifetimesAll),
+    byExitReason: {
+      ttl: calcLifetimeStats(acc.lifetimesByReason.ttl),
+      weak_score: calcLifetimeStats(acc.lifetimesByReason.weak_score),
+      displaced: calcLifetimeStats(acc.lifetimesByReason.displaced),
+    },
+  };
+
+  // Диагностично сравнение "какво отличава progressed кандидатите от масата
+  // displaced" (виж заявката) - по Stage B discovery-time метрики
+  // (activityScore/direction/confidence, immutable снимка от buildDiscoveryEpisode)
+  // + собствения timing profil на всяка група. НЕ участва в ranking/eviction -
+  // чисто наблюдение върху вече записаните episode данни.
+  const progressedEpisodes = episodes.filter((ep) => classifyDiscoveryEpisodePoolStatus(ep) === 'progressed');
+  const displacedEpisodes = episodes.filter((ep) => classifyDiscoveryEpisodePoolStatus(ep) === 'exited_before_setup' && ep.exitReason === 'displaced');
+  // PR #101 - "не стартовият Activity Score, а ЕВОЛЮЦИЯТА му" (виж заявката):
+  // delta = стойността В МОМЕНТА на SETUP/ENTRY минус discovery-time снимката,
+  // само за episode-и, които реално са стигнали дотам (derived.activityScoreAtSetup/
+  // AtEntry идват от applyDiscoveryEpisodeSetup/Entry по-горе, вече "живи"
+  // member.lastScore/lastConfidence стойности от discoverypool - без ново изчисление).
+  const avgDelta = (eps, filterField, atField, baseField) => avg(
+    eps.filter((ep) => ep[filterField]).map((ep) => {
+      const d = ep.derived || {};
+      return (d[atField] != null && d[baseField] != null) ? d[atField] - d[baseField] : null;
+    }).filter((v) => v != null)
+  );
+  summary.progressedVsDisplaced = {
+    progressed: {
+      ...summarizeDiscoveryGroup(progressedEpisodes),
+      avgLeadTimeSetupMin: avg(progressedEpisodes.map((ep) => (ep.derived || {}).leadTimeSetupMin).filter((v) => v != null)),
+      avgDeltaActivityDiscoveryToSetup: avgDelta(progressedEpisodes, 'setup', 'activityScoreAtSetup', 'activityScoreAtDiscovery'),
+      avgDeltaConfidenceDiscoveryToSetup: avgDelta(progressedEpisodes, 'setup', 'confidenceAtSetup', 'confidenceAtDiscovery'),
+      avgDeltaActivityDiscoveryToEntry: avgDelta(progressedEpisodes, 'entry', 'activityScoreAtEntry', 'activityScoreAtDiscovery'),
+      avgDeltaConfidenceDiscoveryToEntry: avgDelta(progressedEpisodes, 'entry', 'confidenceAtEntry', 'confidenceAtDiscovery'),
+    },
+    displaced: {
+      ...summarizeDiscoveryGroup(displacedEpisodes),
+      avgLifetimeMin: avg(displacedEpisodes.map((ep) => calcDiscoveryEpisodeLifetimeMin(ep)).filter((v) => v != null)),
+    },
+  };
+
+  // Multi-horizon Discovery ENTRY outcome (PR #101, огледално на
+  // outcomeByHorizon в buildTelemetrySummary) - CONFIRMED и MISSED (counterfactual
+  // chase наблюдение) държани СТРОГО отделно, за да не се смесват в
+  // агрегацията (виж заявката т.1).
+  const confirmedEntryEpisodes = episodes.filter((ep) => ep.entry && ep.entry.decision === 'confirmed');
+  const missedEntryEpisodes = episodes.filter((ep) => ep.entry && ep.entry.decision === 'missed');
+  summary.outcomeByHorizon = { confirmed: {}, missed: {} };
+  for (const m of OUTCOME_HORIZONS_MIN) {
+    const field = `outcome${m}m`;
+    summary.outcomeByHorizon.confirmed[`m${m}`] = buildDiscoveryOutcomeStatsForField(confirmedEntryEpisodes, field);
+    summary.outcomeByHorizon.missed[`m${m}`] = buildDiscoveryOutcomeStatsForField(missedEntryEpisodes, field);
+  }
+  return summary;
+}
+
+// Агрегира вече заредени/филтрирани flowwarmingevent: записи (чисто
+// in-memory, БЕЗ KV достъп тук - виж /flow-warming-events ендпойнта по-долу).
+// Чисто diagnostic - целта е да отговори дали FLOW WARMING прагът
+// (виж calcFlowWarmingScore/getFlowWarmingTier) е прекалено строг за major
+// монети (BTC/ETH), преди да го разхлабваме на сляпо.
+function buildFlowWarmingSummary(records) {
+  const summary = {
+    total: records.length,
+    byTier: { warming: 0, leader: 0 },
+    byDirection: { long: 0, short: 0 },
+    byCoinTier: { major: 0, semi: 0, minor: 0 },
+    bySymbol: {},
+    avgScore: null,
+  };
+  let scoreSum = 0, scoreCount = 0;
+  for (const r of records) {
+    if (summary.byTier[r.tier] != null) summary.byTier[r.tier]++;
+    if (summary.byDirection[r.direction] != null) summary.byDirection[r.direction]++;
+    if (summary.byCoinTier[r.coinTier] != null) summary.byCoinTier[r.coinTier]++;
+    summary.bySymbol[r.symbol] = (summary.bySymbol[r.symbol] || 0) + 1;
+    if (typeof r.score === 'number') { scoreSum += r.score; scoreCount++; }
+  }
+  summary.avgScore = scoreCount ? +(scoreSum / scoreCount).toFixed(2) : null;
+  return summary;
+}
+
+export {
+  calcDCALevels, checkDcaLevels, checkPriceLevels, sendWhatsApp, scanSymbolSignals, checkMarketSignals, checkMacroSqueeze,
+  updateDiscoverySnapshotState, runDiscoveryFullAnalysis,
+  // ЕТАП 1 - ENTRY TELEMETRY INTEGRITY AUDIT - изложени само за unit тестове
+  // (виж worker-entry-telemetry-integrity.test.js), НЕ се ползват от друг
+  // производствен код извън worker.js самия.
+  buildTelemetryRecord, buildTcSetupCreatedRecord, buildTcArmedCreatedRecord, buildTcArmedResetRecord,
+  buildTcLifecycleSummary, buildTcReArmStats, buildTcLatencyBuckets, buildTcResetByReason,
+  buildTelemetrySummary, buildEpisodeSummary,
+  buildTcConversionMetrics, buildCoverageRange, countPossibleDuplicateEvents,
+  countUnmatchedEvaluations, countMissingLatency, buildTcIntegrityDiagnostics,
+  buildTelemetryIntegrityDiagnostics,
+  // PR #141 review fix - изложени само за unit тестове.
+  buildTcMissingEpisodeIds, buildTcCohortStatus, listKvKeysWithTruncation,
+  // COINGLASS LIQUIDATION DIAGNOSTICS - изложени само за unit тестове.
+  fetchLiquidationOrdersWorker, calcLiquidationCascade, accumulateLiquidationGravity,
+  findNearestLiquidationCluster, calcLiquidationGravityScore, getLiquidationGravityTier,
+  isLiqDiagEnabled, toCoinGlassCoin, classifyCoinGlassLiqResponse, normalizeLiqDiagOrders,
+  buildLiqDiagUrl, fetchLiquidationOrdersDiag, detectLiqDiagTruncation, applyLiqShadowStep,
+  runLiqShadowDiagnostics, buildLiqDiagSummary, runLiqDiagProbe, WATCHLIST,
+  fetchLiquidationOrdersRelayDiag, getLiqDiagSource, fetchLiquidationOrdersShadow,
+};
+
+// Transport mitigation (виж discussion-а "Provider rate-limit root-cause
+// анализ" - football.html Dashboard-ова страна) - Cloudflare Observability
+// потвърди реален cluster от 3 идентични /apisports/fixtures?live=all заявки
+// в рамките на <2s, стигащи до Worker-а (вкл. поне веднъж от трафик, който
+// НЕ носи сигнатурата на Dashboard-а самия - utm_source параметър, който
+// football.html никога не добавя). Worker-ът дотогава нямаше НИКАКЪВ
+// caching/inflight dedup - всяка входяща заявка (от кой да е caller -
+// Dashboard таб, устройство, external hit) тригерваше независим реален
+// upstream fetch. `apisportsLiveAllInflightPromise` е ЕДИНСТВЕНОТО ново
+// module-level състояние - single-flight lock, СКОПиран изключително до
+// /fixtures?live=all branch-а по-долу (виж fetch()). НЕ е доказан root-cause
+// fix - само защитно намалява реалния upstream call rate за near-duplicate
+// заявки в кратък прозорец, независимо от произхода им.
+let apisportsLiveAllInflightPromise = null;
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const search = url.search;
+
+    if (path.startsWith("/yahoo/")) {
+      const symbol = path.replace("/yahoo/", "");
+      const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`;
+      const response = await fetch(yahooUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          "Accept": "application/json"
+        }
+      });
+      const data = await response.json();
+      return new Response(JSON.stringify(data), {
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    // Whitelist за /football/ (PRIORITY 3 от финалния анализ): без него ВСЕКИ
+    // path зад /football/ минаваше директно към football-data.org с нашия
+    // FOOTBALL_DATA_TOKEN - всеки, който знае Worker URL-а, можеше да го
+    // ползва като безплатен прокси и да изразходва квотата ни (аналогично на
+    // вече фиксираната CoinGlass дупка). Токен (PROXY_TOKEN) НЕ е добавен
+    // умишлено - football.html е публична страница на gabas82.github.io,
+    // токен, вграден в публичен клиентски JS, се вижда веднага през
+    // view-source и не крие нищо реално (същата причина, поради която
+    // CoinGlass защитата по-долу също е чист whitelist, не token). Пътищата
+    // тук са изведени директно от реалната употреба в football.html.
+    const ALLOWED_FOOTBALL_PATHS = ['/competitions/', '/matches'];
+    if (path.startsWith("/football/")) {
+      const footballPath = path.replace("/football", "");
+      if (!ALLOWED_FOOTBALL_PATHS.some(p => footballPath.startsWith(p))) {
+        return new Response(JSON.stringify({ error: "Forbidden" }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      const footballUrl = `https://api.football-data.org/v4${footballPath}${search}`;
+      const response = await fetch(footballUrl, {
+        headers: {
+          "X-Auth-Token": env.FOOTBALL_DATA_TOKEN
+        }
+      });
+      const data = await response.json();
+      return new Response(JSON.stringify(data), {
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    // Whitelist за /apisports/ - същата причина/подход като /football/ по-горе.
+    const ALLOWED_APISPORTS_PATHS = ['/fixtures', '/players/', '/standings'];
+    if (path.startsWith("/apisports/")) {
+      const apiPath = path.replace("/apisports", "");
+      if (!ALLOWED_APISPORTS_PATHS.some(p => apiPath.startsWith(p))) {
+        return new Response(JSON.stringify({ error: "Forbidden" }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      // Transport mitigation (виж коментара при apisportsLiveAllInflightPromise
+      // по-горе) - СТРИКТНО скопирана до /fixtures?live=all, нищо друго под
+      // /apisports/ не минава през тоя клон. Cache identity е canonical
+      // upstream URL (без tracking/други query параметри от входящата
+      // заявка - виж discussion-а "tracking параметри не трябва да създават
+      // отделен cache entry"), не raw incoming request URL.
+      if (apiPath === '/fixtures' && url.searchParams.get('live') === 'all') {
+        const canonicalLiveAllUrl = 'https://v3.football.api-sports.io/fixtures?live=all';
+        const cacheKey = new Request(canonicalLiveAllUrl, { method: 'GET' });
+        const cache = caches.default;
+        const cachedResponse = await cache.match(cacheKey);
+        if (cachedResponse) return cachedResponse;
+
+        if (!apisportsLiveAllInflightPromise) {
+          apisportsLiveAllInflightPromise = (async () => {
+            try {
+              const response = await fetch(canonicalLiveAllUrl, {
+                headers: { "x-apisports-key": env.APISPORTS_KEY }
+              });
+              const data = await response.json();
+              // Огледално на вече доказания detection сигнал в apiFetchAS()
+              // (football.html) - api-sports.io връща HTTP 200 дори при
+              // достигнат лимит, с {"errors":{...}} тяло. Cache-ваме
+              // ИЗКЛЮЧИТЕЛНО успешен отговор (празен errors обект/масив) -
+              // provider грешка (rateLimit или друга) никога не влиза в
+              // cache-а и никога не удължава TTL-а.
+              const hasProviderError = !!(data && data.errors && Object.keys(data.errors).length);
+              // PRE-MERGE корекция (виж discussion-а "transient/anomalous
+              // zero response caching риск") - production наблюдение (6 live
+              // мача -> 0 -> 0 -> 6 отново, без user interaction) доказа, че
+              // upstream МОЖЕ да върне легитимен-изглеждащ `errors:[],
+              // results:0, response:[]` временно, дори докато реално има live
+              // мачове. `results:0` е структурно НЕРАЗЛИЧИМО от "наистина
+              // няма live мачове в момента" - НЯМА надежден начин да се
+              // различат без heuristic/hindsight (сравнение с предишно
+              // известно състояние), което изрично не въвеждаме. Затова: НЕ
+              // кешираме НИКАКВА нула, независимо от причината - единна,
+              // uniform проверка, не "detection" на anomaly. Иначе 1
+              // transient/anomalous нула би се споделяла към ВСИЧКИ caller-и
+              // за 15s (cache-ът е shared между tabove/устройства), вместо да
+              // си остане изолирана за 1 caller, 1 момент, каквото е pre-
+              // mitigation поведението. Legitimate нула (действително няма
+              // live мачове) просто губи cache защитата - всеки caller пак
+              // прави собствена upstream заявка, точно както преди тая цяла
+              // задача - нулева промяна в коректността, само по-малко
+              // защитено от clustering през тия периоди.
+              const hasLiveMatches = Array.isArray(data && data.response) && data.response.length > 0;
+              if (!hasProviderError && hasLiveMatches) {
+                const toCache = new Response(JSON.stringify(data), {
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "max-age=15"
+                  }
+                });
+                await cache.put(cacheKey, toCache);
+              }
+              return data;
+            } finally {
+              apisportsLiveAllInflightPromise = null;
+            }
+          })();
+        }
+        const data = await apisportsLiveAllInflightPromise;
+        return new Response(JSON.stringify(data), {
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*"
+          }
+        });
+      }
+
+      const apiUrl = `https://v3.football.api-sports.io${apiPath}${search}`;
+      const response = await fetch(apiUrl, {
+        headers: {
+          "x-apisports-key": env.APISPORTS_KEY
+        }
+      });
+      const data = await response.json();
+      return new Response(JSON.stringify(data), {
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    if (path === "/tv-alert" && (request.method === "POST" || request.method === "GET")) {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TV_ALERT_TOKEN || "").trim();
+      // fail-closed: ако TV_ALERT_TOKEN secret-ът липсва, expectedToken е "" и
+      // старата проверка `expectedToken && ...` се прескачаше изцяло, пускайки
+      // всякакви заявки без токен. Сега липсващ secret също отказва достъп.
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      // GET - за ръчно тестване директно от адресната лента на браузъра (query params
+      // вместо JSON тяло). Реалният TradingView webhook винаги праща POST с JSON.
+      let payload;
+      if (request.method === "GET") {
+        payload = Object.fromEntries(url.searchParams.entries());
+      } else {
+        try {
+          payload = JSON.parse(await request.text());
+        } catch (e) {
+          return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+      }
+      const val = (v, digits) => v == null ? "?" : (digits != null ? Number(v).toFixed(digits) : v);
+      const text = `🔭 ALT CYCLE RADAR\nФаза: ${payload.phase || "?"}\nScore: ${val(payload.score, 1)}/100\n\n`
+        + `BTC.D: ${val(payload.btcD, 2)}%\nALT/BTC: ${val(payload.altBtc, 4)}\n`
+        + `Breadth 30/60/90: ${val(payload.breadth30, 0)}/${val(payload.breadth60, 0)}/${val(payload.breadth90, 0)}\n\n`
+        + `Дата: ${payload.time || "?"}`;
+      const cmResult = await sendWhatsApp(env, text);
+      return new Response(JSON.stringify({ ok: true, callmebot: cmResult }), { headers: { "Content-Type": "application/json" } });
+    }
+
+    // ENTRY ENGINE TELEMETRY - read-only debug ендпойнт (виж buildTelemetrySummary
+    // по-горе). Fail-closed token auth (TELEMETRY_TOKEN secret), огледално на
+    // /tv-alert по-горе. Чисто READ - никакво управление/промяна на прагове,
+    // само извличане на вече натрупаните telemetry: KV записи за анализ.
+    // COINGLASS LIQUIDATION DIAGNOSTICS - read-only (KV `liqdiag:`), + ръчна
+    // проба за ЕДИН символ от WATCHLIST. Същата TELEMETRY_TOKEN защита.
+    // API ключът никога не се връща.
+    if ((path === "/liq-diagnostics" || path === "/liq-diagnostics/probe") && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+      if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
+      const watch = WATCHLIST.map(w => w.symbol);
+      const symbolParam = (url.searchParams.get("symbol") || "").trim().toUpperCase();
+      if (symbolParam && !watch.includes(symbolParam)) return json({ error: "symbol not in WATCHLIST" }, 400);
+      if (path === "/liq-diagnostics/probe") {
+        if (!symbolParam) return json({ error: "symbol required" }, 400);
+        if ((url.searchParams.get("source") || "").trim().toLowerCase() === "relay") {
+          const { orders, ...rest } = await fetchLiquidationOrdersRelayDiag(env, symbolParam);
+          return json({ symbol: symbolParam, source: "relay", ...rest, sample: orders.slice(0, 3) });
+        }
+        const coinParam = (url.searchParams.get("coin") || "").trim().toUpperCase();
+        if (coinParam && !/^[A-Z0-9]{1,20}$/.test(coinParam)) return json({ error: "invalid coin" }, 400);
+        return json(await runLiqDiagProbe(env, symbolParam, { coinOverride: coinParam || null }));
+      }
+      if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
+      const symbols = symbolParam ? [symbolParam] : watch;
+      const entries = await Promise.all(symbols.map(async symbol => ({ symbol, diag: await loadLiqDiagState(env, symbol) })));
+      const summary = buildLiqDiagSummary(entries);
+      summary.enabled = isLiqDiagEnabled(env);
+      summary.source = getLiqDiagSource(env);
+      if (url.searchParams.get("full") === "1") summary.raw = Object.fromEntries(entries.map(e => [e.symbol, e.diag]));
+      return json(summary);
+    }
+    if (path === "/telemetry" && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ALERT_STATE) {
+        return new Response(JSON.stringify({ error: "ALERT_STATE not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const symbolFilter = url.searchParams.get("symbol");
+      const decisionFilter = url.searchParams.get("decision"); // confirmed|missed|veto
+      const directionFilter = url.searchParams.get("direction"); // long|short
+      const since = url.searchParams.get("since") ? Number(url.searchParams.get("since")) : null;
+      const until = url.searchParams.get("until") ? Number(url.searchParams.get("until")) : null;
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 500);
+      const MAX_KEYS_SCANNED = 2000; // безопасен таван - предпазва от прекалено скъпа заявка
+
+      const prefix = symbolFilter ? `telemetry:${symbolFilter}:` : "telemetry:";
+      // PR #141 review fix (TRUNCATION DETECTION) - виж listKvKeysWithTruncation
+      // по-горе за защо `keys.length > MAX_KEYS_SCANNED` самостоятелно не е
+      // достатъчно.
+      const { keys: allKeys, truncated } = await listKvKeysWithTruncation(env.ALERT_STATE, prefix, MAX_KEYS_SCANNED);
+
+      const records = [];
+      for (const k of allKeys) {
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        if (decisionFilter && rec.decision !== decisionFilter) continue;
+        if (directionFilter && rec.direction !== directionFilter) continue;
+        if (since != null && rec.at < since) continue;
+        if (until != null && rec.at > until) continue;
+        records.push(rec);
+      }
+      records.sort((a, b) => b.at - a.at); // най-новите първи
+
+      // STAGE DIRECTION COUNTS (diagnostic-only, виж incrementStageDirectionCount
+      // по-горе) - LONG/SHORT разпределение ОЩЕ при SETUP/ARMED, не само при
+      // терминалния ENTRY (records по-горе) - локализира дали SHORT bias-ът е
+      // upstream или идва едва от Stage 3 (ENTRY TRIGGER) гейта.
+      let stageDirectionCounts = { setup: { long: 0, short: 0 }, armed: { long: 0, short: 0 } };
+      try {
+        const rawCounts = await env.ALERT_STATE.get('entryenginestagecounts');
+        if (rawCounts) stageDirectionCounts = JSON.parse(rawCounts);
+      } catch (e) { /* observability only */ }
+
+      return new Response(JSON.stringify({
+        count: records.length, truncated,
+        records: records.slice(0, limit),
+        summary: buildTelemetrySummary(records),
+        // EPISODE-LEVEL AGGREGATION (виж buildEpisodeSummary по-горе) -
+        // ДОПЪЛНИТЕЛЕН изглед, не заменя summary по-горе.
+        episodeSummary: buildEpisodeSummary(records, truncated),
+        stageDirectionCounts,
+        // ЕТАП 1 - ENTRY TELEMETRY INTEGRITY AUDIT (diagnostic-only) -
+        // ДОПЪЛНИТЕЛЕН изглед, не заменя/променя summary/episodeSummary по-горе.
+        diagnostics: buildTelemetryIntegrityDiagnostics(records, truncated),
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    }
+
+    // PR #105 - TC LIFECYCLE TELEMETRY: read-only debug ендпойнт (виж
+    // buildTcLifecycleSummary по-горе). Огледален на /telemetry по-горе -
+    // същия TELEMETRY_TOKEN, същия MAX_KEYS_SCANNED таван, същия fail-closed
+    // auth. Комбинира ДВЕ KV namespaces: tclifecycle: (setup_created/
+    // armed_created/armed_reset, нови в PR #105) + telemetry: филтрирано по
+    // setupMode='trend_continuation' (вече съществуващите ENTRY EVALUATION
+    // записи, разширени в PR #105 с timeFromArmMin/pctMoveFromArm/
+    // atrMoveFromArm). Чисто READ - никаква промяна на ARMED/ENTRY логиката.
+    if (path === "/tc-lifecycle" && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ALERT_STATE) {
+        return new Response(JSON.stringify({ error: "ALERT_STATE not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const symbolFilter = url.searchParams.get("symbol");
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 500);
+      const MAX_KEYS_SCANNED = 2000;
+
+      const lifecyclePrefix = symbolFilter ? `tclifecycle:${symbolFilter}:` : "tclifecycle:";
+      // PR #141 review fix (TRUNCATION DETECTION) - виж listKvKeysWithTruncation
+      // по-горе.
+      const { keys: lifecycleKeys, truncated: lifecycleTruncated } =
+        await listKvKeysWithTruncation(env.ALERT_STATE, lifecyclePrefix, MAX_KEYS_SCANNED);
+      const lifecycleRecords = [];
+      for (const k of lifecycleKeys) {
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        lifecycleRecords.push(rec);
+      }
+      lifecycleRecords.sort((a, b) => b.at - a.at);
+
+      // Реюзва вече съществуващите telemetry: записи (ENTRY EVALUATION), само
+      // trend_continuation - без duplicate storage на CONFIRMED/MISSED/VETO
+      // данните, които вече живеят в /telemetry.
+      const telemetryPrefix = symbolFilter ? `telemetry:${symbolFilter}:` : "telemetry:";
+      // PR #141 review fix (TRUNCATION DETECTION) - виж listKvKeysWithTruncation
+      // по-горе.
+      const { keys: telemetryKeys, truncated: telemetryTruncated } =
+        await listKvKeysWithTruncation(env.ALERT_STATE, telemetryPrefix, MAX_KEYS_SCANNED);
+      const tcEntryRecords = [];
+      for (const k of telemetryKeys) {
+        if (!k.name.endsWith(':trend_continuation')) continue;
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        tcEntryRecords.push(rec);
+      }
+
+      return new Response(JSON.stringify({
+        lifecycleCount: lifecycleRecords.length, lifecycleTruncated,
+        entryEvaluationCount: tcEntryRecords.length, telemetryTruncated,
+        records: lifecycleRecords.slice(0, limit),
+        summary: buildTcLifecycleSummary(lifecycleRecords, tcEntryRecords),
+        // ЕТАП 1 - ENTRY TELEMETRY INTEGRITY AUDIT (diagnostic-only, виж
+        // buildTcIntegrityDiagnostics по-горе) - ДОПЪЛНИТЕЛЕН изглед, не
+        // заменя/променя summary по-горе.
+        diagnostics: buildTcIntegrityDiagnostics(lifecycleRecords, tcEntryRecords, lifecycleTruncated, telemetryTruncated),
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    }
+
+    // DISCOVERY RADAR - discoveryepisode: read-only debug ендпойнт (Stage F
+    // companion, виж buildDiscoveryEpisodeSummary по-горе). Огледален на
+    // /telemetry по-горе - същия TELEMETRY_TOKEN, същия fail-closed auth,
+    // същия MAX_KEYS_SCANNED таван. Чисто READ - никакво управление на pool/
+    // episode състоянието тук.
+    if (path === "/discovery-episodes" && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ALERT_STATE) {
+        return new Response(JSON.stringify({ error: "ALERT_STATE not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const symbolFilter = url.searchParams.get("symbol");
+      const statusFilter = url.searchParams.get("status"); // discovery|setup|armed|entry_pending_outcome|complete
+      const since = url.searchParams.get("since") ? Number(url.searchParams.get("since")) : null;
+      const until = url.searchParams.get("until") ? Number(url.searchParams.get("until")) : null;
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 500);
+      const MAX_KEYS_SCANNED = 2000;
+
+      const prefix = symbolFilter ? `discoveryepisode:${symbolFilter}:` : "discoveryepisode:";
+      let allKeys = [];
+      let cursor;
+      do {
+        const listResult = await env.ALERT_STATE.list({ prefix, cursor, limit: 1000 });
+        allKeys.push(...listResult.keys);
+        cursor = listResult.list_complete ? undefined : listResult.cursor;
+      } while (cursor && allKeys.length < MAX_KEYS_SCANNED);
+      const truncated = allKeys.length > MAX_KEYS_SCANNED;
+      allKeys = allKeys.slice(0, MAX_KEYS_SCANNED);
+
+      const records = [];
+      for (const k of allKeys) {
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        if (statusFilter && rec.status !== statusFilter) continue;
+        const discoveredAt = rec.discovery ? rec.discovery.at : null;
+        if (since != null && (discoveredAt == null || discoveredAt < since)) continue;
+        if (until != null && (discoveredAt == null || discoveredAt > until)) continue;
+        records.push(rec);
+      }
+      records.sort((a, b) => (b.discovery ? b.discovery.at : 0) - (a.discovery ? a.discovery.at : 0)); // най-новите първи
+
+      return new Response(JSON.stringify({
+        count: records.length, truncated,
+        records: records.slice(0, limit),
+        summary: buildDiscoveryEpisodeSummary(records),
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    }
+
+    // FIRST QUALIFYING WAKE-UP - read-only debug ендпойнт (Етап 2, виж
+    // updateDiscoveryWakeups/buildDiscoveryWakeupSummary по-горе). Огледален
+    // на /discovery-episodes по-горе - същия TELEMETRY_TOKEN, същия
+    // fail-closed auth, същия MAX_KEYS_SCANNED таван. Показва и активните
+    // (discoverywakeupactive - един консолидиран обект, няма truncation риск
+    // там отделно от самия MAX_KEYS_SCANNED капан на архива), и архивираните
+    // (discoverywakeuparchive:) наблюдения - изрично разделени в отговора, за
+    // да не се бъркат "в момента будни" с "вече приключени".
+    if (path === "/discovery-wakeup" && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ALERT_STATE) {
+        return new Response(JSON.stringify({ error: "ALERT_STATE not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const symbolFilter = url.searchParams.get("symbol");
+      const since = url.searchParams.get("since") ? Number(url.searchParams.get("since")) : null;
+      const until = url.searchParams.get("until") ? Number(url.searchParams.get("until")) : null;
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 500);
+      const MAX_KEYS_SCANNED = 2000;
+
+      let active = {};
+      try {
+        const rawActive = await env.ALERT_STATE.get('discoverywakeupactive');
+        active = rawActive ? JSON.parse(rawActive) : {};
+      } catch (e) { /* observability only */ }
+      let activeEntries = Object.values(active);
+      if (symbolFilter) activeEntries = activeEntries.filter((e) => e.symbol === symbolFilter);
+      if (since != null) activeEntries = activeEntries.filter((e) => e.firstQualifyingAt >= since);
+      if (until != null) activeEntries = activeEntries.filter((e) => e.firstQualifyingAt <= until);
+      activeEntries.sort((a, b) => b.firstQualifyingAt - a.firstQualifyingAt);
+
+      const archivePrefix = symbolFilter ? `discoverywakeuparchive:${symbolFilter}:` : "discoverywakeuparchive:";
+      let allKeys = [];
+      let cursor;
+      do {
+        const listResult = await env.ALERT_STATE.list({ prefix: archivePrefix, cursor, limit: 1000 });
+        allKeys.push(...listResult.keys);
+        cursor = listResult.list_complete ? undefined : listResult.cursor;
+      } while (cursor && allKeys.length < MAX_KEYS_SCANNED);
+      const truncated = allKeys.length > MAX_KEYS_SCANNED;
+      allKeys = allKeys.slice(0, MAX_KEYS_SCANNED);
+
+      const archiveRecords = [];
+      for (const k of allKeys) {
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        if (since != null && rec.firstQualifyingAt < since) continue;
+        if (until != null && rec.firstQualifyingAt > until) continue;
+        archiveRecords.push(rec);
+      }
+      archiveRecords.sort((a, b) => b.closedAt - a.closedAt); // най-новите първи
+
+      return new Response(JSON.stringify({
+        active: { count: activeEntries.length, records: activeEntries.slice(0, limit) },
+        archive: {
+          count: archiveRecords.length, truncated,
+          records: archiveRecords.slice(0, limit),
+          summary: buildDiscoveryWakeupSummary(archiveRecords, truncated),
+        },
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    }
+
+    // FLOW WARMING EVENTS - read-only debug ендпойнт (виж buildFlowWarmingSummary
+    // по-горе) - диагностична бройка колко често FLOW WARMING реално прекосява
+    // прага си (flowwarmingevent: KV записи, същия гейт като самото известие).
+    // Огледален на /discovery-episodes по-горе - същия TELEMETRY_TOKEN, същия
+    // MAX_KEYS_SCANNED таван, същия fail-closed auth. Чисто READ - никаква
+    // промяна на FLOW WARMING прага/логиката тук.
+    if (path === "/flow-warming-events" && request.method === "GET") {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ALERT_STATE) {
+        return new Response(JSON.stringify({ error: "ALERT_STATE not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const symbolFilter = url.searchParams.get("symbol");
+      const since = url.searchParams.get("since") ? Number(url.searchParams.get("since")) : null;
+      const until = url.searchParams.get("until") ? Number(url.searchParams.get("until")) : null;
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 500);
+      const MAX_KEYS_SCANNED = 2000;
+
+      const prefix = symbolFilter ? `flowwarmingevent:${symbolFilter}:` : "flowwarmingevent:";
+      let allKeys = [];
+      let cursor;
+      do {
+        const listResult = await env.ALERT_STATE.list({ prefix, cursor, limit: 1000 });
+        allKeys.push(...listResult.keys);
+        cursor = listResult.list_complete ? undefined : listResult.cursor;
+      } while (cursor && allKeys.length < MAX_KEYS_SCANNED);
+      const truncated = allKeys.length > MAX_KEYS_SCANNED;
+      allKeys = allKeys.slice(0, MAX_KEYS_SCANNED);
+
+      const records = [];
+      for (const k of allKeys) {
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        let rec;
+        try { rec = JSON.parse(raw); } catch (e) { continue; }
+        if (since != null && rec.at < since) continue;
+        if (until != null && rec.at > until) continue;
+        records.push(rec);
+      }
+      records.sort((a, b) => b.at - a.at); // най-новите първи
+
+      return new Response(JSON.stringify({
+        count: records.length, truncated,
+        records: records.slice(0, limit),
+        summary: buildFlowWarmingSummary(records),
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    }
+
+    // Whitelist за CoinGlass прокси-то: без него ВСЕКИ path, който не съвпадне
+    // с /yahoo, /football, /apisports, /tv-alert по-горе, минаваше директно
+    // към CoinGlass с нашия платен CG_API_KEY - всеки, който знае Worker URL-а,
+    // можеше да го ползва като безплатен прокси и да изразходва квотата ни.
+    // В момента никой активен клиент (signal-scanner.html/football.html) не
+    // ползва тази прокси функция (OI данните минават директно през Binance),
+    // затова списъкът е празен - добави тук конкретни пътища, ако някога
+    // потрябва отново реален CoinGlass proxy caller.
+    const ALLOWED_COINGLASS_PATHS = [];
+    if (!ALLOWED_COINGLASS_PATHS.some(p => path.startsWith(p))) {
+      return new Response(JSON.stringify({ error: "Forbidden" }), {
+        status: 403,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    const target = "https://open-api-v4.coinglass.com" + path + search;
+    const response = await fetch(target, {
+      method: request.method,
+      headers: {
+        "Content-Type": "application/json",
+        "CG-API-KEY": env.CG_API_KEY
+      }
+    });
+    const data = await response.json();
+    return new Response(JSON.stringify(data), {
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+  },
+
+  async scheduled(event, env, ctx) {
+    // Cloudflare може да преизползва "топъл" isolate между отделни scheduled()
+    // извиквания - ако предишна инвокация бъде убита (wall-time/CPU лимит)
+    // точно докато чака вътре в sendWhatsAppSerialized (await sleep/fetch),
+    // нейната Promise увисва завинаги. whatsAppChain (module-scope, виж по-горе)
+    // наследява тази увиснала Promise и ВСИЧКИ бъдещи sendWhatsApp() извиквания
+    // (във всеки следващ тик) чакат зад нея - завинаги (потвърдено от
+    // Observability: пълна тишина във WhatsApp + exception на всеки тик, точно
+    // след бурст от 15+ известия). Ресетваме веригата в началото на ВСЯКА нова
+    // инвокация, за да не наследява потенциално увиснала Promise от предишна -
+    // lastWhatsAppSendAt (обикновено число, не Promise/IO обект) остава както си
+    // е, за да пази реалното темпо между тиковете.
+    whatsAppChain = Promise.resolve();
+    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env), checkPriceLevels(env), updateDiscoverySnapshotState(env), runDiscoveryFullAnalysis(env)]));
+  }
+};
