@@ -18,6 +18,7 @@ import {
   isLiqDiagEnabled, toCoinGlassCoin, classifyCoinGlassLiqResponse, normalizeLiqDiagOrders,
   buildLiqDiagUrl, fetchLiquidationOrdersDiag, detectLiqDiagTruncation, applyLiqShadowStep,
   runLiqShadowDiagnostics, buildLiqDiagSummary, runLiqDiagProbe, WATCHLIST, scanSymbolSignals,
+  fetchLiquidationOrdersRelayDiag, getLiqDiagSource,
 } from './worker/worker.js';
 import worker from './worker/worker.js';
 
@@ -337,9 +338,13 @@ describe('(D) END-TO-END scanSymbolSignals - диагностиката НЕ в�
     const m = new Map();
     return { m, get: async (k) => (m.has(k) ? m.get(k) : null), put: async (k, v) => { m.set(k, v); }, delete: async (k) => { m.delete(k); }, list: async () => ({ keys: [], list_complete: true }) };
   }
-  function router(cgCalls) {
+  function router(cgCalls, relayCalls = []) {
     return async (url, opts) => {
       const s = String(url);
+      if (s.includes('/liquidations?')) {
+        relayCalls.push(s);
+        return new Response(JSON.stringify({ symbol: 'BTCUSDT', count: 1, truncated: false, events: [{ side: 1, liquidatedPosition: 'short', usdValue: 820000, price: 99500, qty: 8.24, time: FIXED_NOW - 30000 }], coverage: { complete: true, reasons: [], gaps: [], connected: true } }), { status: 200 });
+      }
       if (s.includes('/klines')) {
         const u = new URL(s);
         return new Response(JSON.stringify(klines(u.searchParams.get('interval'), Number(u.searchParams.get('limit')))), { status: 200 });
@@ -353,14 +358,14 @@ describe('(D) END-TO-END scanSymbolSignals - диагностиката НЕ в�
       return new Response(JSON.stringify({ code: -1, msg: 'mock unavailable' }), { status: 503 });
     };
   }
-  async function runScan(flag) {
+  async function runScan(flag, extraEnv = { LIQ_DIAG_SOURCE: 'coinglass' }) {
     Date.now = () => FIXED_NOW;
     const kv = makeKv();
-    const cgCalls = [];
-    globalThis.fetch = router(cgCalls);
-    const env = { RELAY_URL: 'https://relay.mock', RELAY_TOKEN: 't', CG_API_KEY: FAKE_KEY, ALERT_STATE: kv, ...(flag ? { LIQ_DIAG_ENABLED: '1' } : {}) };
+    const cgCalls = [], relayCalls = [];
+    globalThis.fetch = router(cgCalls, relayCalls);
+    const env = { RELAY_URL: 'https://relay.mock', RELAY_TOKEN: 'relay-secret-xyz', CG_API_KEY: FAKE_KEY, ALERT_STATE: kv, ...extraEnv, ...(flag ? { LIQ_DIAG_ENABLED: '1' } : {}) };
     const result = await scanSymbolSignals(env, 'BTCUSDT');
-    return { result, kv, cgCalls };
+    return { result, kv, cgCalls, relayCalls };
   }
 
   it('резултатът и sigstate са идентични с изкл./вкл. флаг; вкл. -> само допълнителен liqdiag: ключ', async () => {
@@ -386,6 +391,73 @@ describe('(D) END-TO-END scanSymbolSignals - диагностиката НЕ в�
     expect(diag.timeline[0].legacySide2Usd15m).toBe(0);
     expect(diag.timeline[0].side2Usd15m).toBe(750000);
     expect(JSON.stringify(diag)).not.toContain(FAKE_KEY);
+  });
+
+  it('RELAY източник (по подразбиране): идентичен резултат/sigstate; legacy CoinGlass заявката е непроменена', async () => {
+    const off = await runScan(false, {});
+    const on = await runScan(true, {});
+    expect(JSON.stringify(on.result)).toBe(JSON.stringify(off.result));
+    expect(on.kv.m.get('sigstate:BTCUSDT')).toBe(off.kv.m.get('sigstate:BTCUSDT'));
+    expect(off.relayCalls.filter(u => u.includes('/liquidations?'))).toHaveLength(0);
+    expect(on.relayCalls).toHaveLength(1);
+    const u = new URL(on.relayCalls[0]);
+    expect(u.searchParams.get('symbol')).toBe('BTCUSDT');
+    expect(u.searchParams.get('since')).toBe(String(FIXED_NOW - 20 * 60000));
+    expect(on.cgCalls).toHaveLength(1);           // само legacy заявката, без CoinGlass shadow
+    expect(off.cgCalls).toHaveLength(1);
+    const diag = JSON.parse(on.kv.m.get('liqdiag:BTCUSDT'));
+    expect(diag.last.source).toBe('relay');
+    expect(diag.last.coverageComplete).toBe(true);
+    expect(diag.events.some(e => e.kind === 'cascade' && e.direction === 'long')).toBe(true);
+    expect(diag.timeline[0].side1Usd15m).toBe(820000);
+    expect(diag.timeline[0].legacySide1Usd15m).toBe(0);
+    expect(JSON.stringify(diag)).not.toContain('relay-secret-xyz');
+    expect(JSON.parse(on.kv.m.get('sigstate:BTCUSDT')).liqGravity).toEqual({ buckets: {}, lastSeenTime: 0 });
+  });
+});
+
+describe('(E) fetchLiquidationOrdersRelayDiag - Binance forceOrder през relay', () => {
+  const now = 1800000000000;
+  const env = { RELAY_URL: 'https://relay.mock', RELAY_TOKEN: 'relay-secret-xyz' };
+  const resp = (status, body) => async () => new Response(JSON.stringify(body), { status });
+  it('източник по подразбиране е relay; coinglass само изрично', () => {
+    expect(getLiqDiagSource({})).toBe('relay');
+    expect(getLiqDiagSource({ LIQ_DIAG_SOURCE: 'CoinGlass' })).toBe('coinglass');
+    expect(getLiqDiagSource({ LIQ_DIAG_SOURCE: 'x' })).toBe('relay');
+  });
+  it('ok + coverage; токенът не е в резултата; невалидни side се филтрират', async () => {
+    const calls = [];
+    const r = await fetchLiquidationOrdersRelayDiag(env, 'ETHUSDT', { now, fetchImpl: async (u) => { calls.push(u); return new Response(JSON.stringify({ events: [{ side: 2, usdValue: 5000, price: 3000, time: now - 1000 }, { side: 7, usdValue: 1, price: 1, time: now }], coverage: { complete: false, reasons: ['gap'] }, truncated: true }), { status: 200 }); } });
+    expect(calls[0]).toContain('symbol=ETHUSDT');
+    expect(calls[0]).toContain(`since=${now - 20 * 60000}`);
+    expect(r.status).toBe('ok');
+    expect(r.count).toBe(1);
+    expect(r.orders[0]).toEqual({ side: 2, usdValue: 5000, time: now - 1000, price: 3000, pair: 'ETHUSDT', baseAsset: null });
+    expect(r.coverageComplete).toBe(false);
+    expect(r.coverageReasons).toEqual(['gap']);
+    expect(r.relayTruncated).toBe(true);
+    expect(JSON.stringify(r)).not.toContain('relay-secret-xyz');
+  });
+  it('статуси: no_relay, source_disabled (503), http_error, bad_shape, parse_error, timeout, network, empty', async () => {
+    expect((await fetchLiquidationOrdersRelayDiag({}, 'BTCUSDT')).status).toBe('no_relay');
+    const d = await fetchLiquidationOrdersRelayDiag(env, 'BTCUSDT', { fetchImpl: resp(503, { enabled: false, reason: 'LIQ_COLLECTOR_ENABLED is not 1' }) });
+    expect(d.status).toBe('source_disabled');
+    expect(d.msg).toContain('LIQ_COLLECTOR_ENABLED');
+    expect((await fetchLiquidationOrdersRelayDiag(env, 'BTCUSDT', { fetchImpl: resp(401, { error: 'Unauthorized' }) })).status).toBe('http_error');
+    expect((await fetchLiquidationOrdersRelayDiag(env, 'BTCUSDT', { fetchImpl: resp(200, { foo: 1 }) })).status).toBe('bad_shape');
+    expect((await fetchLiquidationOrdersRelayDiag(env, 'BTCUSDT', { fetchImpl: async () => new Response('<html>', { status: 200 }) })).status).toBe('parse_error');
+    expect((await fetchLiquidationOrdersRelayDiag(env, 'BTCUSDT', { fetchImpl: async () => { const e = new Error('x'); e.name = 'AbortError'; throw e; } })).status).toBe('timeout');
+    expect((await fetchLiquidationOrdersRelayDiag(env, 'BTCUSDT', { fetchImpl: async () => { throw new Error('ECONNRESET'); } })).status).toBe('network');
+    expect((await fetchLiquidationOrdersRelayDiag(env, 'BTCUSDT', { fetchImpl: resp(200, { events: [], coverage: { complete: true, reasons: [] } }) })).status).toBe('empty');
+  });
+  it('applyLiqShadowStep отчита източника и непълното покритие', () => {
+    const fr = { source: 'relay', status: 'ok', count: 1, coin: 'BTCUSDT', coinVerified: true, coinRule: 'relay_pair', startTime: now - 1, at: now, orders: [{ side: 1, usdValue: 10, time: now, price: 1 }], coverageComplete: false, coverageReasons: ['gap', 'not_connected'] };
+    const d = applyLiqShadowStep(null, fr, { price: 1 }).diag;
+    expect(d.sources).toEqual({ relay: 1 });
+    expect(d.coverageIncompleteCount).toBe(1);
+    expect(d.coverageReasons).toEqual({ gap: 1, not_connected: 1 });
+    expect(d.last.source).toBe('relay');
+    expect(d.timeline[0].coverageComplete).toBe(false);
   });
 });
 

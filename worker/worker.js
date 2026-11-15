@@ -3831,6 +3831,58 @@ async function fetchLiquidationOrdersDiag(env, symbol, { now = Date.now(), lookb
   }
 }
 
+// ─── BINANCE forceOrder ПРЕЗ RELAY (shadow източник, заместител на CoinGlass) ───
+// relay/liquidation-collector.js държи 1 WebSocket към Binance !forceOrder@arr
+// и сервира /liquidations?symbol=&since=&token= (RELAY_TOKEN, като /klines).
+// Символът е директно Binance двойката (без coin карта); `side` е в същата
+// конвенция като legacy calcLiquidationCascade (1 = принудително BUY = SHORT
+// ликвидирани, 2 = принудително SELL = LONG ликвидирани). `coverage` казва дали
+// relay-ят е бил свързан през целия поискан прозорец (gaps/рестарт).
+// Връща същата форма като fetchLiquidationOrdersDiag -> applyLiqShadowStep.
+async function fetchLiquidationOrdersRelayDiag(env, symbol, { now = Date.now(), lookbackMs = LIQ_DIAG_LOOKBACK_MS, fetchImpl = null } = {}) {
+  const startTime = now - lookbackMs;
+  const meta = { source: 'relay', symbol, coin: symbol, coinVerified: true, coinRule: 'relay_pair', startTime, minAmount: null, at: now };
+  const blank = (status, extra = {}) => ({ ...meta, status, code: null, msg: null, count: 0, orders: [], latencyMs: 0, coverageComplete: null, coverageReasons: [], ...extra });
+  if (!env?.RELAY_URL || !env?.RELAY_TOKEN) return blank('no_relay');
+  const t0 = Date.now();
+  try {
+    const doFetch = fetchImpl || fetchWithTimeout;
+    const r = await doFetch(`${env.RELAY_URL}/liquidations?symbol=${encodeURIComponent(symbol)}&since=${startTime}&token=${encodeURIComponent(env.RELAY_TOKEN)}`);
+    let json;
+    try { json = await r.json(); } catch (e) { json = undefined; }
+    const latencyMs = Date.now() - t0;
+    if (r.status === 503) return blank('source_disabled', { httpStatus: 503, msg: json?.reason ? String(json.reason).slice(0, 200) : null, latencyMs });
+    if (r.status < 200 || r.status >= 300) return blank('http_error', { httpStatus: r.status, msg: json?.error ? String(json.error).slice(0, 200) : null, latencyMs });
+    if (!json || typeof json !== 'object') return blank('parse_error', { httpStatus: r.status, latencyMs });
+    if (!Array.isArray(json.events)) return blank('bad_shape', { httpStatus: r.status, latencyMs });
+    const orders = json.events
+      .map(e => ({ side: Number(e.side), usdValue: parseFloat(e.usdValue), time: Number(e.time), price: parseFloat(e.price), pair: symbol, baseAsset: null }))
+      .filter(d => (d.side === 1 || d.side === 2) && isFinite(d.usdValue) && isFinite(d.time));
+    const cov = json.coverage && typeof json.coverage === 'object' ? json.coverage : null;
+    return {
+      ...meta, status: orders.length ? 'ok' : 'empty', code: null, msg: null, httpStatus: r.status,
+      count: orders.length, orders, latencyMs, relayTruncated: !!json.truncated,
+      coverageComplete: cov ? cov.complete === true : null,
+      coverageReasons: cov && Array.isArray(cov.reasons) ? cov.reasons.slice(0, 10).map(String) : [],
+    };
+  } catch (error) {
+    const isTimeout = error?.name === 'AbortError' || /abort|timeout/i.test(String(error?.message || ''));
+    return blank(isTimeout ? 'timeout' : 'network', { msg: String(error?.message || error?.name || 'error').slice(0, 200), latencyMs: Date.now() - t0 });
+  }
+}
+
+// Shadow източник: env.LIQ_DIAG_SOURCE = 'relay' (по подразбиране - CoinGlass
+// абонаментът е изтекъл) | 'coinglass'. Важи САМО при LIQ_DIAG_ENABLED=1.
+function getLiqDiagSource(env) {
+  const s = String(env?.LIQ_DIAG_SOURCE ?? '').trim().toLowerCase();
+  return s === 'coinglass' ? 'coinglass' : 'relay';
+}
+function fetchLiquidationOrdersShadow(env, symbol, opts = {}) {
+  return getLiqDiagSource(env) === 'coinglass'
+    ? fetchLiquidationOrdersDiag(env, symbol, opts)
+    : fetchLiquidationOrdersRelayDiag(env, symbol, opts);
+}
+
 function liqDiagUsdBin(usd) {
   let idx = 0;
   for (let i = 0; i < LIQ_DIAG_USD_BINS.length; i++) if (usd >= LIQ_DIAG_USD_BINS[i]) idx = i;
@@ -3852,6 +3904,7 @@ function emptyLiqDiagState() {
     counts: {}, last: null, lastOkAt: null, maxCount: 0, truncatedSuspectCount: 0,
     pairCounts: {}, baseAssets: {},
     shadowGravity: { buckets: {}, lastSeenTime: 0 },
+    coverageIncompleteCount: 0, coverageReasons: {}, sources: {},
     cascadeHist: { buy: {}, sell: {} },
     cascadeMax: { buy: 0, sell: 0 },
     prevShadow: { cascadeBull: false, cascadeBear: false, gravityKey: 'none' },
@@ -3871,12 +3924,22 @@ function applyLiqShadowStep(prevDiag, fetchResult, { price = null, oiDeltaPct = 
   if (!d.createdAt) d.createdAt = now;
   d.updatedAt = now;
   d.counts[fetchResult.status] = (d.counts[fetchResult.status] || 0) + 1;
-  const truncatedSuspect = fetchResult.status === 'ok' && detectLiqDiagTruncation(fetchResult.orders, fetchResult.startTime);
+  const truncatedSuspect = fetchResult.relayTruncated === true || (fetchResult.status === 'ok' && fetchResult.source !== 'relay' && detectLiqDiagTruncation(fetchResult.orders, fetchResult.startTime));
   if (truncatedSuspect) d.truncatedSuspectCount++;
+  const source = fetchResult.source || 'coinglass';
+  if (!d.sources) d.sources = {};
+  d.sources[source] = (d.sources[source] || 0) + 1;
+  const coverageComplete = fetchResult.coverageComplete ?? null;
+  if (coverageComplete === false) {
+    d.coverageIncompleteCount = (d.coverageIncompleteCount || 0) + 1;
+    if (!d.coverageReasons) d.coverageReasons = {};
+    for (const r of fetchResult.coverageReasons || []) d.coverageReasons[r] = (d.coverageReasons[r] || 0) + 1;
+  }
   d.last = {
     at: now, status: fetchResult.status, code: fetchResult.code ?? null, msg: fetchResult.msg ?? null,
     httpStatus: fetchResult.httpStatus ?? null, count: fetchResult.count ?? 0, coin: fetchResult.coin,
     coinVerified: !!fetchResult.coinVerified, coinRule: fetchResult.coinRule, latencyMs: fetchResult.latencyMs ?? null, truncatedSuspect,
+    source, coverageComplete, coverageReasons: fetchResult.coverageReasons || [],
   };
   if (fetchResult.status === 'ok') d.lastOkAt = now;
   if ((fetchResult.count || 0) > d.maxCount) d.maxCount = fetchResult.count;
@@ -3918,7 +3981,7 @@ function applyLiqShadowStep(prevDiag, fetchResult, { price = null, oiDeltaPct = 
   d.prevShadow = { cascadeBull: usable ? cascade.bullish : d.prevShadow.cascadeBull, cascadeBear: usable ? cascade.bearish : d.prevShadow.cascadeBear, gravityKey: gKey };
 
   d.timeline.push({
-    at: now, status: fetchResult.status, price,
+    at: now, status: fetchResult.status, source, coverageComplete, price,
     side1Usd15m: usable ? Math.round(cascade.buySumUsd) : null, side2Usd15m: usable ? Math.round(cascade.sellSumUsd) : null,
     legacySide1Usd15m: Math.round(legacyBuyUsd || 0), legacySide2Usd15m: Math.round(legacySellUsd || 0),
     gravityTier: gTier, gravityDistancePct: gScore.distancePct != null ? Math.round(gScore.distancePct * 100) / 100 : null,
@@ -3968,6 +4031,7 @@ function buildLiqDiagSummary(entries) {
     bySymbol[symbol] = {
       last: diag.last, counts: diag.counts, lastOkAt: diag.lastOkAt, maxCount: diag.maxCount,
       truncatedSuspectCount: diag.truncatedSuspectCount, pairCounts: diag.pairCounts, baseAssets: diag.baseAssets,
+      sources: diag.sources || {}, coverageIncompleteCount: diag.coverageIncompleteCount || 0, coverageReasons: diag.coverageReasons || {},
       cascadeMax: diag.cascadeMax, cascadeHist: diag.cascadeHist,
       gravityBuckets: Object.keys(diag.shadowGravity?.buckets || {}).length,
       gravityLastSeenTime: diag.shadowGravity?.lastSeenTime ?? 0,
@@ -4724,7 +4788,7 @@ async function scanSymbolSignals(env, symbol) {
   // COINGLASS LIQUIDATION DIAGNOSTICS (shadow) - стартира паралелно с
   // Promise.all по-долу, САМО при env.LIQ_DIAG_ENABLED === '1'. Legacy
   // liquidationOrders заявката остава непроменена.
-  const liqDiagFetchPromise = isLiqDiagEnabled(env) ? fetchLiquidationOrdersDiag(env, symbol).catch(() => null) : null;
+  const liqDiagFetchPromise = isLiqDiagEnabled(env) ? fetchLiquidationOrdersShadow(env, symbol).catch(() => null) : null;
   const [oiHist, wallsRaw, chg24h, longShortCycle, fundingCycle, liquidationOrders, takerHist] = await Promise.all([
     fetchOpenInterestHistWorker(env, symbol, '5m', 13),
     fetchOrderBookWallsWorker(env, symbol, price),
@@ -7364,6 +7428,7 @@ export {
   isLiqDiagEnabled, toCoinGlassCoin, classifyCoinGlassLiqResponse, normalizeLiqDiagOrders,
   buildLiqDiagUrl, fetchLiquidationOrdersDiag, detectLiqDiagTruncation, applyLiqShadowStep,
   runLiqShadowDiagnostics, buildLiqDiagSummary, runLiqDiagProbe, WATCHLIST,
+  fetchLiquidationOrdersRelayDiag, getLiqDiagSource, fetchLiquidationOrdersShadow,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
@@ -7590,6 +7655,10 @@ export default {
       if (symbolParam && !watch.includes(symbolParam)) return json({ error: "symbol not in WATCHLIST" }, 400);
       if (path === "/liq-diagnostics/probe") {
         if (!symbolParam) return json({ error: "symbol required" }, 400);
+        if ((url.searchParams.get("source") || "").trim().toLowerCase() === "relay") {
+          const { orders, ...rest } = await fetchLiquidationOrdersRelayDiag(env, symbolParam);
+          return json({ symbol: symbolParam, source: "relay", ...rest, sample: orders.slice(0, 3) });
+        }
         const coinParam = (url.searchParams.get("coin") || "").trim().toUpperCase();
         if (coinParam && !/^[A-Z0-9]{1,20}$/.test(coinParam)) return json({ error: "invalid coin" }, 400);
         return json(await runLiqDiagProbe(env, symbolParam, { coinOverride: coinParam || null }));
@@ -7599,6 +7668,7 @@ export default {
       const entries = await Promise.all(symbols.map(async symbol => ({ symbol, diag: await loadLiqDiagState(env, symbol) })));
       const summary = buildLiqDiagSummary(entries);
       summary.enabled = isLiqDiagEnabled(env);
+      summary.source = getLiqDiagSource(env);
       if (url.searchParams.get("full") === "1") summary.raw = Object.fromEntries(entries.map(e => [e.symbol, e.diag]));
       return json(summary);
     }
