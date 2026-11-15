@@ -20,6 +20,21 @@ const PORT = process.env.PORT || 8080;
 const TOKEN = (process.env.RELAY_TOKEN || '').trim();
 console.log(`RELAY_TOKEN configured: ${TOKEN ? 'yes (' + TOKEN.length + ' chars)' : 'no'}`);
 
+// BINANCE LIQUIDATION COLLECTOR (виж liquidation-collector.js) - ИЗКЛЮЧЕН,
+// освен ако LIQ_COLLECTOR_ENABLED=1. Държи 1 WebSocket към Binance
+// !forceOrder@arr и обслужва /liquidations. Не пипа нито един от proxy
+// endpoint-ите по-долу, нито /health (App Platform health check-ът НЕ зависи
+// от колектора - прекъсване към Binance никога не води до рестарт на relay-я).
+let liq = { collector: null, disabledReason: 'not initialised' };
+try {
+  liq = require('./liquidation-collector').createCollectorFromEnv(process.env);
+  if (liq.collector) liq.collector.start();
+  console.log(`Liquidation collector: ${liq.collector ? 'enabled' : 'disabled (' + liq.disabledReason + ')'}`);
+} catch (e) {
+  liq = { collector: null, disabledReason: 'init error: ' + (e && e.message ? e.message : e) };
+  console.error('Liquidation collector init failed - relay continues without it:', e);
+}
+
 function proxyToBinance(targetUrl, res) {
   https.get(targetUrl, (binRes) => {
     let body = '';
@@ -176,6 +191,30 @@ const server = http.createServer((req, res) => {
     if (!requireToken(url, res)) return;
     const symbol = url.searchParams.get('symbol');
     proxyToBinance(buildTicker24hrTarget(symbol), res);
+    return;
+  }
+
+  // BINANCE LIQUIDATION COLLECTOR - read-only достъп до събраните forceOrder
+  // събития (виж liquidation-collector.js). Същата RELAY_TOKEN защита.
+  //   /liquidations?symbol=BTCUSDT&since=<ms>&limit=<n>&token=...
+  //   /liquidations/stats?token=...
+  if (url.pathname === '/liquidations' || url.pathname === '/liquidations/stats') {
+    if (!requireToken(url, res)) return;
+    const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+    try {
+      if (!liq.collector) { send(503, { enabled: false, reason: liq.disabledReason, runtime: process.version }); return; }
+      if (url.pathname === '/liquidations/stats') { send(200, liq.collector.getStats()); return; }
+      const symbol = (url.searchParams.get('symbol') || '').trim().toUpperCase();
+      if (!symbol) { send(400, { error: 'symbol is required' }); return; }
+      if (!liq.collector.symbols.has(symbol)) { send(400, { error: 'symbol is not collected' }); return; }
+      const sinceRaw = url.searchParams.get('since');
+      const since = sinceRaw != null && sinceRaw !== '' ? Number(sinceRaw) : undefined;
+      if (since !== undefined && !Number.isFinite(since)) { send(400, { error: 'since must be a number (ms)' }); return; }
+      const limit = url.searchParams.get('limit');
+      send(200, liq.collector.query(symbol, since, { limit: limit ? Number(limit) : undefined }));
+    } catch (e) {
+      send(500, { error: 'collector error', message: e && e.message ? e.message : String(e) });
+    }
     return;
   }
 
