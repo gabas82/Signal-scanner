@@ -2162,6 +2162,7 @@ function buildTelemetryRecord({
   timeFromArmMin, pctMoveFromArm, atrMoveFromArm, setupAt,
   targetScore, targetTier, targetDirection,
   reArmCount, triggerSource, structuralReferenceAtArm, structRefUnchanged,
+  liqConfirm,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
   const chaseDistanceAtrRatio = (atr5m > 0 && chaseDistance != null) ? chaseDistance / atr5m : null;
@@ -2197,6 +2198,12 @@ function buildTelemetryRecord({
     // не се предполага false, за да различаваме "не се е стигнало до проверка"
     // от "проверено и НЕ съвпада".
     htfAligned: htfAligned ?? null,
+    // BINANCE LIQUIDATION LIVE (виж liqConfirmStatus по-горе) - 'confirm' |
+    // 'against' | 'neutral' | 'no_data' | null (LIQ_LIVE_ENABLED изключен -
+    // не е изчислявано изобщо). Observability-only, за бъдеща калибрация
+    // (виж доклада "Binance Liquidation Integration - Етап 2") - не участва
+    // в decision/score логиката по-горе.
+    liqConfirm: liqConfirm ?? null,
     outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome240m: null, // попълват се по-късно от resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals
     // PR #103 PATH DIAGNOSTICS (MFE/MAE) - попълват се по-късно от
     // updateExcursion/resolvePendingOutcomeHorizons, огледално на outcome{X}m.
@@ -3883,6 +3890,54 @@ function fetchLiquidationOrdersShadow(env, symbol, opts = {}) {
     : fetchLiquidationOrdersRelayDiag(env, symbol, opts);
 }
 
+// ═══ BINANCE LIQUIDATION LIVE (реално влияние, виж доклада "Binance
+// Liquidation Integration - Етап 2") ════════════════════════════════════════
+// ПРИНЦИПИ (огледални на shadow модула по-горе, но тук ДЕЙСТВИТЕЛНО заменя
+// legacy CoinGlass източника, вместо да го наблюдава отстрани):
+// (1) ИЗКЛЮЧЕНО по подразбиране - env.LIQ_LIVE_ENABLED === '1' (отделен флаг
+//     от LIQ_DIAG_ENABLED - shadow диагностиката остава недокосната).
+// (2) calcLiquidationCascade/accumulateLiquidationGravity НЕ се пипат - само
+//     входният liquidationOrders масив идва от Binance relay вместо CoinGlass.
+// (3) В тази стъпка НЕ влияе на SETUP/ARMED/ENTRY score/gate логиката - само
+//     информативен WhatsApp ред + telemetry полета (виж liqConfirmStatus).
+function isLiqLiveEnabled(env) {
+  return String(env?.LIQ_LIVE_ENABLED ?? '').trim() === '1';
+}
+
+// Реюзва fetchLiquidationOrdersRelayDiag (вече тествана shadow функция) -
+// идентична {side,usdValue,time,price} форма, side конвенция 1=Buy/2=Sell
+// огледална на CoinGlass (виж relay/liquidation-collector.js). hasData
+// разграничава "relay недостъпен/грешка" (status != ok/empty) от "данни
+// получени, но прозорецът е празен" (status === empty, легитимен нулев
+// резултат) - вижда се в caller-а чрез liqConfirmStatus по-долу.
+async function fetchLiquidationOrdersLive(env, symbol) {
+  const result = await fetchLiquidationOrdersRelayDiag(env, symbol);
+  const hasData = result.status === 'ok' || result.status === 'empty';
+  return { orders: result.orders, hasData };
+}
+
+// Разграничава 4 отделни състояния - НИКОГА не показва "няма данни" като
+// потвърждение (confirm). cascade е вече изчисленият calcLiquidationCascade()
+// резултат ({bullish,bearish}), direction е armed/entry посоката за сравнение.
+//   'no_data'  - relay недостъпен/грешка/изключен - липсва реална информация.
+//   'neutral'  - данни получени, но нито bullish, нито bearish каскада.
+//   'confirm'  - каскадата е в СЪЩАТА посока като direction.
+//   'against'  - каскадата е в ПРОТИВОПОЛОЖНАТА посока.
+function liqConfirmStatus(cascade, hasData, direction) {
+  if (!hasData || !cascade) return 'no_data';
+  const sameDirection = (direction === 'long' && cascade.bullish) || (direction === 'short' && cascade.bearish);
+  if (sameDirection) return 'confirm';
+  const oppositeDirection = (direction === 'long' && cascade.bearish) || (direction === 'short' && cascade.bullish);
+  if (oppositeDirection) return 'against';
+  return 'neutral';
+}
+const LIQ_CONFIRM_LABELS = {
+  confirm: 'LIQ: ✓ потвърждение (Binance)',
+  against: 'LIQ: ✗ против (Binance)',
+  neutral: 'LIQ: — неутрално',
+  no_data: 'LIQ: — няма данни',
+};
+
 function liqDiagUsdBin(usd) {
   let idx = 0;
   for (let i = 0; i < LIQ_DIAG_USD_BINS.length; i++) if (usd >= LIQ_DIAG_USD_BINS[i]) idx = i;
@@ -4789,15 +4844,29 @@ async function scanSymbolSignals(env, symbol) {
   // Promise.all по-долу, САМО при env.LIQ_DIAG_ENABLED === '1'. Legacy
   // liquidationOrders заявката остава непроменена.
   const liqDiagFetchPromise = isLiqDiagEnabled(env) ? fetchLiquidationOrdersShadow(env, symbol).catch(() => null) : null;
-  const [oiHist, wallsRaw, chg24h, longShortCycle, fundingCycle, liquidationOrders, takerHist] = await Promise.all([
+  // BINANCE LIQUIDATION LIVE (виж isLiqLiveEnabled/fetchLiquidationOrdersLive
+  // по-горе) - САМО при env.LIQ_LIVE_ENABLED === '1' заменя мъртвия CoinGlass
+  // източник (fetchLiquidationOrdersWorker, CG_API_KEY липсва) с реалните
+  // Binance forceOrder данни от DigitalOcean relay-я. calcLiquidationCascade/
+  // accumulateLiquidationGravity по-долу остават напълно непроменени - само
+  // входният масив вече идва от друг източник. liqLiveEnabled=false (default)
+  // -> liquidationFetch идва от legacy пътя, байт-идентично на старото поведение.
+  const liqLiveEnabled = isLiqLiveEnabled(env);
+  const [oiHist, wallsRaw, chg24h, longShortCycle, fundingCycle, liquidationFetch, takerHist] = await Promise.all([
     fetchOpenInterestHistWorker(env, symbol, '5m', 13),
     fetchOrderBookWallsWorker(env, symbol, price),
     fetch24hChangeWorker(env, symbol),
     fetchLongShortWorker(env, symbol),
     fetchFundingWorker(env, symbol),
-    fetchLiquidationOrdersWorker(env, symbol),
+    liqLiveEnabled ? fetchLiquidationOrdersLive(env, symbol) : fetchLiquidationOrdersWorker(env, symbol).then(orders => ({ orders, hasData: orders != null })),
     fetchTakerLongShortWorker(env, symbol, '5m', 13),
   ]);
+  const liquidationOrders = liquidationFetch.orders;
+  // hasData разграничава "няма данни" (relay недостъпен/грешка/изключен) от
+  // "данни има, но прозорецът е празен/без каскада" (легитимен неутрален
+  // резултат) - виж liqConfirmStatus по-долу и изискването да не третираме
+  // липсата на данни като потвърждение.
+  const liquidationHasData = liquidationFetch.hasData;
   const oiDeltaPct = calcOiDeltaPct(oiHist);
   const oiCross = interpretOiPriceCross(warming.direction === 'up', oiDeltaPct);
   const wallBiasLong = !!wallsRaw && wallsRaw.buyWallUsd > wallsRaw.sellWallUsd;
@@ -5051,6 +5120,17 @@ async function scanSymbolSignals(env, symbol) {
   const migrationFired = migrationCanFire(state, migrationKey, migrationDirection);
   if (migrationFired) markMigrationFired(state, migrationKey, migrationDirection);
 
+  // BINANCE LIQUIDATION LIVE - еднократен reset на вече натрупания
+  // liqGravity профил при ПЪРВОТО активиране на LIQ_LIVE_ENABLED за този
+  // символ - предпазва от смесване на стари "мъртви" CoinGlass клъстери
+  // (цени от седмици/месеци, вече ирелевантни - виж доклада) с нови реални
+  // Binance натрупвания. state.liqGravityLiveReset се пази persisted в KV -
+  // гарантира, че reset-ът става ТОЧНО веднъж, дори флагът да се изключва и
+  // включва повторно впоследствие. НЕ пипа нищо друго в state.
+  if (liqLiveEnabled && !state.liqGravityLiveReset) {
+    state.liqGravity = { buckets: {}, lastSeenTime: 0 };
+    state.liqGravityLiveReset = true;
+  }
   // IDEA 08 - "LIQUIDATION GRAVITY" (виж calcLiquidationGravityScore по-горе) -
   // изцяло отделно известие, огледално на TRAP/AUCTION/MIGRATION. Реизползва
   // liquidationOrders (вече изтеглени по-горе за LIQUIDATION CASCADE) - БЕЗ
@@ -5216,6 +5296,7 @@ async function scanSymbolSignals(env, symbol) {
         reArmCount: state.armed.reArmCount, triggerSource: state.armed.triggerSource,
         structuralReferenceAtArm: state.armed.structuralReferenceAtArm,
         structRefUnchanged: state.armed.structRefUnchanged,
+        liqConfirm: liqLiveEnabled ? liqConfirmStatus(liquidationCascade, liquidationHasData, entryDirection) : null,
       });
       entryResult.entryQualityScore = record.entryQualityScore;
       entryResult.entryQualityTier = record.entryQualityTier;
@@ -5418,6 +5499,7 @@ async function scanSymbolSignals(env, symbol) {
         timeFromArmMin: tcTimeFromArmMin, pctMoveFromArm: tcPctMoveFromArm, atrMoveFromArm: tcAtrMoveFromArm,
         setupAt: state.trendArmed.setupAt,
         targetScore: targetScore.score, targetTier, targetDirection: targetScore.direction,
+        liqConfirm: liqLiveEnabled ? liqConfirmStatus(liquidationCascade, liquidationHasData, entryDirection) : null,
       });
       trendEntryResult.entryQualityScore = record.entryQualityScore;
       trendEntryResult.entryQualityTier = record.entryQualityTier;
@@ -5529,6 +5611,10 @@ async function scanSymbolSignals(env, symbol) {
     trendSetupFired, trendSetupDirection: trendSetupState.direction, trendSetupScore: trendSetupState.score, trendSetupBreakdown: trendSetupState.breakdown,
     trendArmedFired, trendArmedDirection,
     trendEntryResult,
+    // BINANCE LIQUIDATION LIVE - подадени само за информативния WhatsApp ред
+    // и telemetry (виж liqConfirmStatus) - liqLiveEnabled=false -> caller-ът
+    // не ги ползва изобщо, съобщенията остават байт-идентични на старите.
+    liquidationCascade, liquidationHasData, liqLiveEnabled,
   };
 }
 
@@ -5554,7 +5640,7 @@ async function scanSymbolSignals(env, symbol) {
 // проблем за точно същата причина.
 async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult, trendSetupFired, trendSetupDirection, trendSetupScore, trendSetupBreakdown, trendArmedFired, trendArmedDirection, trendEntryResult } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult, trendSetupFired, trendSetupDirection, trendSetupScore, trendSetupBreakdown, trendArmedFired, trendArmedDirection, trendEntryResult, liquidationCascade, liquidationHasData, liqLiveEnabled } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -5743,6 +5829,10 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
           reasons.join(' + '),
           `⚠️ Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3)`,
         ];
+        // BINANCE LIQUIDATION LIVE - само информативно (виж liqConfirmStatus
+        // по-горе), НЕ влияе на ARMED решението. liqLiveEnabled=false ->
+        // редът не се добавя изобщо, съобщението остава байт-идентично.
+        if (liqLiveEnabled) armedLines.push(LIQ_CONFIRM_LABELS[liqConfirmStatus(liquidationCascade, liquidationHasData, armedDirection)]);
         batch.push(armedLines.join('\n'));
       }
       // ENTRY ENGINE - ЕТАП 3: "ENTRY TRIGGER" (виж calcEntryTrigger по-горе) -
@@ -5773,6 +5863,10 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
             `15M CONFIRMATION: ${entryResult.confirmation15m ? '✓' : '—'}`,
             `FLOW: ${entryResult.flowBoost ? '✓' : '—'}`,
             `HTF CONTEXT: ${entryResult.htfAligned ? '✓' : '—'}`,
+            // BINANCE LIQUIDATION LIVE - само информативно (виж
+            // liqConfirmStatus по-горе), НЕ влияе на ENTRY SCORE/QUALITY TIER
+            // в тази стъпка. liqLiveEnabled=false -> редът липсва изцяло.
+            ...(liqLiveEnabled ? [LIQ_CONFIRM_LABELS[liqConfirmStatus(liquidationCascade, liquidationHasData, entryResult.direction)]] : []),
             // PR #104/#119 - BOTH QUALITY (виж classifyBothQuality по-горе) -
             // маркиране за ВСЯКА TC+MR same-tick BOTH комбинация (не само
             // tc3_mr3) - данните показват, че всички both комбинации
@@ -5829,6 +5923,7 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
           `⚡ ARMED ${trendArmedDirection === 'long' ? 'LONG' : 'SHORT'} ${symbolNoUsdt} (TREND CONTINUATION)`,
           `⚠️ Все още НЕ Е entry - чакаме ENTRY TRIGGER (Етап 3)`,
         ];
+        if (liqLiveEnabled) trendArmedLines.push(LIQ_CONFIRM_LABELS[liqConfirmStatus(liquidationCascade, liquidationHasData, trendArmedDirection)]);
         batch.push(trendArmedLines.join('\n'));
       }
       if (trendEntryResult.status === 'entry' || trendEntryResult.status === 'missed') {
@@ -5852,6 +5947,8 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
             `15M CONFIRMATION: ${trendEntryResult.confirmation15m ? '✓' : '—'}`,
             `FLOW: ${trendEntryResult.flowBoost ? '✓' : '—'}`,
             `HTF CONTEXT: ${trendEntryResult.htfAligned ? '✓' : '—'}`,
+            // BINANCE LIQUIDATION LIVE - виж бележката при mean_reversion ENTRY по-горе.
+            ...(liqLiveEnabled ? [LIQ_CONFIRM_LABELS[liqConfirmStatus(liquidationCascade, liquidationHasData, trendEntryResult.direction)]] : []),
             // PR #104/#119 - BOTH QUALITY (виж classifyBothQuality по-горе) -
             // маркиране за ВСЯКА TC+MR same-tick BOTH комбинация (не само
             // tc3_mr3) - данните показват, че всички both комбинации
@@ -7429,6 +7526,8 @@ export {
   buildLiqDiagUrl, fetchLiquidationOrdersDiag, detectLiqDiagTruncation, applyLiqShadowStep,
   runLiqShadowDiagnostics, buildLiqDiagSummary, runLiqDiagProbe, WATCHLIST,
   fetchLiquidationOrdersRelayDiag, getLiqDiagSource, fetchLiquidationOrdersShadow,
+  // BINANCE LIQUIDATION LIVE - изложени само за unit тестове.
+  isLiqLiveEnabled, fetchLiquidationOrdersLive, liqConfirmStatus, LIQ_CONFIRM_LABELS,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
