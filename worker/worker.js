@@ -5354,6 +5354,13 @@ async function scanSymbolSignals(env, symbol) {
         liqConfirm: liqLiveEnabled ? liqConfirmStatus(liquidationCascade, liquidationHasData, entryDirection) : null,
         vetoSource: entryResult.vetoSource,
       });
+      // OBSERVABILITY-ONLY (наблюдателен период, Binance Liquidation Etap 3) -
+      // console.log при liqVeto, видимо на живо в Cloudflare Observability →
+      // Logs, НЕЗАВИСИМО от KV telemetry записа по-горе (не го заменя, не
+      // променя decision/score логиката).
+      if (decision === 'veto' && record.vetoSource !== 'flow') {
+        console.log(`LIQ_VETO mean_reversion ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null}`);
+      }
       entryResult.entryQualityScore = record.entryQualityScore;
       entryResult.entryQualityTier = record.entryQualityTier;
       mrTelemetryRecordAt = record.at; // PR #104 - виж коментара при декларацията по-горе
@@ -5561,6 +5568,11 @@ async function scanSymbolSignals(env, symbol) {
         liqConfirm: liqLiveEnabled ? liqConfirmStatus(liquidationCascade, liquidationHasData, entryDirection) : null,
         vetoSource: trendEntryResult.vetoSource,
       });
+      // OBSERVABILITY-ONLY (наблюдателен период, Binance Liquidation Etap 3) -
+      // виж огледалния коментар в MEAN REVERSION блока по-горе.
+      if (decision === 'veto' && record.vetoSource !== 'flow') {
+        console.log(`LIQ_VETO trend_continuation ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null}`);
+      }
       trendEntryResult.entryQualityScore = record.entryQualityScore;
       trendEntryResult.entryQualityTier = record.entryQualityTier;
       if (env.ALERT_STATE) {
