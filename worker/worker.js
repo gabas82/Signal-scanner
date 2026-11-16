@@ -5372,6 +5372,13 @@ async function scanSymbolSignals(env, symbol) {
       if (decision === 'veto' && record.vetoSource !== 'flow') {
         console.log(`LIQ_VETO mean_reversion ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null}`);
       }
+      // OBSERVABILITY-ONLY, огледално на LIQ_VETO по-горе - за CONFIRMED записи
+      // С налични LIQ данни (liqConfirm != 'no_data'), за да могат VETO и
+      // CONFIRMED сигналите да се сравняват обективно в анализа. Записи БЕЗ
+      // LIQ данни (null/'no_data') НЕ логват тук - разграничени са нарочно.
+      if (decision === 'confirmed' && record.liqConfirm != null && record.liqConfirm !== 'no_data') {
+        console.log(`LIQ_CONFIRM mean_reversion ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null}`);
+      }
       entryResult.entryQualityScore = record.entryQualityScore;
       entryResult.entryQualityTier = record.entryQualityTier;
       mrTelemetryRecordAt = record.at; // PR #104 - виж коментара при декларацията по-горе
@@ -5583,6 +5590,10 @@ async function scanSymbolSignals(env, symbol) {
       // виж огледалния коментар в MEAN REVERSION блока по-горе.
       if (decision === 'veto' && record.vetoSource !== 'flow') {
         console.log(`LIQ_VETO trend_continuation ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null}`);
+      }
+      // OBSERVABILITY-ONLY - виж огледалния коментар в MEAN REVERSION блока по-горе.
+      if (decision === 'confirmed' && record.liqConfirm != null && record.liqConfirm !== 'no_data') {
+        console.log(`LIQ_CONFIRM trend_continuation ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null}`);
       }
       trendEntryResult.entryQualityScore = record.entryQualityScore;
       trendEntryResult.entryQualityTier = record.entryQualityTier;
