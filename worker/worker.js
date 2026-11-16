@@ -5746,6 +5746,17 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
         if (resistance != null) lines.push(`🔺 Съпротива: ${formatPrice(resistance)} USD`);
         if (support != null) lines.push(`🔻 Подкрепа: ${formatPrice(support)} USD`);
         if (longShort) lines.push(`⚖️ Long/Short: ${longShort.longPct}% / ${longShort.shortPct}%`);
+        // BINANCE LIQUIDATION LIVE - най-близкият реален ликвидационен клъстер
+        // ("магнит", виж findNearestLiquidationCluster/calcLiquidationGravityScore
+        // по-горе) - преизчислява се всеки тик спрямо ТЕКУЩАТА цена, затова
+        // автоматично се обновява при нов сигнал или след достигане/отдалечаване
+        // от магнита. Гейтнато зад liqLiveEnabled (false -> редът липсва изцяло,
+        // байт-идентично на старото съобщение) - иначе само при реално открит
+        // клъстер (clusterPrice != null), не празен placeholder.
+        if (liqLiveEnabled && liqGravityClusterPrice != null) {
+          const magnetDistance = liqGravityDistancePct == null ? '--' : (liqGravityDistancePct > 0 ? '+' : '') + liqGravityDistancePct.toFixed(1) + '%';
+          lines.push(`🧲 Ликв. магнит: ${formatPrice(liqGravityClusterPrice)} USD (${Math.round(liqGravityClusterUsd).toLocaleString('en-US')} USD, ${magnetDistance})`);
+        }
         lines.push('──────────');
         // Две отделни секции (т.17) - "Нов сигнал" е ПРИЧИНАТА за това известие
         // точно сега; "Активни потвърждения" са по-стари сигнали от паметта

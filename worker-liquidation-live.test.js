@@ -514,3 +514,20 @@ describe('(J) calcLiquidationCascade - директна проверка на si
     expect(r.sellSumUsd).toBe(520000);
   });
 });
+
+describe('(K) CORE сигнал - "Ликв. магнит" ред (найблизкия GRAVITY клъстер, числово)', () => {
+  it('редът е гейтнат зад liqLiveEnabled И изисква реално открит клъстер (clusterPrice != null)', () => {
+    expect(workerSrc).toContain('if (liqLiveEnabled && liqGravityClusterPrice != null) {');
+  });
+  it('форматът показва цена, натрупан USD и % разстояние от liqGravityClusterPrice/Usd/DistancePct', () => {
+    expect(workerSrc).toContain('🧲 Ликв. магнит: ${formatPrice(liqGravityClusterPrice)} USD (${Math.round(liqGravityClusterUsd).toLocaleString(\'en-US\')} USD, ${magnetDistance})');
+  });
+  it('позициониран между Long/Short реда и разделителя "──────────" в CORE съобщението', () => {
+    const longShortIdx = workerSrc.indexOf('lines.push(`⚖️ Long/Short: ${longShort.longPct}% / ${longShort.shortPct}%`);');
+    const magnetIdx = workerSrc.indexOf('🧲 Ликв. магнит:');
+    const dividerIdx = workerSrc.indexOf("lines.push('──────────');");
+    expect(longShortIdx).toBeGreaterThan(-1);
+    expect(magnetIdx).toBeGreaterThan(longShortIdx);
+    expect(dividerIdx).toBeGreaterThan(magnetIdx);
+  });
+});
