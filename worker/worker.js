@@ -3388,6 +3388,17 @@ async function listKvKeysWithTruncation(kv, prefix, maxKeysScanned) {
   return { keys: keys.slice(0, maxKeysScanned), truncated };
 }
 
+// TELEMETRY_TOKEN - приема токена и през X-Telemetry-Token header (за
+// автоматизирани клиенти, за да не стои в URL/query string), освен
+// досегашния ?token= query param. Чисто адитивно - query параметърът
+// продължава да работи точно както преди, никоя от проверките по-долу не е
+// разхлабена. Header-ът има приоритет само ако е непразен.
+function getSuppliedTelemetryToken(request, url) {
+  const headerToken = (request.headers.get("X-Telemetry-Token") || "").trim();
+  if (headerToken) return headerToken;
+  return (url.searchParams.get("token") || "").trim();
+}
+
 // COVERAGE RANGE - най-ранния/най-късния `at` timestamp сред сканираните
 // записи. Чисто observational - показва какъв времеви прозорец реално
 // покрива текущата (евентуално truncated) извадка.
@@ -7835,7 +7846,7 @@ export default {
     // проба за ЕДИН символ от WATCHLIST. Същата TELEMETRY_TOKEN защита.
     // API ключът никога не се връща.
     if ((path === "/liq-diagnostics" || path === "/liq-diagnostics/probe") && request.method === "GET") {
-      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
       const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
       const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
       if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
@@ -7862,7 +7873,7 @@ export default {
       return json(summary);
     }
     if (path === "/telemetry" && request.method === "GET") {
-      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
       const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
       if (!expectedToken || suppliedToken !== expectedToken) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -7935,7 +7946,7 @@ export default {
     // записи, разширени в PR #105 с timeFromArmMin/pctMoveFromArm/
     // atrMoveFromArm). Чисто READ - никаква промяна на ARMED/ENTRY логиката.
     if (path === "/tc-lifecycle" && request.method === "GET") {
-      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
       const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
       if (!expectedToken || suppliedToken !== expectedToken) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -8002,7 +8013,7 @@ export default {
     // същия MAX_KEYS_SCANNED таван. Чисто READ - никакво управление на pool/
     // episode състоянието тук.
     if (path === "/discovery-episodes" && request.method === "GET") {
-      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
       const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
       if (!expectedToken || suppliedToken !== expectedToken) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -8062,7 +8073,7 @@ export default {
     // (discoverywakeuparchive:) наблюдения - изрично разделени в отговора, за
     // да не се бъркат "в момента будни" с "вече приключени".
     if (path === "/discovery-wakeup" && request.method === "GET") {
-      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
       const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
       if (!expectedToken || suppliedToken !== expectedToken) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -8131,7 +8142,7 @@ export default {
     // MAX_KEYS_SCANNED таван, същия fail-closed auth. Чисто READ - никаква
     // промяна на FLOW WARMING прага/логиката тук.
     if (path === "/flow-warming-events" && request.method === "GET") {
-      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
       const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
       if (!expectedToken || suppliedToken !== expectedToken) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
