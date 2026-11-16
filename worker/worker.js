@@ -2059,9 +2059,16 @@ function calcFlowBoost({ direction, flowWarmingDirection, flowWarmingTier, trapD
 // етикетът е по-конкретен за наблюдение. ENTRY SCORE 2 (STRUCTURE+TRIGGER
 // база, гарантирани щом статусът е 'entry') + до 3 boost точки (15м
 // confirmation, FLOW, HTF context) - същата рамка като SETUP score-а.
-function calcEntryTrigger({ direction, candle5m, atr5m, candle15m, atr15m, structRef, flowVeto, flowBoost, htfAligned }) {
+// liqVeto (виж calcLiqVeto по-горе) - BINANCE LIQUIDATION LIVE, ЕТАП 3 -
+// огледално на flowVeto, подава се ВЕЧЕ изчислено от caller-а (false при
+// изключен LIQ_LIVE_ENABLED - нулева промяна). vetoSource в резултата - само
+// observability (кой от двата независими veto източника е сработил).
+function calcEntryTrigger({ direction, candle5m, atr5m, candle15m, atr15m, structRef, flowVeto, flowBoost, htfAligned, liqVeto = false }) {
   if (!isTriggerCandle(candle5m, direction, atr5m)) return { status: 'none' };
-  if (flowVeto) return { status: 'veto', triggerClose: candle5m.close, structRef };
+  if (flowVeto || liqVeto) {
+    const vetoSource = flowVeto && liqVeto ? 'both' : flowVeto ? 'flow' : 'liq';
+    return { status: 'veto', triggerClose: candle5m.close, structRef, vetoSource };
+  }
   if (isTooExtended(candle5m.close, structRef, atr5m)) {
     return { status: 'missed', triggerClose: candle5m.close, structRef };
   }
@@ -2162,7 +2169,7 @@ function buildTelemetryRecord({
   timeFromArmMin, pctMoveFromArm, atrMoveFromArm, setupAt,
   targetScore, targetTier, targetDirection,
   reArmCount, triggerSource, structuralReferenceAtArm, structRefUnchanged,
-  liqConfirm,
+  liqConfirm, vetoSource,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
   const chaseDistanceAtrRatio = (atr5m > 0 && chaseDistance != null) ? chaseDistance / atr5m : null;
@@ -2204,6 +2211,11 @@ function buildTelemetryRecord({
     // (виж доклада "Binance Liquidation Integration - Етап 2") - не участва
     // в decision/score логиката по-горе.
     liqConfirm: liqConfirm ?? null,
+    // BINANCE LIQUIDATION LIVE - ЕТАП 3 (виж calcLiqVeto/calcEntryTrigger
+    // по-горе) - 'flow' | 'liq' | 'both' | null, само когато decision='veto'.
+    // Разграничава кой veto източник реално е спрял входа - за бъдещ анализ
+    // на ефективността на новия Binance-базиран filter.
+    vetoSource: vetoSource ?? null,
     outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome240m: null, // попълват се по-късно от resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals
     // PR #103 PATH DIAGNOSTICS (MFE/MAE) - попълват се по-късно от
     // updateExcursion/resolvePendingOutcomeHorizons, огледално на outcome{X}m.
@@ -3956,6 +3968,26 @@ function buildLiqConfirmLine(liqLiveEnabled, cascade, hasData, direction) {
   return LIQ_CONFIRM_LABELS[liqConfirmStatus(cascade, hasData, direction)];
 }
 
+// ═══ BINANCE LIQUIDATION LIVE - ЕТАП 3 (реално влияние върху ENTRY) ═════════
+// Комбинира ДВАТА независими Binance-базирани сигнала в един veto за ENTRY
+// TRIGGER-а, огледално на calcFlowVeto (opposing -> temporary veto, НЕ чупи
+// ARMED, просто не пали ENTRY този тик):
+//   (1) CASCADE против - последните 15мин принудителни ликвидации (виж
+//       calcLiquidationCascade) са в ПРОТИВОПОЛОЖНА посока. Изисква
+//       hasData===true (никога veto от липсващи/остарели relay данни - виж
+//       liqConfirmStatus по-горе, същия принцип).
+//   (2) GRAVITY против - цената е близо до вече калибриран силен исторически
+//       клъстер (WATCH/CONFIRMED tier, виж getLiquidationGravityTier) В
+//       ПРОТИВОПОЛОЖНА посока - "магнитът" тегли натам, не към нашата посока.
+//       Gravity профилът е дълготраен accumulated state (не еднотиков), затова
+//       НЕ се гейтва от текущия тик-ов hasData - собственият му hasHardFactor
+//       праг (OI/CVD потвърждение) вече е калибрацията за надеждност.
+function calcLiqVeto({ direction, cascade, hasData, gravityDirection, gravityTier }) {
+  const cascadeAgainst = hasData === true && liqConfirmStatus(cascade, hasData, direction) === 'against';
+  const gravityAgainst = gravityTier !== 'none' && gravityDirection != null && gravityDirection !== direction;
+  return cascadeAgainst || gravityAgainst;
+}
+
 function liqDiagUsdBin(usd) {
   let idx = 0;
   for (let i = 0; i < LIQ_DIAG_USD_BINS.length; i++) if (usd >= LIQ_DIAG_USD_BINS[i]) idx = i;
@@ -5283,12 +5315,17 @@ async function scanSymbolSignals(env, symbol) {
     const flowVeto = calcFlowVeto({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
     const flowBoost = calcFlowBoost({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
     const htfAligned = entryDirection === 'long' ? (trend4h.bull || emaFilter.bull) : (trend4h.bear || emaFilter.bear);
+    // BINANCE LIQUIDATION LIVE - ЕТАП 3 (виж calcLiqVeto по-горе) - изрично
+    // false при изключен LIQ_LIVE_ENABLED, нулева промяна в тоя случай.
+    const liqVeto = liqLiveEnabled
+      ? calcLiqVeto({ direction: entryDirection, cascade: liquidationCascade, hasData: liquidationHasData, gravityDirection: liqGravityDirection, gravityTier: liqGravityTier })
+      : false;
     const lastClosed5mCandle = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
     entryResult = calcEntryTrigger({
       direction: entryDirection,
       candle5m: lastClosed5mCandle, atr5m,
       candle15m: c15Closed.length ? c15Closed[c15Closed.length - 1] : null, atr15m,
-      structRef, flowVeto, flowBoost, htfAligned,
+      structRef, flowVeto, flowBoost, htfAligned, liqVeto,
     });
     // TELEMETRY - записва се за entry/missed/veto (виж buildTelemetryRecord
     // по-горе), НЕЗАВИСИМО от гейт логиката по-долу - чисто observability.
@@ -5315,6 +5352,7 @@ async function scanSymbolSignals(env, symbol) {
         structuralReferenceAtArm: state.armed.structuralReferenceAtArm,
         structRefUnchanged: state.armed.structRefUnchanged,
         liqConfirm: liqLiveEnabled ? liqConfirmStatus(liquidationCascade, liquidationHasData, entryDirection) : null,
+        vetoSource: entryResult.vetoSource,
       });
       entryResult.entryQualityScore = record.entryQualityScore;
       entryResult.entryQualityTier = record.entryQualityTier;
@@ -5469,12 +5507,15 @@ async function scanSymbolSignals(env, symbol) {
     const flowVeto = calcFlowVeto({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
     const flowBoost = calcFlowBoost({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
     const htfAligned = entryDirection === 'long' ? (trend4h.bull || emaFilter.bull) : (trend4h.bear || emaFilter.bear);
+    const liqVeto = liqLiveEnabled
+      ? calcLiqVeto({ direction: entryDirection, cascade: liquidationCascade, hasData: liquidationHasData, gravityDirection: liqGravityDirection, gravityTier: liqGravityTier })
+      : false;
     const lastClosed5mCandle = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
     trendEntryResult = calcEntryTrigger({
       direction: entryDirection,
       candle5m: lastClosed5mCandle, atr5m,
       candle15m: c15Closed.length ? c15Closed[c15Closed.length - 1] : null, atr15m,
-      structRef, flowVeto, flowBoost, htfAligned,
+      structRef, flowVeto, flowBoost, htfAligned, liqVeto,
     });
     // PR #105 - TC LIFECYCLE TELEMETRY: смята се веднага след calcEntryTrigger,
     // СПОДЕЛЕНО между ENTRY EVALUATION записа по-долу и терминалния ARMED
@@ -5518,6 +5559,7 @@ async function scanSymbolSignals(env, symbol) {
         setupAt: state.trendArmed.setupAt,
         targetScore: targetScore.score, targetTier, targetDirection: targetScore.direction,
         liqConfirm: liqLiveEnabled ? liqConfirmStatus(liquidationCascade, liquidationHasData, entryDirection) : null,
+        vetoSource: trendEntryResult.vetoSource,
       });
       trendEntryResult.entryQualityScore = record.entryQualityScore;
       trendEntryResult.entryQualityTier = record.entryQualityTier;
@@ -7550,7 +7592,9 @@ export {
   fetchLiquidationOrdersRelayDiag, getLiqDiagSource, fetchLiquidationOrdersShadow,
   // BINANCE LIQUIDATION LIVE - изложени само за unit тестове.
   isLiqLiveEnabled, fetchLiquidationOrdersLive, liqConfirmStatus, LIQ_CONFIRM_LABELS,
-  buildLiqConfirmLine,
+  buildLiqConfirmLine, calcLiqVeto,
+  // ENTRY ENGINE core - изложени само за unit тестове (виж calcLiqVeto wiring-а).
+  calcFlowVeto, calcFlowBoost, calcEntryTrigger,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
