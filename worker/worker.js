@@ -942,6 +942,126 @@ function markLiveSeen(state, label, now) {
   state.liveSignalState[label] = { lastSeenAt: now };
 }
 
+// ═══ ROTATION TRACKER - следи ДИНАМИЧНАТА listа от монети на dashboard-а
+// (base watchlist + top gainers + top OI + trending, обем >1M филтър, виж
+// loadAll() в signal-scanner.html) - различно от фиксирания 35-символен
+// WATCHLIST по-горе, който следим за WhatsApp известия. Чисто observational,
+// не пипа ENTRY/VETO/CAPITULATION логиката никъде.
+//
+// Подредбата (rank) в dashboard-а зависи от сложна комбинация от сигнали
+// (calcSignal/calcSetupQuality/oiFlip - само в клиентския JS). Вместо да
+// дублираме цялата тази логика в Worker-а, подреждаме по vol24 низходящо -
+// разумно приближение, не пиксел-перфектно копие на визуалния ред.
+//
+// Състояние: ЕДИН малък обект { [symbol]: {enteredAt, entryPrice, entryRank,
+// peakRank, maxPrice, minPrice, sourceTags, lastSeenAt} }, презаписван на
+// всеки cron тик (огледално на state.liveSignalState) - НЕ пишем отделен KV
+// запис на тик за всяка монета (42 монети * 288 тика/ден би било ненужно
+// много записи за нещо, което не се налага да е толкова гранулярно).
+// Финализиран запис (telemetry:-стил, подобен на останалите persist patterns
+// в този файл) се пише само когато монета РЕАЛНО излезе от листата - виж
+// LIVE_PRESENCE_GAP_MS (толеранс за 1 пропуснат/забавен тик, за да не броим
+// секундно мигане като "излязла->влязла" събитие).
+const ROTATION_OUTCOME_HORIZONS_MIN = [60, 240, 1440]; // 1ч / 4ч / 24ч след излизане
+
+function rankRotationCandidates(coins) {
+  return [...coins].sort((a, b) => (b.vol24 || 0) - (a.vol24 || 0));
+}
+
+// Изгражда "чакащите" 1ч/4ч/24ч хоризонта за един нов финализиран rotation
+// запис - огледално на buildPendingOutcomeHorizons по-долу, но по-кратък
+// списък (тук няма MFE/MAE excursion tracking, само raw % промяна).
+function buildPendingRotationHorizons(exitedAt) {
+  const horizons = {};
+  for (const m of ROTATION_OUTCOME_HORIZONS_MIN) horizons[`m${m}`] = { dueAt: exitedAt + m * 60000, resolved: false };
+  return horizons;
+}
+
+// Raw % промяна спрямо цената при излизане - БЕЗ посока (за разлика от
+// calcOutcomePct), защото "ротацията" не е LONG/SHORT залог, а наблюдение
+// какво прави цената, след като монетата спре да е "на прожектор".
+function calcRotationOutcomePct(exitPrice, laterPrice) {
+  if (exitPrice == null || laterPrice == null || !(exitPrice > 0)) return null;
+  return (laterPrice - exitPrice) / exitPrice * 100;
+}
+
+// Сравнява предишното активно състояние срещу текущия тик selection (вече
+// вкл. vol24>1M филтъра и ранкнат по rankRotationCandidates) и връща
+// {activeState, exitedRecords} - activeState е новото състояние за запис,
+// exitedRecords са финализираните (само что РЕАЛНО излезлите, не просто
+// пропуснат тик) записи, готови за persist + pending horizons.
+function diffRotationMembership(prevActive, currentRanked, now) {
+  const active = {};
+  const currentBySymbol = new Map(currentRanked.map((c, idx) => [c.symbol, { ...c, rank: idx }]));
+
+  // 1) Текущо видимите монети - нови влизания или опреснено присъствие.
+  for (const [symbol, c] of currentBySymbol) {
+    const prev = prevActive[symbol];
+    if (!prev) {
+      active[symbol] = {
+        enteredAt: now, entryPrice: c.price, entryRank: c.rank,
+        peakRank: c.rank, maxPrice: c.price, minPrice: c.price, lastPrice: c.price,
+        sourceTags: c.sourceTags || [], lastSeenAt: now,
+      };
+    } else {
+      active[symbol] = {
+        ...prev,
+        peakRank: Math.min(prev.peakRank, c.rank),
+        maxPrice: Math.max(prev.maxPrice, c.price),
+        minPrice: Math.min(prev.minPrice, c.price),
+        lastPrice: c.price,
+        sourceTags: c.sourceTags || prev.sourceTags,
+        lastSeenAt: now,
+      };
+    }
+  }
+
+  // 2) Предишно активни, вече невидими монети - проверяваме GAP толеранса
+  // преди да ги броим за реално излезли (вместо просто пропуснат тик).
+  const exitedRecords = [];
+  for (const [symbol, prev] of Object.entries(prevActive)) {
+    if (currentBySymbol.has(symbol)) continue;
+    if (now - prev.lastSeenAt <= LIVE_PRESENCE_GAP_MS) {
+      active[symbol] = prev; // още в толеранс-прозореца - пазим го, не го трием
+      continue;
+    }
+    exitedRecords.push({
+      symbol, enteredAt: prev.enteredAt, exitedAt: prev.lastSeenAt,
+      durationMin: (prev.lastSeenAt - prev.enteredAt) / 60000,
+      entryPrice: prev.entryPrice, exitPrice: prev.lastPrice,
+      entryRank: prev.entryRank, peakRank: prev.peakRank,
+      maxPrice: prev.maxPrice, minPrice: prev.minPrice,
+      sourceTags: prev.sourceTags,
+      horizons: buildPendingRotationHorizons(prev.lastSeenAt),
+      outcome60m: null, outcome240m: null, outcome1440m: null,
+    });
+  }
+  return { activeState: active, exitedRecords };
+}
+
+// Резолвира ГОТОВИТЕ (due) хоризонти на ЕДИН pending rotation запис спрямо
+// текущата цена на монетата (currentPrice - подадена отделно, защото монетата
+// вече не е в активния rotation fetch batch, та трябва самостоятелен lookup
+// за нея, докато изчакваме хоризонтите ѝ). Огледално на
+// resolvePendingOutcomeHorizons по-горе, но по-опростено (без MFE/MAE).
+function resolvePendingRotationOutcomes(pending, currentPrice, now = Date.now()) {
+  const updates = {};
+  let allResolved = true;
+  if (!pending.horizons || typeof pending.horizons !== 'object') return { updates, allResolved: true };
+  for (const field of Object.keys(pending.horizons)) {
+    const h = pending.horizons[field];
+    if (h.resolved) continue;
+    if (now >= h.dueAt && currentPrice != null) {
+      const suffix = field.slice(1);
+      updates[`outcome${suffix}m`] = calcRotationOutcomePct(pending.exitPrice, currentPrice);
+      h.resolved = true;
+    } else {
+      allResolved = false;
+    }
+  }
+  return { updates, allResolved };
+}
+
 // "Mario – Build-Up Detector + EMA Filter" - Early Build-Up на 1ч отваря 18ч
 // прозорец за 4ч Confirm, а Confirm + разширяващ се ATR дава Pre-Impulse.
 const BUILDUP_MAX_HOURS = 18;
@@ -7788,6 +7908,9 @@ export {
   CAPITULATION_ALERT_MAX_PER_TICK, admitCapitulationAlert,
   // PUBLIC GRAVITY SNAPSHOT (/liq-gravity-public) - изложен само за unit тестове.
   buildLiqGravityPublicSnapshot,
+  // ROTATION TRACKER - изложени само за unit тестове.
+  ROTATION_OUTCOME_HORIZONS_MIN, rankRotationCandidates, buildPendingRotationHorizons,
+  calcRotationOutcomePct, diffRotationMembership, resolvePendingRotationOutcomes,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
