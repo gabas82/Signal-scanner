@@ -12,6 +12,9 @@ import {
   priceToLiqBucket, liqBucketToPrice,
   CLUSTER_TRACK_KV_PREFIX, CLUSTER_EVENT_KV_PREFIX, clusterTrackKey, clusterEventKey,
   trackSymbolClusterOutcome,
+  CLUSTER_OUTCOME_MIN_SAMPLE, CLUSTER_OUTCOME_REASONS, buildOutcomeRateStats,
+  groupClusterOutcomeRecords, buildClusterOutcomeSummary, compareOutcomeGroups,
+  buildClusterVsControlComparison,
 } from './worker/worker.js';
 import worker from './worker/worker.js';
 
@@ -439,5 +442,144 @@ describe('/cluster-diagnostics endpoint', () => {
     const body = await res.json();
     expect(Object.keys(body.tracked)).not.toContain('[object Object]');
     expect(body.tracked.BTCUSDT).toEqual({ ledger: {}, slots: {} });
+  });
+});
+
+// Помощник: минимален синтетичен затворен lifecycle запис за Stage 3 тестовете.
+function closedRecord({ kind = 'cluster', originTag = 'fresh', closeReason = 'bounced', durationMin = 30, peakProximityPct = 1 } = {}) {
+  return { symbol: 'BTCUSDT', kind, originTag, closeReason, durationMin, peakProximityPct };
+}
+
+describe('buildOutcomeRateStats', () => {
+  it('празен списък -> sampleSize 0, lowSample true, всички rates null', () => {
+    const s = buildOutcomeRateStats([]);
+    expect(s.sampleSize).toBe(0);
+    expect(s.lowSample).toBe(true);
+    expect(s.rates.bounced).toBeNull();
+    expect(s.avgDurationMin).toBeNull();
+    expect(s.avgPeakProximityPct).toBeNull();
+  });
+  it('смята correct counts/rates за смесени closeReason', () => {
+    const records = [
+      closedRecord({ closeReason: 'bounced' }),
+      closedRecord({ closeReason: 'bounced' }),
+      closedRecord({ closeReason: 'broken_confirmed' }),
+      closedRecord({ closeReason: 'expired' }),
+    ];
+    const s = buildOutcomeRateStats(records);
+    expect(s.sampleSize).toBe(4);
+    expect(s.counts).toEqual({ broken_gap: 0, broken_confirmed: 1, bounced: 2, expired: 1 });
+    expect(s.rates.bounced).toBeCloseTo(0.5);
+    expect(s.rates.broken_confirmed).toBeCloseTo(0.25);
+  });
+  it('под CLUSTER_OUTCOME_MIN_SAMPLE -> lowSample true, над прага -> false', () => {
+    const below = Array.from({ length: CLUSTER_OUTCOME_MIN_SAMPLE - 1 }, () => closedRecord());
+    const atThreshold = Array.from({ length: CLUSTER_OUTCOME_MIN_SAMPLE }, () => closedRecord());
+    expect(buildOutcomeRateStats(below).lowSample).toBe(true);
+    expect(buildOutcomeRateStats(atThreshold).lowSample).toBe(false);
+  });
+  it('усреднява durationMin/peakProximityPct, игнорира липсващи (null) стойности', () => {
+    const records = [
+      closedRecord({ durationMin: 10, peakProximityPct: 1 }),
+      closedRecord({ durationMin: 30, peakProximityPct: 3 }),
+      { ...closedRecord(), durationMin: null, peakProximityPct: null },
+    ];
+    const s = buildOutcomeRateStats(records);
+    expect(s.avgDurationMin).toBeCloseTo(20);
+    expect(s.avgPeakProximityPct).toBeCloseTo(2);
+  });
+  it('нечисти/невалидни записи (null, непознат closeReason) не чупят агрегата', () => {
+    const records = [null, undefined, { kind: 'cluster', closeReason: 'something_unexpected' }, closedRecord()];
+    expect(() => buildOutcomeRateStats(records)).not.toThrow();
+    const s = buildOutcomeRateStats(records);
+    expect(s.sampleSize).toBe(4);
+    expect(Object.values(s.counts).reduce((a, b) => a + b, 0)).toBe(1); // само истинският closeReason се брои
+  });
+  it('невалиден вход (не масив) -> празен резултат, без грешка', () => {
+    expect(() => buildOutcomeRateStats(null)).not.toThrow();
+    expect(buildOutcomeRateStats(undefined).sampleSize).toBe(0);
+  });
+});
+
+describe('groupClusterOutcomeRecords / buildClusterOutcomeSummary', () => {
+  it('разделя правилно cluster_fresh / cluster_legacy / control', () => {
+    const records = [
+      closedRecord({ kind: 'cluster', originTag: 'fresh' }),
+      closedRecord({ kind: 'cluster', originTag: 'legacy' }),
+      closedRecord({ kind: 'control', originTag: null }),
+    ];
+    const groups = groupClusterOutcomeRecords(records);
+    expect(groups.cluster_fresh.length).toBe(1);
+    expect(groups.cluster_legacy.length).toBe(1);
+    expect(groups.control.length).toBe(1);
+  });
+  it('липсващ/непознат originTag на cluster запис пада консервативно в legacy', () => {
+    const records = [{ kind: 'cluster', originTag: null, closeReason: 'bounced' }, { kind: 'cluster', closeReason: 'bounced' }];
+    const groups = groupClusterOutcomeRecords(records);
+    expect(groups.cluster_fresh.length).toBe(0);
+    expect(groups.cluster_legacy.length).toBe(2);
+  });
+  it('непознат kind се игнорира тихо, без грешка', () => {
+    const records = [{ kind: 'something_else' }, closedRecord()];
+    expect(() => groupClusterOutcomeRecords(records)).not.toThrow();
+    expect(groupClusterOutcomeRecords(records).cluster_fresh.length).toBe(1);
+  });
+  it('buildClusterOutcomeSummary връща stats за всяка от трите групи', () => {
+    const records = [closedRecord({ kind: 'cluster', originTag: 'fresh' }), closedRecord({ kind: 'control' })];
+    const summary = buildClusterOutcomeSummary(records);
+    expect(Object.keys(summary).sort()).toEqual(['cluster_fresh', 'cluster_legacy', 'control']);
+    expect(summary.cluster_fresh.sampleSize).toBe(1);
+    expect(summary.cluster_legacy.sampleSize).toBe(0);
+    expect(summary.control.sampleSize).toBe(1);
+  });
+});
+
+describe('compareOutcomeGroups', () => {
+  it('смята rate разлика правилно между две групи', () => {
+    const a = buildOutcomeRateStats([closedRecord({ closeReason: 'bounced' }), closedRecord({ closeReason: 'bounced' })]);
+    const b = buildOutcomeRateStats([closedRecord({ closeReason: 'bounced' }), closedRecord({ closeReason: 'broken_confirmed' })]);
+    const cmp = compareOutcomeGroups(a, b, { labelA: 'cluster', labelB: 'control' });
+    expect(cmp.rateDiff.bounced).toBeCloseTo(1 - 0.5);
+    expect(cmp.labelA).toBe('cluster');
+    expect(cmp.labelB).toBe('control');
+  });
+  it('lowConfidence е true, ако ПОНЕ ЕДНА от двете групи е под прага', () => {
+    const small = buildOutcomeRateStats([closedRecord()]);
+    const big = buildOutcomeRateStats(Array.from({ length: CLUSTER_OUTCOME_MIN_SAMPLE }, () => closedRecord()));
+    expect(compareOutcomeGroups(small, big).lowConfidence).toBe(true);
+    expect(compareOutcomeGroups(big, big).lowConfidence).toBe(false);
+  });
+  it('rateDiff е null, ако някоя от двете групи няма наблюдения за дадения reason', () => {
+    const empty = buildOutcomeRateStats([]);
+    const some = buildOutcomeRateStats([closedRecord()]);
+    const cmp = compareOutcomeGroups(empty, some);
+    expect(cmp.rateDiff.bounced).toBeNull();
+  });
+});
+
+describe('buildClusterVsControlComparison (главна Stage 3 входна точка)', () => {
+  it('комбинира breakdown + двете сравнения в едно', () => {
+    const records = [
+      ...Array.from({ length: 15 }, () => closedRecord({ kind: 'cluster', originTag: 'fresh', closeReason: 'broken_confirmed' })),
+      ...Array.from({ length: 5 }, () => closedRecord({ kind: 'cluster', originTag: 'legacy', closeReason: 'bounced' })),
+      ...Array.from({ length: 10 }, () => closedRecord({ kind: 'control', originTag: null, closeReason: 'bounced' })),
+    ];
+    const result = buildClusterVsControlComparison(records);
+    expect(result.breakdown.cluster_fresh.sampleSize).toBe(15);
+    expect(result.breakdown.cluster_legacy.sampleSize).toBe(5);
+    expect(result.breakdown.control.sampleSize).toBe(10);
+    expect(result.clusterVsControl.sampleSizeA).toBe(20); // fresh+legacy общо
+    expect(result.clusterVsControl.lowConfidence).toBe(true); // cluster общо 20 (не lowSample), но control=10 < 20 прага
+    expect(result.freshVsLegacy.labelA).toBe('fresh');
+    expect(result.freshVsLegacy.lowConfidence).toBe(true); // legacy sample=5 < 20
+  });
+  it('празен вход -> всички групи с sampleSize 0, без грешка', () => {
+    const result = buildClusterVsControlComparison([]);
+    expect(result.breakdown.cluster_fresh.sampleSize).toBe(0);
+    expect(result.clusterVsControl.lowConfidence).toBe(true);
+  });
+  it('невалиден вход (не масив) не хвърля грешка', () => {
+    expect(() => buildClusterVsControlComparison(null)).not.toThrow();
+    expect(() => buildClusterVsControlComparison(undefined)).not.toThrow();
   });
 });

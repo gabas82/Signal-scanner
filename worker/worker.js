@@ -4429,6 +4429,92 @@ async function trackSymbolClusterOutcome(env, symbol, buckets, price, now = Date
   }
 }
 
+// Stage 3 - АНАЛИЗ (чиста логика, без I/O, без wiring никъде - викана е РЪЧНО
+// по-късно, когато има достатъчно натрупани `clusterevent:*` записи, виж
+// discussion-а "клъстер срещу контролна група"). Взема вече извлечени
+// затворени lifecycle записи (напр. от `/cluster-diagnostics` `closed`
+// масива) и смята дали клъстер (срещу контрола) и fresh (срещу legacy)
+// наистина се различават по изход - БЕЗ да пипа production state/KV/cron.
+//
+// Под този брой затворени случаи в група - резултата носи lowSample:true,
+// за да не вадим категорични изводи от шепа наблюдения (виж уточнението за
+// "без прибързани заключения").
+const CLUSTER_OUTCOME_MIN_SAMPLE = 20;
+const CLUSTER_OUTCOME_REASONS = ['broken_gap', 'broken_confirmed', 'bounced', 'expired'];
+
+// Честотно разпределение на изходите + средни стойности за ЕДНА група затворени
+// записи - чист агрегат, огледален на buildOutcomeStatsForField/buildLiqDiagSummary
+// по-горе (same "брой + rate + lowSample" прецедент).
+function buildOutcomeRateStats(records) {
+  const list = Array.isArray(records) ? records : [];
+  const n = list.length;
+  const counts = Object.fromEntries(CLUSTER_OUTCOME_REASONS.map(r => [r, 0]));
+  let durationSum = 0, durationCount = 0;
+  let peakSum = 0, peakCount = 0;
+  for (const r of list) {
+    if (r && CLUSTER_OUTCOME_REASONS.includes(r.closeReason)) counts[r.closeReason]++;
+    if (r && typeof r.durationMin === 'number') { durationSum += r.durationMin; durationCount++; }
+    if (r && typeof r.peakProximityPct === 'number') { peakSum += r.peakProximityPct; peakCount++; }
+  }
+  const rates = Object.fromEntries(CLUSTER_OUTCOME_REASONS.map(r => [r, n > 0 ? counts[r] / n : null]));
+  return {
+    sampleSize: n,
+    lowSample: n < CLUSTER_OUTCOME_MIN_SAMPLE,
+    counts, rates,
+    avgDurationMin: durationCount > 0 ? durationSum / durationCount : null,
+    avgPeakProximityPct: peakCount > 0 ? peakSum / peakCount : null,
+  };
+}
+
+// Разделя затворените записи на cluster_fresh / cluster_legacy / control -
+// 'control' записите нямат originTag (винаги null, виж openLevelLifecycle),
+// затова не се делят на fresh/legacy. Непознат/липсващ originTag на cluster
+// запис пада в cluster_legacy (консервативно - "неизвестен произход", никога
+// невярно отчетен като "fresh").
+function groupClusterOutcomeRecords(records) {
+  const groups = { cluster_fresh: [], cluster_legacy: [], control: [] };
+  for (const r of (Array.isArray(records) ? records : [])) {
+    if (!r) continue;
+    if (r.kind === 'control') groups.control.push(r);
+    else if (r.kind === 'cluster') groups[r.originTag === 'fresh' ? 'cluster_fresh' : 'cluster_legacy'].push(r);
+  }
+  return groups;
+}
+
+function buildClusterOutcomeSummary(records) {
+  const groups = groupClusterOutcomeRecords(records);
+  return Object.fromEntries(Object.entries(groups).map(([key, recs]) => [key, buildOutcomeRateStats(recs)]));
+}
+
+// Сравнява две вече изчислени групи (buildOutcomeRateStats резултати) -
+// разлика rate по rate + lowConfidence, щом ЕДИН от двата sample-а е под
+// CLUSTER_OUTCOME_MIN_SAMPLE (виж уточнението - не вадим извод от малка извадка).
+function compareOutcomeGroups(a, b, labels = {}) {
+  const rateDiff = Object.fromEntries(CLUSTER_OUTCOME_REASONS.map(r => [
+    r, (a.rates[r] == null || b.rates[r] == null) ? null : a.rates[r] - b.rates[r],
+  ]));
+  return {
+    labelA: labels.labelA ?? null, labelB: labels.labelB ?? null,
+    sampleSizeA: a.sampleSize, sampleSizeB: b.sampleSize,
+    lowConfidence: a.lowSample || b.lowSample,
+    rateDiff,
+  };
+}
+
+// Главната входна точка за Етап 3 - взема СУРОВ списък затворени lifecycle
+// записи (напр. combined `closed` от /cluster-diagnostics за произволен брой
+// символи) и връща пълната разбивка + двете сравнения, които интересуват:
+// клъстер-срещу-контрола и fresh-срещу-legacy (само вътре в cluster групата).
+function buildClusterVsControlComparison(records) {
+  const breakdown = buildClusterOutcomeSummary(records);
+  const clusterAll = buildOutcomeRateStats((Array.isArray(records) ? records : []).filter(r => r?.kind === 'cluster'));
+  return {
+    breakdown,
+    clusterVsControl: compareOutcomeGroups(clusterAll, breakdown.control, { labelA: 'cluster', labelB: 'control' }),
+    freshVsLegacy: compareOutcomeGroups(breakdown.cluster_fresh, breakdown.cluster_legacy, { labelA: 'fresh', labelB: 'legacy' }),
+  };
+}
+
 // ═══ CME GAP TRACKER ════════════════════════════════════════════════════════
 // TradingView webhook (виж discussion-а за TV_ALERT_TOKEN/CME_DL:BTC1!/ETH1!,
 // 4h таймфрейм) - два plain-text алерта на символ: "CME GAP ENTERED" и
@@ -8518,6 +8604,10 @@ export {
   priceToLiqBucket, liqBucketToPrice,
   CLUSTER_TRACK_KV_PREFIX, CLUSTER_EVENT_KV_PREFIX, clusterTrackKey, clusterEventKey,
   trackSymbolClusterOutcome,
+  // Stage 3 - АНАЛИЗ - изложени само за unit тестове.
+  CLUSTER_OUTCOME_MIN_SAMPLE, CLUSTER_OUTCOME_REASONS, buildOutcomeRateStats,
+  groupClusterOutcomeRecords, buildClusterOutcomeSummary, compareOutcomeGroups,
+  buildClusterVsControlComparison,
   // CME GAP TRACKER - изложени само за unit тестове.
   parseCmeGapAlertText, normalizeCmeGapSymbol, openCmeGapRecord, finalizeCmeGapRecord,
   handleCmeGapEvent, buildCmeGapAlertMessage,
