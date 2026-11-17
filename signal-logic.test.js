@@ -12,7 +12,8 @@ import {
   isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
-  DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras, isScanNowTab, carryForwardKlineExtras
+  DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras, isScanNowTab, carryForwardKlineExtras,
+  isDeepAthDropCandidate
 } from './signal-logic.js';
 
 function baseCoin(overrides = {}) {
@@ -1205,5 +1206,23 @@ describe('carryForwardKlineExtras', () => {
   it('остава null, ако и предишният цикъл е бил null', () => {
     const prev = baseCoin();
     expect(carryForwardKlineExtras(prev)).toEqual({ goldenCross: null, vol1h: null, vol4h: null });
+  });
+});
+
+describe('isDeepAthDropCandidate', () => {
+  it('отхвърля монети в топ 200 по пазарна капитализация, дори при -80%+ от ATH', () => {
+    expect(isDeepAthDropCandidate(0, -95)).toBe(false);
+    expect(isDeepAthDropCandidate(199, -95)).toBe(false);
+  });
+  it('приема монети извън топ 200 (ранг 201+) с >=80% спад от ATH', () => {
+    expect(isDeepAthDropCandidate(200, -80)).toBe(true);
+    expect(isDeepAthDropCandidate(499, -99)).toBe(true);
+  });
+  it('отхвърля монети извън топ 200, ако спадът от ATH е по-малък от 80%', () => {
+    expect(isDeepAthDropCandidate(300, -79.9)).toBe(false);
+  });
+  it('отхвърля монети без известен ath_change_percentage', () => {
+    expect(isDeepAthDropCandidate(300, null)).toBe(false);
+    expect(isDeepAthDropCandidate(300, undefined)).toBe(false);
   });
 });
