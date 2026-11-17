@@ -1632,6 +1632,29 @@ function markTargetFired(state, key, direction) {
   state.target = { key, direction, at: Date.now() };
 }
 
+// CAPITULATION ALERT (FLUSH/BASE) - двата "ядро" детектора на capitulation suite
+// (виж calcFlushSignal/calcBaseSignal по-горе) вече допринасят точки в LONG/
+// SHORT резултата (SIGNAL_WEIGHTS.flush/base = 1.25, под MIN_NOTIFY_SCORE =
+// 2.5), затова сам FLUSH/BASE, без друг съпровождащ сигнал, никога не
+// пораждаше собствено известие - оставаше "невидим" в WhatsApp. Огледално на
+// liqGravityCanFire/markLiqGravityFired по-горе - посоката е винаги 'long'
+// (FLUSH/BASE са bottom-detection сигнали), затова ключът сам достатъчно
+// разграничава "ново" от "вече известено в последните 30 мин" (hysteresis
+// cooldown по подразбиране). НЕ променя flush/base boolean-а, нито точковия
+// резултат - чисто допълнително known-to-user известие.
+function flushCanFire(state) {
+  return canFireWithHysteresis(state.flushFired, 'flush', 'long');
+}
+function markFlushFired(state) {
+  state.flushFired = { key: 'flush', direction: 'long', at: Date.now() };
+}
+function baseCanFire(state) {
+  return canFireWithHysteresis(state.baseFired, 'base', 'long');
+}
+function markBaseFired(state) {
+  state.baseFired = { key: 'base', direction: 'long', at: Date.now() };
+}
+
 // ═══ IDEA 03 - "AUCTION QUALITY" ═══════════════════════════════════════════════
 // Оценява БАЛАНСА на Value Area от Volume Profile Engine (виж по-горе): широка/
 // тясна (ширина спрямо POC цената) и симетрична/скосена (къде седи POC вътре
@@ -4698,6 +4721,15 @@ async function scanSymbolSignals(env, symbol) {
 
   const state = await loadSymbolState(env, symbol);
 
+  // CAPITULATION ALERT (виж flushCanFire/baseCanFire по-горе) - собствено
+  // известие за FLUSH/BASE, независимо от majority/MIN_NOTIFY_SCORE гейта на
+  // главното известие по-долу. Не влияе на flush/base boolean-а нито на
+  // longScore/shortScore - само маркира state при реално изпращане.
+  const flushFired = flush && flushCanFire(state);
+  const baseFired = base && baseCanFire(state);
+  if (flushFired) markFlushFired(state);
+  if (baseFired) markBaseFired(state);
+
   const early = calcBuildUpEarly(c1h);
   // т.9 - early.long и early.short теоретично могат да са ВЕДНЪЖ и двете true
   // (независими условия), при което старото `dir: early.long ? 1 : -1` тихо
@@ -5698,6 +5730,7 @@ async function scanSymbolSignals(env, symbol) {
     migrationPct: migrationScore.migrationPct, migrationTodayPoc: migrationScore.todayPoc, migrationYesterdayPoc: migrationScore.yesterdayPoc,
     liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore,
     liqGravityDistancePct: liqGravityScore.distancePct, liqGravityClusterPrice: liqGravityScore.clusterPrice, liqGravityClusterUsd: liqGravityScore.clusterUsd,
+    flushFired, baseFired,
     vahEvent, valEvent,
     setupFired, setupDirection: setupState.direction, setupScore: setupState.score, setupBreakdown: setupState.breakdown,
     armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp,
@@ -5734,7 +5767,7 @@ async function scanSymbolSignals(env, symbol) {
 // проблем за точно същата причина.
 async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
     try {
-      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult, trendSetupFired, trendSetupDirection, trendSetupScore, trendSetupBreakdown, trendArmedFired, trendArmedDirection, trendEntryResult, liquidationCascade, liquidationHasData, liqLiveEnabled } = await scanSymbolSignals(env, pos.symbol);
+      const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, flushFired, baseFired, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult, trendSetupFired, trendSetupDirection, trendSetupScore, trendSetupBreakdown, trendArmedFired, trendArmedDirection, trendEntryResult, liquidationCascade, liquidationHasData, liqLiveEnabled } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
         btcFlowContext = {
           hasHardFactor: sparkTier !== 'none', direction: sparkDirection,
@@ -5875,6 +5908,28 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
           `⚠️ Хипотеза за тестване (историческа ликвидационна зона) - НЕ Е entry сигнал`,
         ];
         batch.push(liqGravityLines.join('\n'));
+      }
+      // CAPITULATION ALERT (виж flushCanFire/baseCanFire по-горе) - изцяло
+      // отделно известие, огледално на TRAP/AUCTION/MIGRATION/GRAVITY по-горе.
+      // FLUSH/BASE вече допринасят точки в главния LONG/SHORT резултат
+      // (SIGNAL_WEIGHTS.flush/base), но сами (без друг съпровождащ сигнал)
+      // никога не крачеха над MIN_NOTIFY_SCORE за собствено известие - затова
+      // това известие не зависи от majority/MIN_NOTIFY_SCORE гейта.
+      if (flushFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        batch.push([
+          `💥 CAPITULATION FLUSH ${symbolNoUsdt}`,
+          price != null ? `Цена: ${formatPrice(price)} USD` : null,
+          `⚠️ Панична разпродажба (RSI 15м < 25 + обем/диапазон spike) - исторически често маркира временно дъно, НЕ Е entry сигнал сам по себе си`,
+        ].filter(Boolean).join('\n'));
+      }
+      if (baseFired) {
+        const symbolNoUsdt = pos.symbol.replace('USDT', '');
+        batch.push([
+          `🔵 CAPITULATION BASE ${symbolNoUsdt}`,
+          price != null ? `Цена: ${formatPrice(price)} USD` : null,
+          `⚠️ Базиране със скрита бичи дивергенция след спад (1ч) - НЕ Е entry сигнал сам по себе си`,
+        ].filter(Boolean).join('\n'));
       }
       // AUTO VAH/VAL STRUCTURE DETECTOR (виж calcVahValStructureEvent по-горе) -
       // изцяло отделни известия, независими от TARGET (не се гейтват едно

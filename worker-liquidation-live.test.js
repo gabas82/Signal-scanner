@@ -210,10 +210,11 @@ describe('(E) END-TO-END scanSymbolSignals - LIQ_LIVE_ENABLED', () => {
       const kvNew = makeKv();
       const newResult = await scanSymbolSignals({ ...envBase(), ALERT_STATE: kvNew }, 'BTCUSDT');
 
-      // Новите 3 полета (liquidationCascade/liquidationHasData/liqLiveEnabled)
-      // са добавка към resultа - премахваме ги преди сравнение, останалото
-      // трябва да е 100% същото като старата production логика.
-      const { liquidationCascade, liquidationHasData, liqLiveEnabled, ...newResultOldShape } = newResult;
+      // Новите полета (liquidationCascade/liquidationHasData/liqLiveEnabled,
+      // плюс flushFired/baseFired от CAPITULATION ALERT - виж flushCanFire/
+      // baseCanFire) са добавка към resultа - премахваме ги преди сравнение,
+      // останалото трябва да е 100% същото като старата production логика.
+      const { liquidationCascade, liquidationHasData, liqLiveEnabled, flushFired, baseFired, ...newResultOldShape } = newResult;
       expect(JSON.stringify(newResultOldShape)).toBe(JSON.stringify(oldResult));
       expect(liqLiveEnabled).toBe(false);
       // legacy пътят (CoinGlass, без CG_API_KEY) си остава мъртъв - потвърждение,
