@@ -1175,6 +1175,64 @@ async function trackCoinRotation(env) {
   }
 }
 
+// ═══ ROTATION TRACKER - дневен дайджест (WhatsApp, СЪЩИЯ доказан канал като
+// останалите известия - виж sendWhatsApp). Веднъж на ~24ч (гейтнато през
+// rotation:digest:lastSentAt в ALERT_STATE, огледално на
+// DISCOVERY_RADAR_INTERVAL_MIN gating patterns по-долу) обобщава излезлите
+// от листата монети през последните 24ч - колко време са стояли, движение
+// на цената докато са били вътре, резултат след изход (ако вече резолвнат).
+const ROTATION_DIGEST_INTERVAL_MS = 24 * 3600000;
+
+function filterRecentRotationExits(records, sinceMs) {
+  return records.filter(r => r && typeof r.exitedAt === 'number' && r.exitedAt >= sinceMs);
+}
+
+function formatRotationOutcome(pct) {
+  if (pct == null) return 'изчаква';
+  return (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%';
+}
+
+function buildRotationDigestMessage(records) {
+  if (records.length === 0) {
+    return '🔄 РОТАЦИЯ (24ч): нито една монета не напусна dashboard листата - стабилен състав.';
+  }
+  const sorted = [...records].sort((a, b) => b.exitedAt - a.exitedAt);
+  const lines = [`🔄 РОТАЦИЯ (24ч): ${records.length} ${records.length === 1 ? 'монета напусна' : 'монети напуснаха'} dashboard листата`];
+  for (const r of sorted.slice(0, 15)) {
+    const whileListedPct = calcRotationOutcomePct(r.entryPrice, r.exitPrice);
+    const durationH = (r.durationMin / 60).toFixed(1);
+    lines.push(`• ${r.symbol}: ${durationH}ч в листата, ${formatRotationOutcome(whileListedPct)} докато вътре, 1ч след изход: ${formatRotationOutcome(r.outcome60m)}`);
+  }
+  if (records.length > 15) lines.push(`… и още ${records.length - 15}`);
+  return lines.join('\n');
+}
+
+function shouldSendDailyRotationDigest(lastSentAt, now) {
+  return !lastSentAt || (now - lastSentAt) >= ROTATION_DIGEST_INTERVAL_MS;
+}
+
+const ROTATION_DIGEST_LAST_SENT_KEY = 'rotation:digest:lastSentAt';
+
+async function maybeSendDailyRotationDigest(env) {
+  try {
+    if (!env.ALERT_STATE) return;
+    const rawLastSent = await env.ALERT_STATE.get(ROTATION_DIGEST_LAST_SENT_KEY);
+    const lastSentAt = rawLastSent ? parseInt(rawLastSent, 10) : null;
+    const now = Date.now();
+    if (!shouldSendDailyRotationDigest(lastSentAt, now)) return;
+
+    const listResult = await env.ALERT_STATE.list({ prefix: 'rotation:' });
+    const recordKeys = listResult.keys.map(k => k.name).filter(name => name.split(':').length >= 3);
+    const records = (await Promise.all(recordKeys.map(k => env.ALERT_STATE.get(k)))).filter(Boolean).map(r => JSON.parse(r));
+    const recent = filterRecentRotationExits(records, now - ROTATION_DIGEST_INTERVAL_MS);
+
+    await sendWhatsApp(env, buildRotationDigestMessage(recent));
+    await env.ALERT_STATE.put(ROTATION_DIGEST_LAST_SENT_KEY, String(now));
+  } catch (e) {
+    console.error('maybeSendDailyRotationDigest error:', e);
+  }
+}
+
 // "Mario – Build-Up Detector + EMA Filter" - Early Build-Up на 1ч отваря 18ч
 // прозорец за 4ч Confirm, а Confirm + разширяващ се ATR дава Pre-Impulse.
 const BUILDUP_MAX_HOURS = 18;
@@ -8026,6 +8084,8 @@ export {
   calcRotationOutcomePct, diffRotationMembership, resolvePendingRotationOutcomes,
   BASE_ROTATION_SYMBOLS, selectHighMoveSymbols, selectHighVolumeSymbols,
   buildRotationCandidates, trackCoinRotation, ROTATION_STATE_KEY, ROTATION_PENDING_KEY,
+  filterRecentRotationExits, buildRotationDigestMessage, shouldSendDailyRotationDigest,
+  maybeSendDailyRotationDigest, ROTATION_DIGEST_LAST_SENT_KEY, ROTATION_DIGEST_INTERVAL_MS,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
@@ -8676,6 +8736,6 @@ export default {
     // lastWhatsAppSendAt (обикновено число, не Promise/IO обект) остава както си
     // е, за да пази реалното темпо между тиковете.
     whatsAppChain = Promise.resolve();
-    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env), checkPriceLevels(env), updateDiscoverySnapshotState(env), runDiscoveryFullAnalysis(env), trackCoinRotation(env)]));
+    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env), checkPriceLevels(env), updateDiscoverySnapshotState(env), runDiscoveryFullAnalysis(env), trackCoinRotation(env).then(() => maybeSendDailyRotationDigest(env))]));
   }
 };

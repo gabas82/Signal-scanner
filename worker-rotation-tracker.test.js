@@ -8,6 +8,8 @@ import {
   diffRotationMembership, resolvePendingRotationOutcomes, ROTATION_OUTCOME_HORIZONS_MIN,
   selectHighMoveSymbols, selectHighVolumeSymbols, buildRotationCandidates,
   BASE_ROTATION_SYMBOLS, trackCoinRotation, ROTATION_STATE_KEY, ROTATION_PENDING_KEY,
+  filterRecentRotationExits, buildRotationDigestMessage, shouldSendDailyRotationDigest,
+  maybeSendDailyRotationDigest, ROTATION_DIGEST_LAST_SENT_KEY, ROTATION_DIGEST_INTERVAL_MS,
 } from './worker/worker.js';
 import worker from './worker/worker.js';
 
@@ -297,6 +299,92 @@ describe('trackCoinRotation (orchestration, fake KV + fetch)', () => {
     expect(updated.outcome60m).toBeCloseTo(10); // (1980-1800)/1800*100
     const pending = JSON.parse(kv.m.get(ROTATION_PENDING_KEY));
     expect(pending).toEqual([]); // единственият хоризонт е резолвнат -> изчезва от опашката
+  });
+});
+
+describe('filterRecentRotationExits', () => {
+  it('включва само записи с exitedAt >= sinceMs', () => {
+    const records = [{ exitedAt: 100 }, { exitedAt: 50 }, { exitedAt: 200 }];
+    expect(filterRecentRotationExits(records, 100)).toEqual([{ exitedAt: 100 }, { exitedAt: 200 }]);
+  });
+  it('пропуска записи без валиден exitedAt', () => {
+    expect(filterRecentRotationExits([{}, null, { exitedAt: 'x' }], 0)).toEqual([]);
+  });
+});
+
+describe('buildRotationDigestMessage', () => {
+  it('специално съобщение при 0 излезли монети', () => {
+    expect(buildRotationDigestMessage([])).toContain('нито една монета');
+  });
+  it('включва символ, продължителност и % докато е била в листата', () => {
+    const msg = buildRotationDigestMessage([
+      { symbol: 'WIFUSDT', entryPrice: 2, exitPrice: 2.1, durationMin: 200, exitedAt: 1000, outcome60m: 1.5 },
+    ]);
+    expect(msg).toContain('WIFUSDT');
+    expect(msg).toContain('+5.0%'); // (2.1-2)/2*100
+    expect(msg).toContain('+1.5%');
+  });
+  it('показва "изчаква" за outcome60m, който още не е резолвнат', () => {
+    const msg = buildRotationDigestMessage([
+      { symbol: 'PEPEUSDT', entryPrice: 1, exitPrice: 0.98, durationMin: 60, exitedAt: 1000, outcome60m: null },
+    ]);
+    expect(msg).toContain('изчаква');
+  });
+  it('ограничава до 15 реда + "… и още N"', () => {
+    const records = Array.from({ length: 18 }, (_, i) => ({ symbol: `S${i}USDT`, entryPrice: 1, exitPrice: 1, durationMin: 10, exitedAt: i, outcome60m: 0 }));
+    const msg = buildRotationDigestMessage(records);
+    expect(msg).toContain('… и още 3');
+  });
+});
+
+describe('shouldSendDailyRotationDigest', () => {
+  it('true при никога непращано (lastSentAt е null)', () => {
+    expect(shouldSendDailyRotationDigest(null, Date.now())).toBe(true);
+  });
+  it('false, ако не са минали 24ч от последното пращане', () => {
+    const now = 1_000_000_000;
+    expect(shouldSendDailyRotationDigest(now - 1000, now)).toBe(false);
+  });
+  it('true, ако са минали >=24ч', () => {
+    const now = 1_000_000_000;
+    expect(shouldSendDailyRotationDigest(now - ROTATION_DIGEST_INTERVAL_MS, now)).toBe(true);
+  });
+});
+
+describe('maybeSendDailyRotationDigest (orchestration)', () => {
+  it('без ALERT_STATE -> no-op, не хвърля грешка', async () => {
+    await expect(maybeSendDailyRotationDigest({})).resolves.toBeUndefined();
+  });
+
+  it('гейт все още не е изтекъл -> не праща нищо, не пипа KV', async () => {
+    const now = 1_000_000_000;
+    const kv = makeKv({ [ROTATION_DIGEST_LAST_SENT_KEY]: String(now - 1000) });
+    const realDateNow = Date.now;
+    Date.now = () => now;
+    let fetchCalled = false;
+    globalThis.fetch = async () => { fetchCalled = true; return new Response('{}'); };
+    try {
+      await maybeSendDailyRotationDigest({ ALERT_STATE: kv });
+    } finally { Date.now = realDateNow; }
+    expect(fetchCalled).toBe(false);
+    expect(kv.m.get(ROTATION_DIGEST_LAST_SENT_KEY)).toBe(String(now - 1000)); // непроменено
+  });
+
+  it('гейтът е изтекъл -> събира последните 24ч exits, праща ги през sendWhatsApp, обновява lastSentAt', async () => {
+    const now = 2_000_000_000;
+    const exitedAt = now - 1000; // в рамките на последните 24ч
+    const kv = makeKv({
+      'rotation:WIFUSDT:100': JSON.stringify({ symbol: 'WIFUSDT', entryPrice: 1, exitPrice: 1.1, durationMin: 60, exitedAt, outcome60m: null }),
+    });
+    let sentText = null;
+    globalThis.fetch = async (url) => { sentText = decodeURIComponent(String(url).match(/text=([^&]*)/)[1]); return new Response('{"success":true}'); };
+    const realDateNow = Date.now;
+    Date.now = () => now;
+    try {
+      await maybeSendDailyRotationDigest({ ALERT_STATE: kv, CALLMEBOT_PHONE: '+1', TEXTMEBOT_APIKEY: 'k' });
+    } finally { Date.now = realDateNow; }
+    expect(sentText).toContain('WIFUSDT');
+    expect(kv.m.get(ROTATION_DIGEST_LAST_SENT_KEY)).toBe(String(now));
   });
 });
 
