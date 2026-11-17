@@ -12,7 +12,7 @@ import {
   isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
-  DCA_ENTRY, DCA_LEVERAGE
+  DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras
 } from './signal-logic.js';
 
 function baseCoin(overrides = {}) {
@@ -1138,5 +1138,32 @@ describe('calcConfirmedSignal', () => {
     const r = calcConfirmedSignal(buildBullConfirmed15m().slice(0, 10), c1hBull);
     expect(r.long).toBe(false);
     expect(r.short).toBe(false);
+  });
+});
+
+describe('carryForwardCoinExtras', () => {
+  it('връща всички null, ако монетата се вижда за пръв път (няма prevCoin)', () => {
+    expect(carryForwardCoinExtras(undefined)).toEqual({
+      pctFromAth: null, pctFromAtl: null, ath: null, atl: null, marketCap: null
+    });
+  });
+  it('пренася последно известните ATH/ATL/MCap стойности от предишния цикъл', () => {
+    const prev = baseCoin({ pctFromAth: -49, pctFromAtl: 95545, ath: 128000, atl: 65, marketCap: 1304440000000 });
+    expect(carryForwardCoinExtras(prev)).toEqual({
+      pctFromAth: -49, pctFromAtl: 95545, ath: 128000, atl: 65, marketCap: 1304440000000
+    });
+  });
+  it('остава null, ако и предишният цикъл е бил null (монетата никога не е имала geckoIdMap данни)', () => {
+    const prev = baseCoin(); // pctFromAth/pctFromAtl/ath/atl/marketCap са null по подразбиране
+    expect(carryForwardCoinExtras(prev)).toEqual({
+      pctFromAth: null, pctFromAtl: null, ath: null, atl: null, marketCap: null
+    });
+  });
+  it('не пренася други полета на монетата (напр. price, oi) - само ATH/ATL/MCap групата', () => {
+    const prev = baseCoin({ price: 64911, oi: 6020000000, ath: 128000 });
+    const result = carryForwardCoinExtras(prev);
+    expect(result).not.toHaveProperty('price');
+    expect(result).not.toHaveProperty('oi');
+    expect(result.ath).toBe(128000);
   });
 });

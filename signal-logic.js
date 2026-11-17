@@ -1554,6 +1554,22 @@ function getValueMigrationTier(score, hasHardFactor) {
   return 'none';
 }
 
+// fetchCoinData() в signal-scanner.html пресъздава allCoins обекта за всяка монета
+// при всеки refresh цикъл, преди loadAthAtlAsync() да е имал шанс да презареди
+// бавните (rate-limited) CoinGecko ATH/ATL/MCap данни за тази монета. Без това,
+// картите мигат към "зареждане..." всеки цикъл, дори за монети с вече известни
+// стойности - виж бележката при loadAthAtlAsync(). prevCoin е записът за същия
+// symbol от allCoins преди презаписа му (или null/undefined при първо зареждане).
+function carryForwardCoinExtras(prevCoin) {
+  return {
+    pctFromAth: prevCoin?.pctFromAth ?? null,
+    pctFromAtl: prevCoin?.pctFromAtl ?? null,
+    ath: prevCoin?.ath ?? null,
+    atl: prevCoin?.atl ?? null,
+    marketCap: prevCoin?.marketCap ?? null,
+  };
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -1583,6 +1599,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcTargetDistancePct, calcTargetScore, getTargetTier, findNearestMagnets, TARGET_LABELS, TARGET_MIN_DISTANCE_PCT,
     calcAuctionQualityScore, getAuctionQualityTier, AUCTION_LABELS, AUCTION_NARROW_WIDTH_PCT, AUCTION_SKEW_THRESHOLD,
     splitCandlesByUtcDay, getTodayYesterdayCandles, calcValueMigrationScore, getValueMigrationTier,
-    MIGRATION_LABELS, MIGRATION_MIN_PCT, MIGRATION_MIN_CANDLES
+    MIGRATION_LABELS, MIGRATION_MIN_PCT, MIGRATION_MIN_CANDLES,
+    carryForwardCoinExtras
   };
 }
