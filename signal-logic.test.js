@@ -12,7 +12,7 @@ import {
   isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
-  DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras, isScanNowTab
+  DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras, isScanNowTab, carryForwardKlineExtras
 } from './signal-logic.js';
 
 function baseCoin(overrides = {}) {
@@ -1187,5 +1187,23 @@ describe('isScanNowTab', () => {
   it('връща false за непознат/празен filter', () => {
     expect(isScanNowTab('')).toBe(false);
     expect(isScanNowTab(undefined)).toBe(false);
+  });
+});
+
+describe('carryForwardKlineExtras', () => {
+  it('връща всички null, ако монетата се вижда за пръв път (няма prevCoin)', () => {
+    expect(carryForwardKlineExtras(undefined)).toEqual({ goldenCross: null, vol1h: null, vol4h: null });
+  });
+  it('пренася последно известните goldenCross/vol1h/vol4h от предишния цикъл', () => {
+    const prev = baseCoin({ goldenCross: true, vol1h: 196700000, vol4h: 206300000 });
+    expect(carryForwardKlineExtras(prev)).toEqual({ goldenCross: true, vol1h: 196700000, vol4h: 206300000 });
+  });
+  it('пренася goldenCross:false коректно (не го бърка с "няма данни")', () => {
+    const prev = baseCoin({ goldenCross: false, vol1h: 1, vol4h: 1 });
+    expect(carryForwardKlineExtras(prev).goldenCross).toBe(false);
+  });
+  it('остава null, ако и предишният цикъл е бил null', () => {
+    const prev = baseCoin();
+    expect(carryForwardKlineExtras(prev)).toEqual({ goldenCross: null, vol1h: null, vol4h: null });
   });
 });

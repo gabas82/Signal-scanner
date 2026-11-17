@@ -1580,6 +1580,18 @@ function carryForwardCoinExtras(prevCoin) {
   };
 }
 
+// Огледално на carryForwardCoinExtras, но за goldenCross/vol1h/vol4h - същият
+// бъг клас: loadKlinesAsync() ги рефилва последователно (200ms/монета,
+// Binance klines), докато fetchCoinData() ги нулираше на всеки цикъл, значи
+// "50 DMA"/"VOL 1H"/"VOL 4H AVG" мигаха към "..." всеки refresh.
+function carryForwardKlineExtras(prevCoin) {
+  return {
+    goldenCross: prevCoin?.goldenCross ?? null,
+    vol1h: prevCoin?.vol1h ?? null,
+    vol4h: prevCoin?.vol4h ?? null,
+  };
+}
+
 // В браузъра (класически <script>) горните декларации стават глобални и се ползват
 // directly от signal-scanner.html. В Node (Vitest) ги правим достъпни през module.exports.
 if (typeof module !== 'undefined' && module.exports) {
@@ -1610,6 +1622,6 @@ if (typeof module !== 'undefined' && module.exports) {
     calcAuctionQualityScore, getAuctionQualityTier, AUCTION_LABELS, AUCTION_NARROW_WIDTH_PCT, AUCTION_SKEW_THRESHOLD,
     splitCandlesByUtcDay, getTodayYesterdayCandles, calcValueMigrationScore, getValueMigrationTier,
     MIGRATION_LABELS, MIGRATION_MIN_PCT, MIGRATION_MIN_CANDLES,
-    carryForwardCoinExtras, isScanNowTab
+    carryForwardCoinExtras, isScanNowTab, carryForwardKlineExtras
   };
 }

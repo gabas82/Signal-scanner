@@ -1392,11 +1392,12 @@ async function fetchCoinData(symbol) {
       else if (prevDelta > 0 && oiDelta < 0) oiFlip = 'down';
     }
     oiPrevMap[symbol] = oiDelta;
-    // Пренасяме последно известните ATH/ATL/MCap от предишния цикъл (allCoins все
-    // още не е презаписан тук), вместо да ги нулираме - виж carryForwardCoinExtras
-    // в signal-logic.js и бележката при loadAthAtlAsync() по-долу.
+    // Пренасяме последно известните ATH/ATL/MCap и goldenCross/vol1h/vol4h от
+    // предишния цикъл (allCoins все още не е презаписан тук), вместо да ги
+    // нулираме - виж carryForwardCoinExtras/carryForwardKlineExtras в
+    // signal-logic.js и бележките при loadAthAtlAsync()/loadKlinesAsync() по-долу.
     const prevCoin = allCoins.find(c => c.fullSymbol === symbol);
-    return { symbol:sym, fullSymbol:symbol, price, chg24, vol24, funding, longPct, shortPct, oi, oiDelta, oiFlip, volSpike, isTrending: trendingSymbols.has(sym), ...carryForwardCoinExtras(prevCoin), goldenCross:null, vol1h:null, vol4h:null, valid:true };
+    return { symbol:sym, fullSymbol:symbol, price, chg24, vol24, funding, longPct, shortPct, oi, oiDelta, oiFlip, volSpike, isTrending: trendingSymbols.has(sym), ...carryForwardCoinExtras(prevCoin), ...carryForwardKlineExtras(prevCoin), valid:true };
   } catch(e) { return null; }
 }
 
