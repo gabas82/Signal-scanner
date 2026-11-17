@@ -12,7 +12,7 @@ import {
   isManipulable, formatNum, formatPrice, formatOIDelta, fixSymbol,
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
-  DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras
+  DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras, isScanNowTab
 } from './signal-logic.js';
 
 function baseCoin(overrides = {}) {
@@ -1165,5 +1165,27 @@ describe('carryForwardCoinExtras', () => {
     expect(result).not.toHaveProperty('price');
     expect(result).not.toHaveProperty('oi');
     expect(result.ath).toBe(128000);
+  });
+});
+
+describe('isScanNowTab', () => {
+  it('връща true за filter200, capitulation и spark - собствен скан, не минават през renderList()', () => {
+    expect(isScanNowTab('filter200')).toBe(true);
+    expect(isScanNowTab('capitulation')).toBe(true);
+    expect(isScanNowTab('spark')).toBe(true);
+  });
+  it('връща false за обикновените табове, филтрирани през renderList()', () => {
+    expect(isScanNowTab('all')).toBe(false);
+    expect(isScanNowTab('long')).toBe(false);
+    expect(isScanNowTab('short')).toBe(false);
+    expect(isScanNowTab('squeeze')).toBe(false);
+    expect(isScanNowTab('trending')).toBe(false);
+    expect(isScanNowTab('bottom')).toBe(false);
+    expect(isScanNowTab('top')).toBe(false);
+    expect(isScanNowTab('setup')).toBe(false);
+  });
+  it('връща false за непознат/празен filter', () => {
+    expect(isScanNowTab('')).toBe(false);
+    expect(isScanNowTab(undefined)).toBe(false);
   });
 });
