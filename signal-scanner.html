@@ -1618,9 +1618,16 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     </div>`;
   }
   const detectorClass = (isBottom ? ' detector-bottom' : isTop ? ' detector-top' : '') + (coin.oiFlip ? ' oi-flip' : '');
+  // geckoIdMap е твърдо закодиран списък - монета извън него НИКОГА няма да
+  // получи ATH/ATL (loadAthAtlAsync я прескача изцяло), затова "зареждане..."
+  // лъжеше безкрайно за такива монети (напр. нови/по-екзотични токени от
+  // TOP 200+ и CAPITULATION таба). Разграничаваме "още не е заредено" от
+  // "никога няма да се зареди за тази монета".
   let athBarHtml = coin.pctFromAth !== null
     ? `<div class="ath-bar"><span style="color:var(--text2)">ATH: <span style="color:${coin.pctFromAth>-15?'var(--red)':coin.pctFromAth>-50?'var(--yellow)':'var(--green)'}">${coin.pctFromAth.toFixed(0)}%</span></span><span style="color:var(--text2)">MCap: <span style="color:var(--text)">$${coin.marketCap>0?formatNum(coin.marketCap):'--'}</span></span><span style="color:var(--text2)">ATL: <span style="color:${coin.pctFromAtl&&coin.pctFromAtl<100?'var(--green)':'var(--text2)'}">+${coin.pctFromAtl?coin.pctFromAtl.toFixed(0):'?'}%</span></span></div>`
-    : `<div class="ath-bar"><span style="color:var(--text2);font-size:9px;">ATH/ATL/MCap: зареждане...</span></div>`;
+    : geckoIdMap[coin.fullSymbol]
+      ? `<div class="ath-bar"><span style="color:var(--text2);font-size:9px;">ATH/ATL/MCap: зареждане...</span></div>`
+      : `<div class="ath-bar"><span style="color:var(--text2);font-size:9px;">ATH/ATL/MCap: недостъпен за тази монета</span></div>`;
   return `
   <div class="coin-card signal-${sc}${detectorClass}" style="animation-delay:${delay}s">
     <div class="card-top">
