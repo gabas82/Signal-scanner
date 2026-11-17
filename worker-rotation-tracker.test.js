@@ -2,11 +2,35 @@
 // trending), различна от фиксирания 35-символен WATCHLIST. Чисто observational
 // логика (влизане/излизане/резултат по-късно) - виж бележката в worker.js
 // преди diffRotationMembership за пълния контекст.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   rankRotationCandidates, buildPendingRotationHorizons, calcRotationOutcomePct,
   diffRotationMembership, resolvePendingRotationOutcomes, ROTATION_OUTCOME_HORIZONS_MIN,
+  selectHighMoveSymbols, selectHighVolumeSymbols, buildRotationCandidates,
+  BASE_ROTATION_SYMBOLS, trackCoinRotation, ROTATION_STATE_KEY, ROTATION_PENDING_KEY,
 } from './worker/worker.js';
+import worker from './worker/worker.js';
+
+const realFetch = globalThis.fetch;
+afterEach(() => { globalThis.fetch = realFetch; });
+
+function makeKv(seed = {}) {
+  const m = new Map(Object.entries(seed));
+  return {
+    m,
+    get: async (k) => (m.has(k) ? m.get(k) : null),
+    put: async (k, v) => { m.set(k, v); },
+    delete: async (k) => { m.delete(k); },
+    list: async ({ prefix } = {}) => ({
+      keys: [...m.keys()].filter(k => !prefix || k.startsWith(prefix)).map(name => ({ name })),
+      list_complete: true,
+    }),
+  };
+}
+
+function tickerRow(symbol, { price = 1, chg = 0, vol = 0 } = {}) {
+  return { symbol, lastPrice: String(price), priceChangePercent: String(chg), quoteVolume: String(vol) };
+}
 
 describe('rankRotationCandidates', () => {
   it('подрежда по vol24 низходящо', () => {
@@ -154,5 +178,156 @@ describe('resolvePendingRotationOutcomes', () => {
   });
   it('третира липсващи/невалидни horizons defensive-but graceful (легаси запис)', () => {
     expect(resolvePendingRotationOutcomes({ exitPrice: 100 }, 110, 1000)).toEqual({ updates: {}, allResolved: true });
+  });
+});
+
+describe('selectHighMoveSymbols', () => {
+  it('филтрира по chg24%>5 И quoteVolume>5M, сортира низходящо, до 15', () => {
+    const bulk = [
+      tickerRow('AUSDT', { chg: 10, vol: 6000000 }),
+      tickerRow('BUSDT', { chg: 20, vol: 6000000 }),
+      tickerRow('CUSDT', { chg: 4, vol: 6000000 }),  // под 5% прага
+      tickerRow('DUSDT', { chg: 15, vol: 1000000 }), // под volume прага
+      tickerRow('_FUTEXP', { chg: 50, vol: 9000000 }), // не завършва на USDT
+    ];
+    expect(selectHighMoveSymbols(bulk)).toEqual(['BUSDT', 'AUSDT']);
+  });
+  it('връща [] при невалиден вход', () => {
+    expect(selectHighMoveSymbols(null)).toEqual([]);
+    expect(selectHighMoveSymbols(undefined)).toEqual([]);
+  });
+});
+
+describe('selectHighVolumeSymbols', () => {
+  it('филтрира по quoteVolume>100M, сортира низходящо, до 10', () => {
+    const bulk = [
+      tickerRow('AUSDT', { vol: 200000000 }),
+      tickerRow('BUSDT', { vol: 500000000 }),
+      tickerRow('CUSDT', { vol: 50000000 }), // под прага
+    ];
+    expect(selectHighVolumeSymbols(bulk)).toEqual(['BUSDT', 'AUSDT']);
+  });
+});
+
+describe('buildRotationCandidates', () => {
+  it('включва base символ дори без gainer/high-volume таг, с vol24>1M', () => {
+    const bulk = [tickerRow('BTCUSDT', { price: 65000, vol: 2000000 })];
+    const result = buildRotationCandidates(bulk);
+    expect(result).toEqual([{ symbol: 'BTCUSDT', price: 65000, vol24: 2000000, chg24: 0, sourceTags: ['base'] }]);
+  });
+  it('изключва base символ с vol24<=1M (СЪЩИЯ филтър като клиента)', () => {
+    const bulk = [tickerRow('BTCUSDT', { price: 65000, vol: 500000 })];
+    expect(buildRotationCandidates(bulk)).toEqual([]);
+  });
+  it('маркира gainer/highVolume таговете правилно, дори за символ извън base', () => {
+    const bulk = [tickerRow('ZZZUSDT', { price: 2, chg: 20, vol: 200000000 })];
+    const result = buildRotationCandidates(bulk);
+    expect(result[0].sourceTags.sort()).toEqual(['gainer', 'highVolume']);
+  });
+  it('пропуска символ, отсъстващ от bulk ticker-а (само в BASE_ROTATION_SYMBOLS списъка)', () => {
+    expect(buildRotationCandidates([])).toEqual([]);
+  });
+  it('BASE_ROTATION_SYMBOLS не е празен и съдържа BTCUSDT/ETHUSDT', () => {
+    expect(BASE_ROTATION_SYMBOLS).toContain('BTCUSDT');
+    expect(BASE_ROTATION_SYMBOLS).toContain('ETHUSDT');
+    expect(BASE_ROTATION_SYMBOLS.length).toBeGreaterThan(0);
+  });
+});
+
+describe('trackCoinRotation (orchestration, fake KV + fetch)', () => {
+  it('без ALERT_STATE или RELAY_URL -> no-op, не хвърля грешка', async () => {
+    await expect(trackCoinRotation({})).resolves.toBeUndefined();
+    await expect(trackCoinRotation({ ALERT_STATE: makeKv() })).resolves.toBeUndefined();
+  });
+
+  it('първи tick - записва нови влизания в rotation:active, не финализира нищо', async () => {
+    globalThis.fetch = async () => new Response(JSON.stringify([
+      tickerRow('BTCUSDT', { price: 65000, vol: 2000000 }),
+    ]), { status: 200 });
+    const kv = makeKv();
+    await trackCoinRotation({ ALERT_STATE: kv, RELAY_URL: 'https://relay.mock', RELAY_TOKEN: 't' });
+    const active = JSON.parse(kv.m.get(ROTATION_STATE_KEY));
+    expect(active.BTCUSDT).toBeDefined();
+    expect(active.BTCUSDT.entryPrice).toBe(65000);
+    expect([...kv.m.keys()].some(k => k.startsWith('rotation:BTCUSDT:'))).toBe(false);
+  });
+
+  it('символ излиза извън GAP толеранса -> финализиран rotation: запис се появява в KV', async () => {
+    const enteredAt = 1000;
+    const lastSeenAt = 2000;
+    const seededActive = { ETHUSDT: { enteredAt, entryPrice: 1800, entryRank: 0, peakRank: 0, maxPrice: 1850, minPrice: 1750, lastPrice: 1820, sourceTags: ['base'], lastSeenAt } };
+    const kv = makeKv({ [ROTATION_STATE_KEY]: JSON.stringify(seededActive) });
+    const now = lastSeenAt + 13 * 60000; // извън 12-мин толеранса
+    const realDateNow = Date.now;
+    Date.now = () => now;
+    try {
+      globalThis.fetch = async () => new Response(JSON.stringify([]), { status: 200 }); // ETHUSDT вече не е в bulk-а
+      await trackCoinRotation({ ALERT_STATE: kv, RELAY_URL: 'https://relay.mock', RELAY_TOKEN: 't' });
+    } finally { Date.now = realDateNow; }
+    const key = `rotation:ETHUSDT:${enteredAt}`;
+    expect(kv.m.has(key)).toBe(true);
+    const record = JSON.parse(kv.m.get(key));
+    expect(record).toMatchObject({ symbol: 'ETHUSDT', enteredAt, exitedAt: lastSeenAt, exitPrice: 1820, outcome60m: null });
+    const pending = JSON.parse(kv.m.get(ROTATION_PENDING_KEY));
+    expect(pending).toHaveLength(1);
+    expect(pending[0].symbol).toBe('ETHUSDT');
+  });
+
+  it('резолвира due хоризонт от pending опашката и обновява финализирания запис в KV', async () => {
+    const exitedRecord = {
+      symbol: 'ETHUSDT', enteredAt: 1000, exitedAt: 2000, durationMin: 16.6,
+      entryPrice: 1800, exitPrice: 1800, entryRank: 0, peakRank: 0,
+      maxPrice: 1850, minPrice: 1750, sourceTags: ['base'],
+      horizons: { m60: { dueAt: 2000 + 60 * 60000, resolved: false } },
+      outcome60m: null, outcome240m: null, outcome1440m: null,
+    };
+    const kv = makeKv({
+      [ROTATION_STATE_KEY]: JSON.stringify({}),
+      [ROTATION_PENDING_KEY]: JSON.stringify([{ symbol: 'ETHUSDT', enteredAt: 1000, exitPrice: 1800, horizons: exitedRecord.horizons }]),
+      'rotation:ETHUSDT:1000': JSON.stringify(exitedRecord),
+    });
+    const now = 2000 + 65 * 60000; // хоризонтът вече е due
+    const realDateNow = Date.now;
+    Date.now = () => now;
+    try {
+      globalThis.fetch = async () => new Response(JSON.stringify([tickerRow('ETHUSDT', { price: 1980 })]), { status: 200 });
+      await trackCoinRotation({ ALERT_STATE: kv, RELAY_URL: 'https://relay.mock', RELAY_TOKEN: 't' });
+    } finally { Date.now = realDateNow; }
+    const updated = JSON.parse(kv.m.get('rotation:ETHUSDT:1000'));
+    expect(updated.outcome60m).toBeCloseTo(10); // (1980-1800)/1800*100
+    const pending = JSON.parse(kv.m.get(ROTATION_PENDING_KEY));
+    expect(pending).toEqual([]); // единственият хоризонт е резолвнат -> изчезва от опашката
+  });
+});
+
+describe('/rotation-diagnostics endpoint', () => {
+  const call = (env, qs = '') => worker.fetch(new Request(`https://w.mock/rotation-diagnostics${qs}`), env, { waitUntil() {} });
+
+  it('без/грешен token -> 401', async () => {
+    const res = await call({ ALERT_STATE: makeKv(), TELEMETRY_TOKEN: 'secret' });
+    expect(res.status).toBe(401);
+  });
+
+  it('с валиден token връща активните и финализираните записи', async () => {
+    const kv = makeKv({
+      [ROTATION_STATE_KEY]: JSON.stringify({ BTCUSDT: { entryPrice: 65000 } }),
+      'rotation:ETHUSDT:1000': JSON.stringify({ symbol: 'ETHUSDT', exitedAt: 5000 }),
+    });
+    const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.activeCount).toBe(1);
+    expect(body.exitedCount).toBe(1);
+    expect(body.exited[0].symbol).toBe('ETHUSDT');
+  });
+
+  it('read-only - не пише в KV', async () => {
+    const kv = makeKv({ [ROTATION_STATE_KEY]: JSON.stringify({}) });
+    await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret');
+    let wrote = false;
+    const originalPut = kv.put;
+    kv.put = async (...args) => { wrote = true; return originalPut(...args); };
+    await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret');
+    expect(wrote).toBe(false);
   });
 });

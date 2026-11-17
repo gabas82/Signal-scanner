@@ -54,6 +54,22 @@ const WATCHLIST = [
   { symbol: 'KASUSDT' },
 ];
 
+// ROTATION TRACKER - копие на BASE_SYMBOLS от signal-scanner.html (НЕ
+// WATCHLIST по-горе - различен списък, различна цел). Dashboard-ът показва
+// base+gainers+high-volume+trending, не фиксирания WhatsApp watchlist.
+// Трябва да се поддържа РЪЧНО синхронизиран с клиентския BASE_SYMBOLS, ако
+// той се промени - виж diffRotationMembership по-долу за пълния контекст.
+const BASE_ROTATION_SYMBOLS = [
+  'BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT',
+  'DOGEUSDT','ADAUSDT','AVAXUSDT','LINKUSDT','DOTUSDT',
+  'NEARUSDT','LTCUSDT','UNIUSDT','AAVEUSDT','INJUSDT',
+  'SUIUSDT','APTUSDT','ARBUSDT','WLDUSDT','ENAUSDT',
+  'FETUSDT','RENDERUSDT','ATOMUSDT','TIAUSDT','ONDOUSDT',
+  'HYPEUSDT','TAOUSDT','ETCUSDT','VVVUSDT',
+  'RIVERUSDT','TONUSDT','TWTUSDT','AIXBTUSDT','MNTUSDT',
+  'SAHARAUSDT','RAVEUSDT',
+];
+
 const DCA_ALERT_COOLDOWN_MS = 24 * 3600000; // не повтаря едно и също DCA ниво по-често от 24ч
 
 // Ръчно зададени ценови зони за наблюдение - "RECLAIM/REJECTION" известие,
@@ -1060,6 +1076,103 @@ function resolvePendingRotationOutcomes(pending, currentPrice, now = Date.now())
     }
   }
   return { updates, allResolved };
+}
+
+// Чисти селектори, огледални на fetchTopGainers/fetchTopOI в
+// signal-scanner.html (СЪЩИТЕ прагове) - работят върху bulk /ticker24hr
+// отговора (вече изтеглян от Discovery Radar през relay-я, виж
+// fetchMarketWideTicker24hrWorker). "OI" в клиентското име е подвеждащо -
+// това всъщност е high-volume филтър, не реално Open Interest - затова тук
+// функцията се казва коректно.
+function selectHighMoveSymbols(bulkTicker) {
+  if (!Array.isArray(bulkTicker)) return [];
+  return bulkTicker
+    .filter(t => t.symbol?.endsWith('USDT') && parseFloat(t.priceChangePercent) > 5 && parseFloat(t.quoteVolume) > 5000000)
+    .sort((a, b) => parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent))
+    .slice(0, 15)
+    .map(t => t.symbol);
+}
+function selectHighVolumeSymbols(bulkTicker) {
+  if (!Array.isArray(bulkTicker)) return [];
+  return bulkTicker
+    .filter(t => t.symbol?.endsWith('USDT') && parseFloat(t.quoteVolume) > 100000000)
+    .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+    .slice(0, 10)
+    .map(t => t.symbol);
+}
+
+// Изгражда ротационните кандидати от bulk ticker-а: base+gainers+high-volume
+// (БЕЗ CoinGecko "trending" - отделен API, релеят не го покрива; оповестено
+// опростяване спрямо клиента, виж discussion-а), dedup + slice(0,45) +
+// vol24>1M филтър - СЪЩИЯ модел като loadAll() в signal-scanner.html.
+function buildRotationCandidates(bulkTicker) {
+  if (!Array.isArray(bulkTicker)) return [];
+  const gainers = selectHighMoveSymbols(bulkTicker);
+  const highVol = selectHighVolumeSymbols(bulkTicker);
+  const gainerSet = new Set(gainers), highVolSet = new Set(highVol), baseSet = new Set(BASE_ROTATION_SYMBOLS);
+  const combined = [...new Set([...BASE_ROTATION_SYMBOLS, ...gainers, ...highVol])].slice(0, 45);
+  const bySymbol = new Map(bulkTicker.filter(t => typeof t.symbol === 'string').map(t => [t.symbol, t]));
+  const out = [];
+  for (const symbol of combined) {
+    const t = bySymbol.get(symbol);
+    if (!t) continue;
+    const price = parseFloat(t.lastPrice), vol24 = parseFloat(t.quoteVolume), chg24 = parseFloat(t.priceChangePercent);
+    if (!(vol24 > 1000000) || !Number.isFinite(price)) continue;
+    const sourceTags = [];
+    if (baseSet.has(symbol)) sourceTags.push('base');
+    if (gainerSet.has(symbol)) sourceTags.push('gainer');
+    if (highVolSet.has(symbol)) sourceTags.push('highVolume');
+    out.push({ symbol, price, vol24, chg24, sourceTags });
+  }
+  return out;
+}
+
+const ROTATION_STATE_KEY = 'rotation:active';
+const ROTATION_PENDING_KEY = 'rotation:pending';
+
+// Главен cron tick за rotation tracker-а - чисто observational, успоредно на
+// (не вътре в) checkMarketSignals/Discovery Radar. Пази state в СЪЩИЯ вече
+// бинднат ALERT_STATE KV namespace, нови rotation:* ключове - без нова
+// инфраструктура. Финализираните записи (rotation:{symbol}:{enteredAt}) се
+// пишат при излизане и се допълват прогресивно, докато всички 1ч/4ч/24ч
+// хоризонта резолвират (виж resolvePendingRotationOutcomes).
+async function trackCoinRotation(env) {
+  try {
+    if (!env.ALERT_STATE || !env.RELAY_URL) return;
+    const bulk = await fetchMarketWideTicker24hrWorker(env);
+    const candidates = buildRotationCandidates(bulk);
+    const ranked = rankRotationCandidates(candidates);
+    const now = Date.now();
+
+    const rawActive = await env.ALERT_STATE.get(ROTATION_STATE_KEY);
+    const prevActive = rawActive ? JSON.parse(rawActive) : {};
+    const { activeState, exitedRecords } = diffRotationMembership(prevActive, ranked, now);
+    await env.ALERT_STATE.put(ROTATION_STATE_KEY, JSON.stringify(activeState));
+
+    const rawPending = await env.ALERT_STATE.get(ROTATION_PENDING_KEY);
+    let pending = rawPending ? JSON.parse(rawPending) : [];
+
+    for (const record of exitedRecords) {
+      await env.ALERT_STATE.put(`rotation:${record.symbol}:${record.enteredAt}`, JSON.stringify(record));
+      pending.push({ symbol: record.symbol, enteredAt: record.enteredAt, exitPrice: record.exitPrice, horizons: record.horizons });
+    }
+
+    const bulkPriceBySymbol = new Map(bulk.filter(t => typeof t.symbol === 'string').map(t => [t.symbol, parseFloat(t.lastPrice)]));
+    const stillPending = [];
+    for (const p of pending) {
+      const currentPrice = bulkPriceBySymbol.get(p.symbol) ?? null;
+      const { updates, allResolved } = resolvePendingRotationOutcomes(p, currentPrice, now);
+      if (Object.keys(updates).length > 0) {
+        const key = `rotation:${p.symbol}:${p.enteredAt}`;
+        const raw = await env.ALERT_STATE.get(key);
+        if (raw) await env.ALERT_STATE.put(key, JSON.stringify({ ...JSON.parse(raw), ...updates }));
+      }
+      if (!allResolved) stillPending.push(p);
+    }
+    await env.ALERT_STATE.put(ROTATION_PENDING_KEY, JSON.stringify(stillPending));
+  } catch (e) {
+    console.error('trackCoinRotation error:', e);
+  }
 }
 
 // "Mario – Build-Up Detector + EMA Filter" - Early Build-Up на 1ч отваря 18ч
@@ -7911,6 +8024,8 @@ export {
   // ROTATION TRACKER - изложени само за unit тестове.
   ROTATION_OUTCOME_HORIZONS_MIN, rankRotationCandidates, buildPendingRotationHorizons,
   calcRotationOutcomePct, diffRotationMembership, resolvePendingRotationOutcomes,
+  BASE_ROTATION_SYMBOLS, selectHighMoveSymbols, selectHighVolumeSymbols,
+  buildRotationCandidates, trackCoinRotation, ROTATION_STATE_KEY, ROTATION_PENDING_KEY,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
@@ -8153,6 +8268,31 @@ export default {
       summary.source = getLiqDiagSource(env);
       if (url.searchParams.get("full") === "1") summary.raw = Object.fromEntries(entries.map(e => [e.symbol, e.diag]));
       return json(summary);
+    }
+    // ROTATION TRACKER diagnostics - read-only, token-gated като /liq-diagnostics.
+    // Показва текущо активните монети в динамичната dashboard листа + вече
+    // финализирани ротационни записи (влязла/излязла/резултат).
+    if (path === "/rotation-diagnostics" && request.method === "GET") {
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+      if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
+      if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
+      const rawActive = await env.ALERT_STATE.get(ROTATION_STATE_KEY);
+      const active = rawActive ? JSON.parse(rawActive) : {};
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "200", 10) || 200, 1000);
+      const listResult = await env.ALERT_STATE.list({ prefix: "rotation:" });
+      const recordKeys = listResult.keys
+        .map(k => k.name)
+        .filter(name => name.split(":").length >= 3); // изключва rotation:active/rotation:pending control ключовете
+      const records = (await Promise.all(recordKeys.map(k => env.ALERT_STATE.get(k)))).filter(Boolean).map(r => JSON.parse(r));
+      records.sort((a, b) => b.exitedAt - a.exitedAt);
+      return json({
+        activeCount: Object.keys(active).length,
+        active,
+        exitedCount: records.length,
+        exited: records.slice(0, limit),
+      });
     }
     // PUBLIC GRAVITY (виж buildLiqGravityPublicSnapshot по-горе) - ЕДИНСТВЕНИЯТ
     // read-only endpoint БЕЗ TELEMETRY_TOKEN, нарочно: няма тайна/търговска
@@ -8536,6 +8676,6 @@ export default {
     // lastWhatsAppSendAt (обикновено число, не Promise/IO обект) остава както си
     // е, за да пази реалното темпо между тиковете.
     whatsAppChain = Promise.resolve();
-    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env), checkPriceLevels(env), updateDiscoverySnapshotState(env), runDiscoveryFullAnalysis(env)]));
+    ctx.waitUntil(Promise.all([checkDcaLevels(env), checkMarketSignals(env), checkMacroSqueeze(env), checkPriceLevels(env), updateDiscoverySnapshotState(env), runDiscoveryFullAnalysis(env), trackCoinRotation(env)]));
   }
 };
