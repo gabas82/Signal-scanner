@@ -4429,6 +4429,87 @@ async function trackSymbolClusterOutcome(env, symbol, buckets, price, now = Date
   }
 }
 
+// ═══ CME GAP TRACKER ════════════════════════════════════════════════════════
+// TradingView webhook (виж discussion-а за TV_ALERT_TOKEN/CME_DL:BTC1!/ETH1!,
+// 4h таймфрейм) - два plain-text алерта на символ: "CME GAP ENTERED" и
+// "CME GAP FILLED", с формат:
+//   CME GAP ENTERED — {{ticker}}
+//   Price: {{close}}
+//   Time: {{time}}
+// Чисто observational, Stage 1 (само логика, без wiring/KV/endpoint). За
+// разлика от Cluster Tracker-а, тук НЕ строим собствена price-sampling state
+// machine - доверяваме се директно на TradingView за ENTERED/FILLED прехода,
+// само сдвояваме двете събития във времето и смятаме резултат.
+
+// Извлича {type, ticker, symbol, price, at} от суровото plain-text тяло на
+// webhook-а. `[\s\S]*?` (не `.`) между групите, защото текстът е на 3 реда.
+// Връща null при каквото и да е несъответствие - fail-closed, никога не
+// хвърля грешка нагоре.
+function parseCmeGapAlertText(text) {
+  if (typeof text !== 'string') return null;
+  const m = text.match(/CME GAP (ENTERED|FILLED)\s*[—-]\s*(\S+)[\s\S]*?Price:\s*([\d.]+)[\s\S]*?Time:\s*(\S+)/i);
+  if (!m) return null;
+  const [, rawType, rawTicker, priceStr, timeStr] = m;
+  const price = parseFloat(priceStr);
+  const at = Date.parse(timeStr);
+  if (!Number.isFinite(price) || !Number.isFinite(at)) return null;
+  return {
+    type: rawType.toUpperCase() === 'ENTERED' ? 'entered' : 'filled',
+    ticker: rawTicker, symbol: normalizeCmeGapSymbol(rawTicker), price, at,
+  };
+}
+
+// CME_DL:BTC1! -> 'BTC', CME_DL:ETH1! -> 'ETH' - само за по-четливи известия/
+// ключове, суровият ticker се пази отделно в събитието/записа.
+function normalizeCmeGapSymbol(ticker) {
+  if (typeof ticker !== 'string') return ticker;
+  return ticker.replace(/^CME_DL:/i, '').replace(/1!$/, '');
+}
+
+function openCmeGapRecord(event) {
+  return { ticker: event.ticker, symbol: event.symbol, enteredAt: event.at, enterPrice: event.price };
+}
+
+// `openRecord` е null, когато FILLED дойде без наблюдаван предходен ENTERED
+// (напр. първото събитие след стартиране на следенето) - записваме честно
+// enteredAt/enterPrice:null, originKnown:false (огледално на "legacy" в
+// Cluster Tracker-а), вместо да губим записа или да го преправим.
+function finalizeCmeGapRecord(openRecord, event, closeReason) {
+  const enteredAt = openRecord ? openRecord.enteredAt : null;
+  const enterPrice = openRecord ? openRecord.enterPrice : null;
+  return {
+    ticker: event.ticker, symbol: event.symbol,
+    enteredAt, enterPrice, originKnown: enteredAt != null,
+    filledAt: event.at, fillPrice: event.price,
+    durationMin: enteredAt != null ? (event.at - enteredAt) / 60000 : null,
+    closeReason,
+  };
+}
+
+// Главната чиста стъпка за ЕДИН символ - взема предходния отворен запис (или
+// null) + новото събитие, връща новия отворен запис + евентуални финализирани
+// записи (огледално на diffRotationMembership/advanceClusterTracking по дух,
+// много по-просто тук защото ENTERED/FILLED вече идват готови от TradingView).
+function handleCmeGapEvent(prevOpen, event) {
+  if (!event) return { nextOpen: prevOpen ?? null, closedRecords: [] };
+  if (event.type === 'entered') {
+    const closedRecords = prevOpen
+      // Нов ENTERED, докато предходният още не е FILLED - затваряме стария
+      // честно като 'superseded' (НЕ го губим тихо, виж принципа по-горе).
+      ? [finalizeCmeGapRecord(prevOpen, event, 'superseded')]
+      : [];
+    return { nextOpen: openCmeGapRecord(event), closedRecords };
+  }
+  return { nextOpen: null, closedRecords: [finalizeCmeGapRecord(prevOpen, event, 'filled')] };
+}
+
+// Текст за незабавното известие (виж "и двете" решението - WhatsApp веднага
+// + запис за по-късен анализ). Чиста функция, не вика sendWhatsApp директно.
+function buildCmeGapAlertMessage(event) {
+  const label = event.type === 'entered' ? '🟡 CME GAP ENTERED' : '✅ CME GAP FILLED';
+  return `${label}\n${event.symbol} (${event.ticker})\nЦена: ${event.price}\n${new Date(event.at).toISOString()}`;
+}
+
 // ═══ COINGLASS LIQUIDATION DIAGNOSTICS (SHADOW, diagnostic-only) ════════════════
 // Диагностика на `/futures/liquidation/order` интеграцията (виж доклада
 // "CoinGlass liquidation/order - symbol diagnostics"). ПРИНЦИПИ:
@@ -8401,6 +8482,9 @@ export {
   priceToLiqBucket, liqBucketToPrice,
   CLUSTER_TRACK_KV_PREFIX, CLUSTER_EVENT_KV_PREFIX, clusterTrackKey, clusterEventKey,
   trackSymbolClusterOutcome,
+  // CME GAP TRACKER - изложени само за unit тестове.
+  parseCmeGapAlertText, normalizeCmeGapSymbol, openCmeGapRecord, finalizeCmeGapRecord,
+  handleCmeGapEvent, buildCmeGapAlertMessage,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
