@@ -3825,6 +3825,19 @@ function markLiqGravityFired(state, key, direction) {
   state.liqGravityFired = { key, direction, at: Date.now() };
 }
 
+// Чист helper (лесен за unit тест) за PUBLIC GRAVITY SNAPSHOT - виж call
+// site-а в scanSymbolSignals и /liq-gravity-public endpoint-а по-долу.
+// direction тук е ЗНАКЪТ на distancePct директно (клъстер НАД цената ->
+// цената вероятно се тегли НАГОРЕ натам = 'long'), а НЕ liqGravityDirection
+// (която е резултат от longScore>=shortScore сравнение и е безсмислена,
+// когато cluster е null и двата score-а са 0).
+function buildLiqGravityPublicSnapshot({ tier, distancePct, clusterPrice, clusterUsd, price }) {
+  if (clusterPrice == null) return undefined;
+  return {
+    tier, direction: distancePct > 0 ? 'long' : 'short', distancePct, clusterPrice, clusterUsd, price, at: Date.now(),
+  };
+}
+
 // ═══ COINGLASS LIQUIDATION DIAGNOSTICS (SHADOW, diagnostic-only) ════════════════
 // Диагностика на `/futures/liquidation/order` интеграцията (виж доклада
 // "CoinGlass liquidation/order - symbol diagnostics"). ПРИНЦИПИ:
@@ -5285,6 +5298,18 @@ async function scanSymbolSignals(env, symbol) {
   const liqGravityKey = liqGravityTier !== 'none' ? `${liqGravityDirection}:${liqGravityTier}` : 'none';
   const liqGravityFired = liqGravityCanFire(state, liqGravityKey, liqGravityDirection);
   if (liqGravityFired) markLiqGravityFired(state, liqGravityKey, liqGravityDirection);
+  // PUBLIC GRAVITY SNAPSHOT (виж /liq-gravity-public по-долу, buildLiqGravityPublicSnapshot) -
+  // лека, read-only снимка на най-близкия идентифициран клъстер за dashboard-а
+  // (gabas82.github.io) - НЕЗАВИСИМА от tier/hasHardFactor гейта (watch/
+  // confirmed изисква OI/CVD потвърждение за WhatsApp известие; тук показваме
+  // суровия клъстер+посока щом изобщо има кошче над LIQ_GRAVITY_CLUSTER_MIN_USD,
+  // независимо дали покрива hasHardFactor прага). `|| undefined` - когато
+  // няма клъстер (clusterPrice null), JSON.stringify пропуска полето изцяло,
+  // затова baseline/никога-не-намерен случая остава byte-identical в sigstate.
+  state.liqGravityPublic = buildLiqGravityPublicSnapshot({
+    tier: liqGravityTier, distancePct: liqGravityScore.distancePct,
+    clusterPrice: liqGravityScore.clusterPrice, clusterUsd: liqGravityScore.clusterUsd, price,
+  });
   // COINGLASS LIQUIDATION DIAGNOSTICS (shadow) - само записва в `liqdiag:`
   // KV; не чете/пише `state`, не влияе на никоя стойност в този return.
   if (liqDiagFetchPromise) {
@@ -7761,6 +7786,8 @@ export {
   // само за unit тестове.
   flushCanFire, markFlushFired, baseCanFire, markBaseFired,
   CAPITULATION_ALERT_MAX_PER_TICK, admitCapitulationAlert,
+  // PUBLIC GRAVITY SNAPSHOT (/liq-gravity-public) - изложен само за unit тестове.
+  buildLiqGravityPublicSnapshot,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
@@ -8003,6 +8030,25 @@ export default {
       summary.source = getLiqDiagSource(env);
       if (url.searchParams.get("full") === "1") summary.raw = Object.fromEntries(entries.map(e => [e.symbol, e.diag]));
       return json(summary);
+    }
+    // PUBLIC GRAVITY (виж buildLiqGravityPublicSnapshot по-горе) - ЕДИНСТВЕНИЯТ
+    // read-only endpoint БЕЗ TELEMETRY_TOKEN, нарочно: няма тайна/търговска
+    // логика вътре, само вече публично изчислена посока+разстояние до
+    // клъстер от реални Binance ликвидации - за gabas82.github.io dashboard-а
+    // (виж discussion-a "WLD картата/market maker ликвидност"). НЕ вика
+    // scanSymbolSignals наново (би било бавно/дублирало cron работата и
+    // странично би пипало hysteresis state) - само чете вече записаната
+    // snapshot от последния cron тик (виж call site-а в scanSymbolSignals).
+    if (path === "/liq-gravity-public" && request.method === "GET") {
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+      if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
+      const watch = WATCHLIST.map(w => w.symbol);
+      const entries = await Promise.all(watch.map(async symbol => {
+        const state = await loadSymbolState(env, symbol);
+        return [symbol, state.liqGravityPublic || null];
+      }));
+      const clusters = Object.fromEntries(entries.filter(([, g]) => g != null));
+      return json({ updatedSymbols: Object.keys(clusters).length, totalSymbols: watch.length, clusters });
     }
     if (path === "/telemetry" && request.method === "GET") {
       const suppliedToken = getSuppliedTelemetryToken(request, url);

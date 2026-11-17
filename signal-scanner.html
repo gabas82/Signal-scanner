@@ -375,6 +375,11 @@ const athCache = {};
 const klineCache = {};
 const wallCache = {};
 const oiPrevMap = {};
+// GRAVITY (виж discussion-а "WLD картата/market maker ликвидност") - ЕДНО
+// извикване връща клъстерите за всичките 35 наблюдавани монети наведнъж
+// (за разлика от wallCache по-горе, което е per-symbol) - затова общ кеш,
+// опреснен най-много веднъж на 60с, независимо колко карти са видими.
+let gravityCache = { clusters: {}, ts: 0 };
 
 function handleSearch(val) { searchQuery = val.toUpperCase().trim(); renderList(); }
 async function cgFetch(path) { const r = await fetch(`${WORKER_URL}${path}`); return r.json(); }
@@ -579,7 +584,7 @@ async function loadWalls(refreshed) {
       // Стените обикновено са на 1-5% от цената при нормална книга - праг от 25% беше нереалистично висок
       // и потушаваше плана почти винаги. 1.5% означава entry/target/SL вече се преплитат.
       const suppressPlan = wallGapPct !== null && wallGapPct < 1.5;
-      let rows = `<div class="wall-row"><span style="color:var(--text2)">📊 ORDER BOOK СТЕНИ</span><span style="color:var(--text2)">limit 500</span></div>`;
+      let rows = `<div class="wall-row"><span style="color:var(--text2)">📊 ORDER BOOK (видими ордери)</span><span style="color:var(--text2)">limit 500</span></div>`;
       rows += `<div class="wall-row"><span style="color:var(--red)">🟥 Sell Wall: ${sw?'$'+formatPrice(sw.price)+' ('+formatNum(sw.usd)+')':'--'}</span><span style="color:var(--green)">🟩 Buy Wall: ${bw?'$'+formatPrice(bw.price)+' ('+formatNum(bw.usd)+')':'--'}</span></div>`;
       if (bw && sw && (sig.signal==='LONG'||sig.signal==='SHORT')) {
         if (suppressPlan) {
@@ -603,7 +608,42 @@ async function loadWalls(refreshed) {
     } catch(e) { wallEl.innerHTML = `<span style="color:var(--text2)">📊 СТЕНИ: --</span>`; }
   }
   if (biasChanged && !refreshed && !isSpecialTab()) { renderList(); loadWalls(true); }
+  await loadGravity();
   updateStats();
+}
+
+// GRAVITY (виж buildLiqGravityPublicSnapshot в worker/worker.js) - реални
+// клъстери от Binance ликвидации за 35-те наблюдавани монети, публикувани от
+// Worker-а БЕЗ token (виж /liq-gravity-public). За разлика от ORDER BOOK
+// СТЕНИТЕ по-горе (видими чакащи лимит ордери - различно нещо, виж
+// коментара при calcWallBias), това е МЯСТОТО, където реално се задействат
+// ликвидации с ливъридж - точно каквото market maker-ите "ловуват". Монети
+// извън WATCHLIST (TOP 200+/CAPITULATION табове) никога няма да имат данни
+// тук - Worker-ът следи само 35-те - затова елементът остава скрит за тях,
+// не виси вечно на "зареждане...".
+async function fetchGravityPublic() {
+  if (gravityCache.ts > Date.now() - 60000) return gravityCache.clusters;
+  try {
+    const r = await fetch(`${WORKER_URL}/liq-gravity-public`);
+    const d = await r.json();
+    gravityCache = { clusters: d.clusters || {}, ts: Date.now() };
+  } catch(e) { /* запазва последния успешен кеш, ако мрежата се провали за момент */ }
+  return gravityCache.clusters;
+}
+async function loadGravity() {
+  const clusters = await fetchGravityPublic();
+  const visible = document.querySelectorAll('.coin-card');
+  for (const card of visible) {
+    const el = card.querySelector('[id^="gravity-"]'); if (!el) continue;
+    const sym = el.id.replace('gravity-','');
+    const g = clusters[sym];
+    if (!g) { el.style.display = 'none'; el.innerHTML = ''; continue; }
+    const dirArrow = g.direction === 'long' ? '▲' : '▼';
+    const dirColor = g.direction === 'long' ? 'var(--green)' : 'var(--red)';
+    const distTxt = (g.distancePct > 0 ? '+' : '') + g.distancePct.toFixed(1) + '%';
+    el.style.display = '';
+    el.innerHTML = `<div class="wall-row"><span style="color:var(--blue)">🧲 GRAVITY: $${formatPrice(g.clusterPrice)} (${formatNum(g.clusterUsd)})</span><span style="color:${dirColor}">${dirArrow} ${distTxt}</span></div>`;
+  }
 }
 
 async function fetchTop200Coins() {
@@ -1663,6 +1703,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     <div class="wall-section" id="wall-${coin.fullSymbol}">
       <span style="color:var(--text2)">📊 СТЕНИ: зареждане...</span>
     </div>
+    <div class="wall-section" id="gravity-${coin.fullSymbol}" style="display:none;"></div>
     ${detectorBanner}
     ${setupBanner}
     ${sparkBanner}
