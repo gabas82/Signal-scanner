@@ -4190,7 +4190,12 @@ function updateClusterLedger(prevLedger, buckets, now) {
       }
       continue; // под watch прага - не си струва да следим (евтин ledger)
     }
-    if (entry.bornAt == null && usd >= LIQ_GRAVITY_CLUSTER_MIN_USD) {
+    // ВАЖНО: само 'watch'-зона записи (originTag null - наблюдавани под прага,
+    // още некласифицирани) могат да се "повишат" до fresh. 'legacy' записи
+    // (от baseline, bornAt също null, но originTag='legacy') НИКОГА не се
+    // прекласифицират - иначе baseline клъстер би станал лъжливо "fresh" на
+    // следващия тик, само защото пак е над прага (виж точка 1 от уточненията).
+    if (entry.originTag == null && usd >= LIQ_GRAVITY_CLUSTER_MIN_USD) {
       const birthLatencyMin = entry.firstNonZeroAt != null ? (now - entry.firstNonZeroAt) / 60000 : null;
       ledger[bucketKey] = {
         ...entry, originTag: 'fresh', originKnown: true,
@@ -4271,7 +4276,10 @@ function stepLevelLifecycle(slot, observedPrice, now) {
   if (!slot || slot.closedAt != null) return slot;
   const levelPrice = slot.levelPrice;
   const distPct = (observedPrice - levelPrice) / levelPrice * 100;
-  const absDistPct = Math.abs(distPct);
+  // Закръглено до 2 знака - избягва KV WRITE само заради незначим float шум
+  // в наблюдаваната цена, без да губи реалната прецизност на разстоянието
+  // (виж уточнение 4/5 - минимален KV budget).
+  const absDistPct = Math.round(Math.abs(distPct) * 100) / 100;
   const inBucket = priceToLiqBucket(observedPrice) === priceToLiqBucket(levelPrice);
   // slot.side = страната на НИВОТО спрямо цената ПРИ отваряне ('above' =
   // нивото е над цената) -> цената тръгва от ОБРАТНАТА страна на самото ниво.
@@ -4279,41 +4287,46 @@ function stepLevelLifecycle(slot, observedPrice, now) {
   // очакване - НЕ спрямо последния тик (виж уточнение 2).
   const expectedSign = slot.side === 'above' ? -1 : 1;
   const currSign = distPct > 0 ? 1 : (distPct < 0 ? -1 : expectedSign);
-
-  const next = { ...slot, lastObservedAt: now, lastObservedPrice: observedPrice };
-  if (slot.peakProximityPct == null || absDistPct < slot.peakProximityPct) next.peakProximityPct = absDistPct;
+  const peakImproved = slot.peakProximityPct == null || absDistPct < slot.peakProximityPct;
+  const peak = (s) => (peakImproved ? { peakProximityPct: absDistPct } : {});
 
   // Докосване (реално наблюдавано попадане в кошчето на нивото) има приоритет
   // пред break-проверката - докато цената е В кошчето на нивото, тя е "на"
   // нивото, не "отвъд" него, независимо от дребен знак шум на границата.
   if (inBucket) {
-    next.phase = 'touched';
-    if (next.firstTouchAt == null) next.firstTouchAt = now;
-    if (next.firstApproachAt == null) next.firstApproachAt = now;
-    return next;
+    if (slot.phase === 'touched' && slot.firstTouchAt != null && !peakImproved) return slot; // вече стабилно touched - нищо ново за запис
+    return {
+      ...slot, ...peak(slot), phase: 'touched',
+      firstTouchAt: slot.firstTouchAt ?? now, firstApproachAt: slot.firstApproachAt ?? now,
+      lastObservedAt: now, lastObservedPrice: observedPrice,
+    };
   }
 
   if (currSign !== expectedSign) {
-    next.closedAt = now;
-    next.closePrice = observedPrice;
-    next.closeReason = slot.phase === 'touched' ? 'broken_confirmed' : 'broken_gap';
-    return next;
+    return {
+      ...slot, ...peak(slot), closedAt: now, closePrice: observedPrice,
+      closeReason: slot.phase === 'touched' ? 'broken_confirmed' : 'broken_gap',
+      lastObservedAt: now, lastObservedPrice: observedPrice,
+    };
   }
 
   if (absDistPct <= CLUSTER_TRACK_PROXIMITY_PCT) {
-    if (next.phase !== 'touched') next.phase = 'approaching';
-    if (next.firstApproachAt == null) next.firstApproachAt = now;
-    return next;
+    if ((slot.phase === 'approaching' || slot.phase === 'touched') && slot.firstApproachAt != null && !peakImproved) return slot; // стабилно приближение - нищо ново
+    return {
+      ...slot, ...peak(slot), phase: slot.phase === 'touched' ? 'touched' : 'approaching',
+      firstApproachAt: slot.firstApproachAt ?? now,
+      lastObservedAt: now, lastObservedPrice: observedPrice,
+    };
   }
 
-  if (next.phase === 'approaching' || next.phase === 'touched') {
-    next.closedAt = now;
-    next.closePrice = observedPrice;
-    next.closeReason = 'bounced';
-    next.bouncedAt = now;
-    return next;
+  if (slot.phase === 'approaching' || slot.phase === 'touched') {
+    return {
+      ...slot, ...peak(slot), closedAt: now, closePrice: observedPrice,
+      closeReason: 'bounced', bouncedAt: now,
+      lastObservedAt: now, lastObservedPrice: observedPrice,
+    };
   }
-  return next;
+  return slot; // далеч, никога не е приближавала - нищо ново за запис
 }
 
 function isLevelLifecycleExpired(slot, now) {
@@ -4335,7 +4348,10 @@ function finalizeClusterLifecycleRecord(slot) {
 // новото състояние + новородени кошчета (births) + финализирани (затворени
 // този тик) lifecycle записи, готови за persist в Stage 2.
 function advanceClusterTracking(prevState, symbol, buckets, price, now) {
-  if (!(price > 0)) return { nextState: prevState || { ledger: {}, slots: {} }, births: [], closedRecords: [] };
+  // prevState (не placeholder {ledger:{},slots:{}}) - невалидна цена с ПРАЗНО
+  // предходно състояние не бива да създава какво да е за запис (виж
+  // trackSymbolClusterOutcome - null nextState изрично пропуска write).
+  if (!(price > 0)) return { nextState: prevState, births: [], closedRecords: [] };
 
   const isFirstRun = !prevState;
   const prevLedger = prevState?.ledger || {};
@@ -4372,6 +4388,45 @@ function advanceClusterTracking(prevState, symbol, buckets, price, now) {
   }
 
   return { nextState: { ledger, slots: nextSlots }, births, closedRecords };
+}
+
+// Stage 2 - KV wiring. ЕДИН KV ключ на символ (`clustertrack:<symbol>`) пази
+// ledger-а + до 4 отворени слота - НЕ отделен запис на тик (виж точка 4/5 от
+// уточненията). WRITE само ако сериализираното съдържание РЕАЛНО се е
+// променило (read-modify-write в рамките на ЕДНО извикване на
+// scanSymbolSignals за този символ - виж call site-а по-долу - никога два
+// пъти в една инвокация, огледално на liqdiag:/sigstate: прецедента).
+// Финализирани (затворени този тик) lifecycle записи се пишат по ЕДИН
+// отделен KV ключ всеки - рядко събитие, НЕ на всеки тик.
+const CLUSTER_TRACK_KV_PREFIX = 'clustertrack:';
+const CLUSTER_EVENT_KV_PREFIX = 'clusterevent:';
+function clusterTrackKey(symbol) { return `${CLUSTER_TRACK_KV_PREFIX}${symbol}`; }
+function clusterEventKey(record) { return `${CLUSTER_EVENT_KV_PREFIX}${record.symbol}:${record.openedAt}:${record.side}_${record.kind}`; }
+
+// Извиква се от scanSymbolSignals (виж wiring-а там, редом до
+// runLiqShadowDiagnostics) - САМО READ-peek на liqGravity.buckets, подадени
+// отвън като обикновен обект (НЕ самия `state`). Никога не хвърля - грешка
+// тук е изолирана и не може да прекъсне ENTRY/VETO пътя (огледално на
+// runLiqShadowDiagnostics по-долу).
+async function trackSymbolClusterOutcome(env, symbol, buckets, price, now = Date.now()) {
+  try {
+    if (!env?.ALERT_STATE) return null;
+    const key = clusterTrackKey(symbol);
+    const raw = await env.ALERT_STATE.get(key);
+    const prevState = raw ? JSON.parse(raw) : null;
+    const { nextState, closedRecords } = advanceClusterTracking(prevState, symbol, buckets, price, now);
+    if (nextState != null) {
+      const nextRaw = JSON.stringify(nextState);
+      if (nextRaw !== raw) await env.ALERT_STATE.put(key, nextRaw);
+    }
+    for (const record of closedRecords) {
+      await env.ALERT_STATE.put(clusterEventKey(record), JSON.stringify(record));
+    }
+    return { nextState, closedRecords };
+  } catch (e) {
+    console.error('trackSymbolClusterOutcome error:', e);
+    return null;
+  }
 }
 
 // ═══ COINGLASS LIQUIDATION DIAGNOSTICS (SHADOW, diagnostic-only) ════════════════
@@ -5854,6 +5909,13 @@ async function scanSymbolSignals(env, symbol) {
       legacyBuyUsd: liquidationCascade.buySumUsd, legacySellUsd: liquidationCascade.sellSumUsd,
     });
   }
+  // LIQUIDATION CLUSTER OUTCOME TRACKER (виж discussion-а "клъстер срещу
+  // контролна група") - само READ-peek на state.liqGravity.buckets (вече
+  // актуализиран от accumulateLiquidationGravity по-горе), пише в собствен
+  // `clustertrack:`/`clusterevent:` KV namespace. Не чете/пише `state`, не
+  // влияе на никоя стойност в този return - огледално на shadow диагностиката
+  // точно над този ред.
+  await trackSymbolClusterOutcome(env, symbol, state.liqGravity?.buckets, price);
 
   // ENTRY ENGINE - ЕТАП 1: "SETUP" (виж calcSetupState по-горе) - реюзва вече
   // изчислените TARGET/VAH/VAL/TRAP/AUCTION/MIGRATION резултати по-горе, БЕЗ
@@ -8337,6 +8399,8 @@ export {
   selectTrackedLevelForSide, openLevelLifecycle, stepLevelLifecycle, isLevelLifecycleExpired,
   expireLevelLifecycle, finalizeClusterLifecycleRecord, advanceClusterTracking,
   priceToLiqBucket, liqBucketToPrice,
+  CLUSTER_TRACK_KV_PREFIX, CLUSTER_EVENT_KV_PREFIX, clusterTrackKey, clusterEventKey,
+  trackSymbolClusterOutcome,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
@@ -8603,6 +8667,36 @@ export default {
         active,
         exitedCount: records.length,
         exited: records.slice(0, limit),
+      });
+    }
+    // LIQUIDATION CLUSTER OUTCOME TRACKER diagnostics - read-only,
+    // token-gated като /rotation-diagnostics. Показва за даден символ (или за
+    // всички от WATCHLIST) текущо отворените слота (clustertrack:<symbol>) +
+    // вече финализирани lifecycle записи (clusterevent:*) - за собствена
+    // проверка на данните, виж discussion-а "клъстер срещу контролна група".
+    if (path === "/cluster-diagnostics" && request.method === "GET") {
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+      if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
+      if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
+      const symbolParam = (url.searchParams.get("symbol") || "").trim().toUpperCase();
+      const symbols = symbolParam ? [symbolParam] : WATCHLIST;
+      const trackedEntries = await Promise.all(symbols.map(async symbol => {
+        const raw = await env.ALERT_STATE.get(clusterTrackKey(symbol));
+        return { symbol, state: raw ? JSON.parse(raw) : null };
+      }));
+      const openCount = trackedEntries.reduce((n, e) => n + Object.values(e.state?.slots || {}).filter(Boolean).length, 0);
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "200", 10) || 200, 1000);
+      const listResult = await env.ALERT_STATE.list({ prefix: CLUSTER_EVENT_KV_PREFIX });
+      const recordKeys = listResult.keys.map(k => k.name);
+      const records = (await Promise.all(recordKeys.map(k => env.ALERT_STATE.get(k)))).filter(Boolean).map(r => JSON.parse(r));
+      records.sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0));
+      return json({
+        openCount,
+        tracked: Object.fromEntries(trackedEntries.map(e => [e.symbol, e.state])),
+        closedCount: records.length,
+        closed: records.slice(0, limit),
       });
     }
     // PUBLIC GRAVITY (виж buildLiqGravityPublicSnapshot по-горе) - ЕДИНСТВЕНИЯТ

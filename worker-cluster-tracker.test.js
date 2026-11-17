@@ -10,7 +10,24 @@ import {
   selectTrackedLevelForSide, openLevelLifecycle, stepLevelLifecycle, isLevelLifecycleExpired,
   expireLevelLifecycle, finalizeClusterLifecycleRecord, advanceClusterTracking,
   priceToLiqBucket, liqBucketToPrice,
+  CLUSTER_TRACK_KV_PREFIX, CLUSTER_EVENT_KV_PREFIX, clusterTrackKey, clusterEventKey,
+  trackSymbolClusterOutcome,
 } from './worker/worker.js';
+import worker from './worker/worker.js';
+
+function makeKv(seed = {}) {
+  const m = new Map(Object.entries(seed));
+  return {
+    m,
+    get: async (k) => (m.has(k) ? m.get(k) : null),
+    put: async (k, v) => { m.set(k, v); },
+    delete: async (k) => { m.delete(k); },
+    list: async ({ prefix } = {}) => ({
+      keys: [...m.keys()].filter(k => !prefix || k.startsWith(prefix)).map(name => ({ name })),
+      list_complete: true,
+    }),
+  };
+}
 
 const MIN_USD = 2000000; // LIQ_GRAVITY_CLUSTER_MIN_USD
 
@@ -319,5 +336,100 @@ describe('advanceClusterTracking (orchestration)', () => {
     const { nextState } = advanceClusterTracking(null, 'BTCUSDT', buckets, 100, 1000);
     expect(nextState.slots.above_cluster).not.toBeNull();
     expect(nextState.slots.above_control).not.toBeNull();
+  });
+});
+
+describe('trackSymbolClusterOutcome (Stage 2 - KV wiring)', () => {
+  it('пише clustertrack:<symbol> при първо извикване', async () => {
+    const kv = makeKv();
+    const buckets = { [keyFor(101)]: MIN_USD * 2 };
+    await trackSymbolClusterOutcome({ ALERT_STATE: kv }, 'BTCUSDT', buckets, 100, 1000);
+    expect(kv.m.has(clusterTrackKey('BTCUSDT'))).toBe(true);
+    const stored = JSON.parse(kv.m.get(clusterTrackKey('BTCUSDT')));
+    expect(stored.slots.above_cluster).toMatchObject({ originTag: 'legacy' });
+  });
+
+  it('пише САМО в clustertrack:/clusterevent: ключове - нищо друго', async () => {
+    const kv = makeKv();
+    const buckets = { [keyFor(101)]: MIN_USD * 2 };
+    await trackSymbolClusterOutcome({ ALERT_STATE: kv }, 'BTCUSDT', buckets, 100, 1000);
+    for (const key of kv.m.keys()) {
+      expect(key.startsWith(CLUSTER_TRACK_KV_PREFIX) || key.startsWith(CLUSTER_EVENT_KV_PREFIX)).toBe(true);
+    }
+  });
+
+  it('пропуска WRITE, щом слотът е стабилизиран (без промяна в поведението)', async () => {
+    const kv = makeKv();
+    const buckets = { [keyFor(101)]: MIN_USD * 2 };
+    await trackSymbolClusterOutcome({ ALERT_STATE: kv }, 'BTCUSDT', buckets, 100, 1000); // отваря слот (phase 'none')
+    await trackSymbolClusterOutcome({ ALERT_STATE: kv }, 'BTCUSDT', buckets, 100, 1001); // 'none' -> 'approaching' - РЕАЛНА промяна, write очакван
+    let putCount = 0;
+    const originalPut = kv.put;
+    kv.put = async (...args) => { putCount++; return originalPut(...args); };
+    // Същите buckets/цена - слотът вече е стабилно 'approaching', нищо ново.
+    await trackSymbolClusterOutcome({ ALERT_STATE: kv }, 'BTCUSDT', buckets, 100, 1002);
+    expect(putCount).toBe(0);
+  });
+
+  it('при затваряне на слот пише отделен clusterevent: запис', async () => {
+    const kv = makeKv();
+    const buckets = { [keyFor(101)]: MIN_USD * 2 };
+    await trackSymbolClusterOutcome({ ALERT_STATE: kv }, 'BTCUSDT', buckets, 100, 0);
+    // Пробив - цената минава през нивото.
+    await trackSymbolClusterOutcome({ ALERT_STATE: kv }, 'BTCUSDT', buckets, 102, 60000);
+    const eventKeys = [...kv.m.keys()].filter(k => k.startsWith(CLUSTER_EVENT_KV_PREFIX));
+    expect(eventKeys.length).toBe(1);
+    const record = JSON.parse(kv.m.get(eventKeys[0]));
+    expect(record).toMatchObject({ symbol: 'BTCUSDT', side: 'above', kind: 'cluster', closeReason: 'broken_gap' });
+  });
+
+  it('не хвърля при KV грешка, връща null', async () => {
+    const badKv = { get: async () => { throw new Error('kv down'); }, put: async () => {} };
+    const result = await trackSymbolClusterOutcome({ ALERT_STATE: badKv }, 'BTCUSDT', {}, 100, 0);
+    expect(result).toBeNull();
+  });
+
+  it('липсващ env.ALERT_STATE -> no-op, без грешка', async () => {
+    await expect(trackSymbolClusterOutcome({}, 'BTCUSDT', {}, 100, 0)).resolves.toBeNull();
+  });
+
+  it('невалидна цена -> не пише нищо', async () => {
+    const kv = makeKv();
+    await trackSymbolClusterOutcome({ ALERT_STATE: kv }, 'BTCUSDT', { [keyFor(101)]: MIN_USD * 2 }, null, 0);
+    expect(kv.m.size).toBe(0);
+  });
+});
+
+describe('/cluster-diagnostics endpoint', () => {
+  const call = (env, qs = '') => worker.fetch(new Request(`https://w.mock/cluster-diagnostics${qs}`), env, { waitUntil() {} });
+
+  it('без/грешен token -> 401', async () => {
+    const res = await call({ ALERT_STATE: makeKv(), TELEMETRY_TOKEN: 'secret' });
+    expect(res.status).toBe(401);
+  });
+
+  it('с валиден token връща отворените слотове и затворените записи', async () => {
+    const trackedState = { ledger: {}, slots: { above_cluster: { symbol: 'BTCUSDT', kind: 'cluster', side: 'above' } } };
+    const closedRecord = { symbol: 'ETHUSDT', side: 'below', kind: 'control', openedAt: 1000, closedAt: 5000, closeReason: 'bounced' };
+    const kv = makeKv({
+      [clusterTrackKey('BTCUSDT')]: JSON.stringify(trackedState),
+      [clusterEventKey(closedRecord)]: JSON.stringify(closedRecord),
+    });
+    const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret&symbol=BTCUSDT');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.openCount).toBe(1);
+    expect(body.tracked.BTCUSDT.slots.above_cluster.symbol).toBe('BTCUSDT');
+    expect(body.closedCount).toBe(1);
+    expect(body.closed[0].symbol).toBe('ETHUSDT');
+  });
+
+  it('read-only - не пише в KV', async () => {
+    const kv = makeKv({ [clusterTrackKey('BTCUSDT')]: JSON.stringify({ ledger: {}, slots: {} }) });
+    let wrote = false;
+    const originalPut = kv.put;
+    kv.put = async (...args) => { wrote = true; return originalPut(...args); };
+    await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret&symbol=BTCUSDT');
+    expect(wrote).toBe(false);
   });
 });
