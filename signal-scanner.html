@@ -666,10 +666,7 @@ async function loadFilter200() {
   const content = document.getElementById('main-content');
   content.innerHTML = `<div class="loading">ЗАРЕЖДАНЕ ТОП 200–500 МОНЕТИ...<br><span style="font-size:10px;color:var(--text2)">Бавно поради rate limit (5 страници × 2.5s)</span><div class="loading-bar"><div class="loading-fill"></div></div></div>`;
   const geckoCoins = await fetchTop200Coins();
-  const filtered200 = geckoCoins.filter((c, idx) => {
-    const athChg = c.ath_change_percentage;
-    return idx >= 50 && athChg != null && athChg <= -80;
-  });
+  const filtered200 = geckoCoins.filter((c, idx) => isDeepAthDropCandidate(idx, c.ath_change_percentage));
   if (filtered200.length === 0) { content.innerHTML = `<div class="no-results">НЯМА МОНЕТИ СЪС -80% ОТ ATH В ТОП 200-500</div>`; return; }
   const results = [];
   for (const gc of filtered200.slice(0, 60)) {

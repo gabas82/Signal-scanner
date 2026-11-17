@@ -1564,6 +1564,16 @@ function isScanNowTab(filter) {
   return filter === 'filter200' || filter === 'capitulation' || filter === 'spark';
 }
 
+// ТОП 200+ таб - geckoCoins е подреден по market_cap_desc, значи idx е рангът
+// минус 1. Етикетът на таба ("ТОП 200-500 монети") изключва топ 200 по пазарна
+// капитализация, затова прагът е FILTER200_MIN_RANK_IDX (200), не 50 - старата
+// стойност пропускаше ранг 51-200 в резултатите въпреки етикета.
+const FILTER200_MIN_RANK_IDX = 200;
+const FILTER200_ATH_DROP_PCT = -80;
+function isDeepAthDropCandidate(idx, athChangePct) {
+  return idx >= FILTER200_MIN_RANK_IDX && athChangePct != null && athChangePct <= FILTER200_ATH_DROP_PCT;
+}
+
 // fetchCoinData() в signal-scanner.html пресъздава allCoins обекта за всяка монета
 // при всеки refresh цикъл, преди loadAthAtlAsync() да е имал шанс да презареди
 // бавните (rate-limited) CoinGecko ATH/ATL/MCap данни за тази монета. Без това,
@@ -1622,6 +1632,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcAuctionQualityScore, getAuctionQualityTier, AUCTION_LABELS, AUCTION_NARROW_WIDTH_PCT, AUCTION_SKEW_THRESHOLD,
     splitCandlesByUtcDay, getTodayYesterdayCandles, calcValueMigrationScore, getValueMigrationTier,
     MIGRATION_LABELS, MIGRATION_MIN_PCT, MIGRATION_MIN_CANDLES,
-    carryForwardCoinExtras, isScanNowTab, carryForwardKlineExtras
+    carryForwardCoinExtras, isScanNowTab, carryForwardKlineExtras,
+    isDeepAthDropCandidate, FILTER200_MIN_RANK_IDX, FILTER200_ATH_DROP_PCT
   };
 }
