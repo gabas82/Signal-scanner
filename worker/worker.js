@@ -1636,23 +1636,61 @@ function markTargetFired(state, key, direction) {
 // (виж calcFlushSignal/calcBaseSignal по-горе) вече допринасят точки в LONG/
 // SHORT резултата (SIGNAL_WEIGHTS.flush/base = 1.25, под MIN_NOTIFY_SCORE =
 // 2.5), затова сам FLUSH/BASE, без друг съпровождащ сигнал, никога не
-// пораждаше собствено известие - оставаше "невидим" в WhatsApp. Огледално на
-// liqGravityCanFire/markLiqGravityFired по-горе - посоката е винаги 'long'
-// (FLUSH/BASE са bottom-detection сигнали), затова ключът сам достатъчно
-// разграничава "ново" от "вече известено в последните 30 мин" (hysteresis
-// cooldown по подразбиране). НЕ променя flush/base boolean-а, нито точковия
-// резултат - чисто допълнително known-to-user известие.
+// пораждаше собствено известие - оставаше "невидим" в WhatsApp.
+//
+// НЕ е canFireWithHysteresis/liqGravityCanFire (ключ+посока там трябва РЕАЛНО
+// да варират, за да "избяга" от "entry.key === key -> false" клаузата -
+// GRAVITY работи, защото tier/посока действително се менят с цената; FLUSH/
+// BASE обаче имат ФИКСИРАНИ клюс='flush'/посока='long' завинаги, затова
+// същата функция би блокирала ПЕРМАНЕНТНО след първия fire, не за cooldown
+// прозореца - потвърдено с директна симулация преди този commit). Вместо това:
+// явен edge-detection (гърми САМО на прехода "не е било активно -> станало
+// активно", не докато едно и също продължаващо събитие си остава true тик
+// след тик) + истински time-based cooldown (пази от бърз flap, ако условието
+// трепти true/false на границата на прага за няколко поредни тика).
+// state.flushActive/state.baseActive се обновяват БЕЗУСЛОВНО всеки тик (виж
+// call site-а по-долу) - именно затова edge-detection-ът остава верен дори
+// между отделни извиквания на scanSymbolSignals.
+const CAPITULATION_COOLDOWN_MIN = 30;
 function flushCanFire(state) {
-  return canFireWithHysteresis(state.flushFired, 'flush', 'long');
+  if (state.flushActive) return false; // продължаващо събитие - вече известено
+  const last = state.flushFired;
+  return !last || (Date.now() - last.at) >= CAPITULATION_COOLDOWN_MIN * 60000;
 }
 function markFlushFired(state) {
-  state.flushFired = { key: 'flush', direction: 'long', at: Date.now() };
+  state.flushFired = { at: Date.now() };
 }
 function baseCanFire(state) {
-  return canFireWithHysteresis(state.baseFired, 'base', 'long');
+  if (state.baseActive) return false;
+  const last = state.baseFired;
+  return !last || (Date.now() - last.at) >= CAPITULATION_COOLDOWN_MIN * 60000;
 }
 function markBaseFired(state) {
-  state.baseFired = { key: 'base', direction: 'long', at: Date.now() };
+  state.baseFired = { at: Date.now() };
+}
+
+// Претоварна защита: при волатилен пазар FLUSH/BASE биха могли да се задействат
+// за много от 35-те символа В ЕДИН тик (hysteresis-ът по-горе предпазва от
+// ПОВТОРНИ известия за едно и също продължаващо събитие, но не лимитира КОЛКО
+// РАЗЛИЧНИ символа могат да гръмнат едновременно). flushWhatsAppBatch групира
+// по WHATSAPP_BATCH_MAX_SIGNALS=2 на съобщение, всяко сериализирано на
+// WHATSAPP_MIN_INTERVAL_MS=12с - 35 сигнала би отнело ~3.5мин само за тях,
+// над другите известия от същия тик, с риск да не събере с 5-минутния cron
+// интервал. Затова капваме пълните известия на тик и обобщаваме остатъка в
+// ЕДНО съобщение, вместо да спрем да ги броим за cooldown (виж capitulationBudget
+// в checkMarketSignals/processWatchlistSymbol по-долу) - маркираме fired
+// независимо от бюджета, за да не се преизпраща същото събитие следващ тик.
+const CAPITULATION_ALERT_MAX_PER_TICK = 6;
+// Чист helper (лесен за unit тест без мокване на цял tick) - true = бюджетът
+// има място, пълното известие трябва да се пусне в batch; false = лимитът е
+// достигнат, label е добавен в overflow за обобщеното известие.
+function admitCapitulationAlert(capitulationBudget, label) {
+  if (capitulationBudget.count < CAPITULATION_ALERT_MAX_PER_TICK) {
+    capitulationBudget.count += 1;
+    return true;
+  }
+  capitulationBudget.overflow.push(label);
+  return false;
 }
 
 // ═══ IDEA 03 - "AUCTION QUALITY" ═══════════════════════════════════════════════
@@ -4725,10 +4763,18 @@ async function scanSymbolSignals(env, symbol) {
   // известие за FLUSH/BASE, независимо от majority/MIN_NOTIFY_SCORE гейта на
   // главното известие по-долу. Не влияе на flush/base boolean-а нито на
   // longScore/shortScore - само маркира state при реално изпращане.
+  // ВАЖНО: flushCanFire/baseCanFire четат state.flushActive/baseActive ОТ
+  // ПРЕДИШНИЯ тик (edge-detection) - затова проверката е ПРЕДИ презаписа на
+  // *Active по-долу, не след него.
   const flushFired = flush && flushCanFire(state);
   const baseFired = base && baseCanFire(state);
   if (flushFired) markFlushFired(state);
   if (baseFired) markBaseFired(state);
+  // || undefined (не просто `= flush`) - JSON.stringify пропуска undefined
+  // полета, затова state за символ, който никога не е имал FLUSH/BASE, остава
+  // напълно непроменен (нула бойлърплейт за вечно-false флагове в KV).
+  state.flushActive = flush || undefined;
+  state.baseActive = base || undefined;
 
   const early = calcBuildUpEarly(c1h);
   // т.9 - early.long и early.short теоретично могат да са ВЕДНЪЖ и двете true
@@ -5765,7 +5811,7 @@ async function scanSymbolSignals(env, symbol) {
 // sendWhatsApp вече е безопасен при паралелни извиквания (виж whatsAppChain
 // по-горе) - scheduled() вече пуска 6-те top-level задачи паралелно без
 // проблем за точно същата причина.
-async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
+async function processWatchlistSymbol(env, pos, btcFlowContext, batch, capitulationBudget) {
     try {
       const { newFired, activeFired, price, support, resistance, direction, longPct, shortPct, longScore, shortScore, majority, ratioOK, enoughScore, cyclePhase, cyclePhaseChanged, cycleLongScore, cycleShortScore, sparkKey, sparkFired, sparkDirection, sparkTier, sparkMaxScore, sparkOiDelta5m, sparkOiDelta15m, sparkOiDelta1h, sparkVolRatio, sparkChg1h, takerDelta5m, takerDelta15m, flowWarmingFired, flowWarmingDirection, flowWarmingTier, flowWarmingMaxScore, trapFired, trapDirection, trapTier, trapMaxScore, oiDeltaPct, reloadFired, reloadDirection, targetFired, targetTier, targetDirection, targetScore, targetDistancePct, targetLevelStrengthPct, targetPrice, targetMagnets, auctionFired, auctionTier, auctionDirection, auctionMaxScore, auctionWidthPct, auctionSkewRatio, migrationFired, migrationTier, migrationDirection, migrationMaxScore, migrationPct, migrationTodayPoc, migrationYesterdayPoc, liqGravityFired, liqGravityTier, liqGravityDirection, liqGravityMaxScore, liqGravityDistancePct, liqGravityClusterPrice, liqGravityClusterUsd, flushFired, baseFired, vahEvent, valEvent, setupFired, setupDirection, setupScore, setupBreakdown, armedFired, armedDirection, armedLowerHigh, armedHigherLow, armedStructureLossDown, armedStructureReclaimUp, entryResult, trendSetupFired, trendSetupDirection, trendSetupScore, trendSetupBreakdown, trendArmedFired, trendArmedDirection, trendEntryResult, liquidationCascade, liquidationHasData, liqLiveEnabled } = await scanSymbolSignals(env, pos.symbol);
       if (pos.symbol === 'BTCUSDT') {
@@ -5917,19 +5963,23 @@ async function processWatchlistSymbol(env, pos, btcFlowContext, batch) {
       // това известие не зависи от majority/MIN_NOTIFY_SCORE гейта.
       if (flushFired) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
-        batch.push([
-          `💥 CAPITULATION FLUSH ${symbolNoUsdt}`,
-          price != null ? `Цена: ${formatPrice(price)} USD` : null,
-          `⚠️ Панична разпродажба (RSI 15м < 25 + обем/диапазон spike) - исторически често маркира временно дъно, НЕ Е entry сигнал сам по себе си`,
-        ].filter(Boolean).join('\n'));
+        if (admitCapitulationAlert(capitulationBudget, `${symbolNoUsdt} FLUSH`)) {
+          batch.push([
+            `💥 CAPITULATION FLUSH ${symbolNoUsdt}`,
+            price != null ? `Цена: ${formatPrice(price)} USD` : null,
+            `⚠️ Панична разпродажба (RSI 15м < 25 + обем/диапазон spike) - исторически често маркира временно дъно, НЕ Е entry сигнал сам по себе си`,
+          ].filter(Boolean).join('\n'));
+        }
       }
       if (baseFired) {
         const symbolNoUsdt = pos.symbol.replace('USDT', '');
-        batch.push([
-          `🔵 CAPITULATION BASE ${symbolNoUsdt}`,
-          price != null ? `Цена: ${formatPrice(price)} USD` : null,
-          `⚠️ Базиране със скрита бичи дивергенция след спад (1ч) - НЕ Е entry сигнал сам по себе си`,
-        ].filter(Boolean).join('\n'));
+        if (admitCapitulationAlert(capitulationBudget, `${symbolNoUsdt} BASE`)) {
+          batch.push([
+            `🔵 CAPITULATION BASE ${symbolNoUsdt}`,
+            price != null ? `Цена: ${formatPrice(price)} USD` : null,
+            `⚠️ Базиране със скрита бичи дивергенция след спад (1ч) - НЕ Е entry сигнал сам по себе си`,
+          ].filter(Boolean).join('\n'));
+        }
       }
       // AUTO VAH/VAL STRUCTURE DETECTOR (виж calcVahValStructureEvent по-горе) -
       // изцяло отделни известия, независими от TARGET (не се гейтват едно
@@ -6282,8 +6332,13 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
   // scheduled()) - споделен масив би разбъркал известията на двете отделни
   // извиквания. Виж flushWhatsAppBatch по-горе защо изобщо батчваме.
   const batch = [];
+  // capitulationBudget - споделен с batch (виж бележката по-горе защо batch е
+  // локален, не module-scope) - лимитира пълните CAPITULATION известия на ТОЗИ
+  // tick до CAPITULATION_ALERT_MAX_PER_TICK; остатъкът отива в overflow и се
+  // сумира в едно известие по-долу вместо да залее WhatsApp опашката.
+  const capitulationBudget = { count: 0, overflow: [] };
   if (btcPos) {
-    btcFlowContext = await processWatchlistSymbol(env, btcPos, btcFlowContext, batch);
+    btcFlowContext = await processWatchlistSymbol(env, btcPos, btcFlowContext, batch, capitulationBudget);
   }
   // SYMBOL_CHUNK_SIZE - предпазливо избран (виж discussion-а) - паралелизира
   // символите на малки партиди вместо "всички наведнъж", за да не претовари
@@ -6292,7 +6347,14 @@ async function checkMarketSignals(env, watchlist = WATCHLIST, btcFlowContextOver
   const SYMBOL_CHUNK_SIZE = 6;
   for (let i = 0; i < restPositions.length; i += SYMBOL_CHUNK_SIZE) {
     const chunk = restPositions.slice(i, i + SYMBOL_CHUNK_SIZE);
-    await Promise.all(chunk.map((pos) => processWatchlistSymbol(env, pos, btcFlowContext, batch)));
+    await Promise.all(chunk.map((pos) => processWatchlistSymbol(env, pos, btcFlowContext, batch, capitulationBudget)));
+  }
+  if (capitulationBudget.overflow.length > 0) {
+    batch.push([
+      `💥🔵 CAPITULATION: още ${capitulationBudget.overflow.length} сигнала този тик`,
+      capitulationBudget.overflow.join(', '),
+      `⚠️ Лимит ${CAPITULATION_ALERT_MAX_PER_TICK} пълни известия/тик (претоварна защита) - виж логове за детайли`,
+    ].join('\n'));
   }
   await flushWhatsAppBatch(env, batch);
 }
@@ -7695,6 +7757,10 @@ export {
   buildLiqConfirmLine, calcLiqVeto,
   // ENTRY ENGINE core - изложени само за unit тестове (виж calcLiqVeto wiring-а).
   calcFlowVeto, calcFlowBoost, calcEntryTrigger,
+  // CAPITULATION ALERT (FLUSH/BASE hysteresis + претоварна защита) - изложени
+  // само за unit тестове.
+  flushCanFire, markFlushFired, baseCanFire, markBaseFired,
+  CAPITULATION_ALERT_MAX_PER_TICK, admitCapitulationAlert,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
