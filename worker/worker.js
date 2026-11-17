@@ -4129,6 +4129,306 @@ function buildLiqGravityPublicSnapshot({ tier, distancePct, clusterPrice, cluste
   };
 }
 
+// ═══ LIQUIDATION CLUSTER OUTCOME TRACKER ═══════════════════════════════════════
+// (виж discussion-а "клъстер срещу контролна група, статистическо предимство")
+// Observational-only, напълно отделен от production GRAVITY пътя - само
+// READ-peek на вече съществуващия state.liqGravity.buckets профил (виж IDEA
+// 08 по-горе), НИКОГА writes там. Собствен KV namespace (clustertrack:/
+// clusterevent:, виж wiring-а по-долу в бъдещ Stage 2) - нулево въздействие
+// върху sigstate:/liqGravityPublic/liqGravityFired/calcLiqVeto/ENTRY/VETO.
+//
+// originTag fresh/legacy = КЪДЕ са се случили ИСТОРИЧЕСКИ ликвидации на дадено
+// ценово ниво - НЕ прогноза за бъдещи ликвидации. liqGravity.buckets никога
+// не се нулира, затова при ПЪРВОТО пускане (без съществуващ ledger) всяко
+// кошче, което вече е над прага, се маркира 'legacy' (originKnown:false,
+// истинското му раждане е неизвестно). Само кошче, пресичащо прага СЛЕД тази
+// baseline снимка, се брои за 'fresh' (originKnown:true, точен bornAt).
+const CLUSTER_TRACK_PROXIMITY_PCT = LIQ_GRAVITY_PROXIMITY_PCT; // СЪЩИЯТ 2% радиус като production GRAVITY detection - клъстер срещу контрола остават сравними "ябълки с ябълки"
+const CLUSTER_TRACK_NEGLIGIBLE_RATIO = 0.1; // кошче под 10% от прага = "очевидно празно" -> контролна страна
+const CLUSTER_TRACK_WATCH_RATIO = 0.5; // следим "наближаващи" кошчета (>=50% от прага) само за formation latency - не всяко нулево кошче
+const CLUSTER_TRACK_MAX_AGE_DAYS = 30;
+const CLUSTER_TRACK_MAX_AGE_MS = CLUSTER_TRACK_MAX_AGE_DAYS * 24 * 3600000;
+
+// Еднократна baseline снимка (само когато НЯМА съществуващ ledger) - всички
+// кошчета ВЕЧЕ над прага влизат като 'legacy', БЕЗ births (не submit-ваме
+// лъжливи "fresh" събития само защото за първи път четем стар профил).
+function buildClusterLedgerBaseline(buckets) {
+  const ledger = {};
+  for (const [bucketKey, usd] of Object.entries(buckets || {})) {
+    if (usd >= LIQ_GRAVITY_CLUSTER_MIN_USD) {
+      ledger[bucketKey] = {
+        originTag: 'legacy', originKnown: false, firstNonZeroAt: null,
+        bornAt: null, bornUsd: usd, birthLatencyMin: null, lastUsd: usd,
+      };
+    }
+  }
+  return ledger;
+}
+
+// Обновява ledger-а на тик спрямо текущите buckets. Връща {ledger, births} -
+// births = САМО кошчета, пресекли прага ЗА ПЪРВИ ПЪТ СЛЕД baseline (fresh).
+// birthLatencyMin (точка 1 от уточненията) се смята само ако кошчето вече е
+// било наблюдавано под прага (firstNonZeroAt е known) - иначе null (честно
+// "не е наблюдавано", не предположение).
+function updateClusterLedger(prevLedger, buckets, now) {
+  const ledger = { ...prevLedger };
+  const births = [];
+  for (const [bucketKey, usd] of Object.entries(buckets || {})) {
+    const entry = ledger[bucketKey];
+    if (!entry) {
+      if (usd >= LIQ_GRAVITY_CLUSTER_MIN_USD) {
+        ledger[bucketKey] = {
+          originTag: 'fresh', originKnown: true, firstNonZeroAt: null,
+          bornAt: now, bornUsd: usd, birthLatencyMin: null, lastUsd: usd,
+        };
+        births.push({ bucketKey, bornAt: now, bornUsd: usd, birthLatencyMin: null });
+      } else if (usd >= LIQ_GRAVITY_CLUSTER_MIN_USD * CLUSTER_TRACK_WATCH_RATIO) {
+        ledger[bucketKey] = {
+          originTag: null, originKnown: true, firstNonZeroAt: now,
+          bornAt: null, bornUsd: null, birthLatencyMin: null, lastUsd: usd,
+        };
+      }
+      continue; // под watch прага - не си струва да следим (евтин ledger)
+    }
+    // ВАЖНО: само 'watch'-зона записи (originTag null - наблюдавани под прага,
+    // още некласифицирани) могат да се "повишат" до fresh. 'legacy' записи
+    // (от baseline, bornAt също null, но originTag='legacy') НИКОГА не се
+    // прекласифицират - иначе baseline клъстер би станал лъжливо "fresh" на
+    // следващия тик, само защото пак е над прага (виж точка 1 от уточненията).
+    if (entry.originTag == null && usd >= LIQ_GRAVITY_CLUSTER_MIN_USD) {
+      const birthLatencyMin = entry.firstNonZeroAt != null ? (now - entry.firstNonZeroAt) / 60000 : null;
+      ledger[bucketKey] = {
+        ...entry, originTag: 'fresh', originKnown: true,
+        bornAt: now, bornUsd: usd, birthLatencyMin, lastUsd: usd,
+      };
+      births.push({ bucketKey, bornAt: now, bornUsd: usd, birthLatencyMin });
+    } else {
+      ledger[bucketKey] = { ...entry, lastUsd: usd };
+    }
+  }
+  return { ledger, births };
+}
+
+// За дадена страна ('above'|'below' спрямо текущата цена) връща ДВЕ
+// независими селекции - { cluster, control } - всяка или null. Огледално на
+// findNearestLiquidationCluster по-горе, но разделя на клъстер/контрола
+// СИМЕТРИЧНО (точка 3 от уточненията): едно и също търсене (радиус, страна),
+// само прагът за квалификация се различава. Сивата зона между
+// CLUSTER_TRACK_NEGLIGIBLE_RATIO и 100% от прага НАРОЧНО не се брои за нищо -
+// не искаме изкуствено предимство за никоя от двете групи.
+function selectTrackedLevelForSide(buckets, price, side) {
+  if (!buckets || price == null || !(price > 0)) return { cluster: null, control: null };
+  const maxDist = price * (CLUSTER_TRACK_PROXIMITY_PCT / 100);
+  let bestCluster = null, bestClusterDist = Infinity;
+  let bestControl = null, bestControlDist = Infinity;
+  for (const key of Object.keys(buckets)) {
+    const usd = buckets[key];
+    const bucketPrice = liqBucketToPrice(Number(key));
+    const signedDist = bucketPrice - price;
+    const bucketSide = signedDist > 0 ? 'above' : (signedDist < 0 ? 'below' : null);
+    if (bucketSide !== side) continue;
+    const absDist = Math.abs(signedDist);
+    if (absDist > maxDist) continue;
+    if (usd >= LIQ_GRAVITY_CLUSTER_MIN_USD) {
+      if (absDist < bestClusterDist) { bestClusterDist = absDist; bestCluster = { bucketKey: key, usd, price: bucketPrice }; }
+    } else if (usd < LIQ_GRAVITY_CLUSTER_MIN_USD * CLUSTER_TRACK_NEGLIGIBLE_RATIO) {
+      if (absDist < bestControlDist) { bestControlDist = absDist; bestControl = { bucketKey: key, usd, price: bucketPrice }; }
+    }
+  }
+  return { cluster: bestCluster, control: bestControl };
+}
+
+// Отваря нов "слот" (cluster или control) за една страна - фиксира
+// levelPrice/bucketKey за ЦЕЛИЯ живот на слота (не пре-селектираме "по-добър"
+// bucket, докато слот е отворен - избягва flip-flop и държи точно 1 слот на
+// side+kind, виж точка 5 от уточненията - максимум 4 слота общо на символ).
+function openLevelLifecycle({ symbol, side, kind, selection, ledgerEntry, now, price }) {
+  const base = {
+    symbol, kind, side, bucketKey: selection.bucketKey, levelPrice: selection.price,
+    openedAt: now, lastObservedAt: now, lastObservedPrice: price,
+    phase: 'none', firstApproachAt: null, firstTouchAt: null,
+    peakProximityPct: Math.abs((price - selection.price) / selection.price * 100),
+    closedAt: null, closePrice: null, closeReason: null, bouncedAt: null,
+    currentUsd: selection.usd,
+  };
+  if (kind !== 'cluster') {
+    return { ...base, originTag: null, originKnown: null, bornAt: null, bornUsd: null, birthLatencyMin: null };
+  }
+  return {
+    ...base,
+    originTag: ledgerEntry?.originTag ?? 'legacy',
+    originKnown: ledgerEntry?.originKnown ?? false,
+    bornAt: ledgerEntry?.bornAt ?? null,
+    bornUsd: ledgerEntry?.bornUsd ?? selection.usd,
+    birthLatencyMin: ledgerEntry?.birthLatencyMin ?? null,
+  };
+}
+
+// Единствената state-machine стъпка за един отворен слот - основава се
+// ИЗКЛЮЧИТЕЛНО на реално наблюдаваната цена на този тик (точка 2 от
+// уточненията): 'touched' се отчита само ако цената РЕАЛНО е паднала в
+// кошчето на нивото; пробив без наблюдавано docosване по-рано е 'broken_gap'
+// (пропуснат между тикове), пробив СЛЕД наблюдавано 'touched' е
+// 'broken_confirmed'. 'bounced' се отчита само ако слотът вече е бил в
+// approaching/touched фаза и после реално се е отдалечил извън зоната, без
+// пробив. Нищо не се "довъобразява" за това, което е станало между тиковете.
+function stepLevelLifecycle(slot, observedPrice, now) {
+  if (!slot || slot.closedAt != null) return slot;
+  const levelPrice = slot.levelPrice;
+  const distPct = (observedPrice - levelPrice) / levelPrice * 100;
+  // Закръглено до 2 знака - избягва KV WRITE само заради незначим float шум
+  // в наблюдаваната цена, без да губи реалната прецизност на разстоянието
+  // (виж уточнение 4/5 - минимален KV budget).
+  const absDistPct = Math.round(Math.abs(distPct) * 100) / 100;
+  const inBucket = priceToLiqBucket(observedPrice) === priceToLiqBucket(levelPrice);
+  // slot.side = страната на НИВОТО спрямо цената ПРИ отваряне ('above' =
+  // нивото е над цената) -> цената тръгва от ОБРАТНАТА страна на самото ниво.
+  // "Пробив" = знакът на (цена - ниво) се обръща спрямо това начално
+  // очакване - НЕ спрямо последния тик (виж уточнение 2).
+  const expectedSign = slot.side === 'above' ? -1 : 1;
+  const currSign = distPct > 0 ? 1 : (distPct < 0 ? -1 : expectedSign);
+  const peakImproved = slot.peakProximityPct == null || absDistPct < slot.peakProximityPct;
+  const peak = (s) => (peakImproved ? { peakProximityPct: absDistPct } : {});
+
+  // Докосване (реално наблюдавано попадане в кошчето на нивото) има приоритет
+  // пред break-проверката - докато цената е В кошчето на нивото, тя е "на"
+  // нивото, не "отвъд" него, независимо от дребен знак шум на границата.
+  if (inBucket) {
+    if (slot.phase === 'touched' && slot.firstTouchAt != null && !peakImproved) return slot; // вече стабилно touched - нищо ново за запис
+    return {
+      ...slot, ...peak(slot), phase: 'touched',
+      firstTouchAt: slot.firstTouchAt ?? now, firstApproachAt: slot.firstApproachAt ?? now,
+      lastObservedAt: now, lastObservedPrice: observedPrice,
+    };
+  }
+
+  if (currSign !== expectedSign) {
+    return {
+      ...slot, ...peak(slot), closedAt: now, closePrice: observedPrice,
+      closeReason: slot.phase === 'touched' ? 'broken_confirmed' : 'broken_gap',
+      lastObservedAt: now, lastObservedPrice: observedPrice,
+    };
+  }
+
+  if (absDistPct <= CLUSTER_TRACK_PROXIMITY_PCT) {
+    if ((slot.phase === 'approaching' || slot.phase === 'touched') && slot.firstApproachAt != null && !peakImproved) return slot; // стабилно приближение - нищо ново
+    return {
+      ...slot, ...peak(slot), phase: slot.phase === 'touched' ? 'touched' : 'approaching',
+      firstApproachAt: slot.firstApproachAt ?? now,
+      lastObservedAt: now, lastObservedPrice: observedPrice,
+    };
+  }
+
+  if (slot.phase === 'approaching' || slot.phase === 'touched') {
+    return {
+      ...slot, ...peak(slot), closedAt: now, closePrice: observedPrice,
+      closeReason: 'bounced', bouncedAt: now,
+      lastObservedAt: now, lastObservedPrice: observedPrice,
+    };
+  }
+  return slot; // далеч, никога не е приближавала - нищо ново за запис
+}
+
+function isLevelLifecycleExpired(slot, now) {
+  return !!slot && slot.closedAt == null && (now - slot.openedAt) >= CLUSTER_TRACK_MAX_AGE_MS;
+}
+function expireLevelLifecycle(slot, now) {
+  return { ...slot, closedAt: now, closePrice: slot.lastObservedPrice ?? null, closeReason: 'expired' };
+}
+
+// Финализира затворен слот за persist - добавя durationMin, иначе byte-same
+// на слота (всички milestone timestamps вече са в него).
+function finalizeClusterLifecycleRecord(slot) {
+  return { ...slot, durationMin: slot.closedAt != null ? (slot.closedAt - slot.openedAt) / 60000 : null };
+}
+
+// Главната чиста функция за ЕДИН символ на ЕДИН тик - не прави I/O. Взема
+// предишното tracker състояние (ledger + до 4 отворени слота) + текущите
+// liqGravity.buckets (READ-peek, никога мутация) + текущата цена, връща
+// новото състояние + новородени кошчета (births) + финализирани (затворени
+// този тик) lifecycle записи, готови за persist в Stage 2.
+function advanceClusterTracking(prevState, symbol, buckets, price, now) {
+  // prevState (не placeholder {ledger:{},slots:{}}) - невалидна цена с ПРАЗНО
+  // предходно състояние не бива да създава какво да е за запис (виж
+  // trackSymbolClusterOutcome - null nextState изрично пропуска write).
+  if (!(price > 0)) return { nextState: prevState, births: [], closedRecords: [] };
+
+  const isFirstRun = !prevState;
+  const prevLedger = prevState?.ledger || {};
+  const { ledger, births } = isFirstRun
+    ? { ledger: buildClusterLedgerBaseline(buckets), births: [] }
+    : updateClusterLedger(prevLedger, buckets, now);
+
+  const prevSlots = prevState?.slots || {};
+  const nextSlots = {};
+  const closedRecords = [];
+
+  for (const side of ['above', 'below']) {
+    const selection = selectTrackedLevelForSide(buckets, price, side);
+    for (const kind of ['cluster', 'control']) {
+      const slotKey = `${side}_${kind}`;
+      let slot = prevSlots[slotKey] || null;
+      if (slot) {
+        slot = stepLevelLifecycle(slot, price, now);
+        if (slot.closedAt == null && isLevelLifecycleExpired(slot, now)) slot = expireLevelLifecycle(slot, now);
+        if (slot.closedAt != null) {
+          closedRecords.push(finalizeClusterLifecycleRecord(slot));
+          slot = null;
+        }
+      }
+      if (!slot) {
+        const sel = selection[kind];
+        if (sel) {
+          const ledgerEntry = kind === 'cluster' ? ledger[sel.bucketKey] : null;
+          slot = openLevelLifecycle({ symbol, side, kind, selection: sel, ledgerEntry, now, price });
+        }
+      }
+      nextSlots[slotKey] = slot;
+    }
+  }
+
+  return { nextState: { ledger, slots: nextSlots }, births, closedRecords };
+}
+
+// Stage 2 - KV wiring. ЕДИН KV ключ на символ (`clustertrack:<symbol>`) пази
+// ledger-а + до 4 отворени слота - НЕ отделен запис на тик (виж точка 4/5 от
+// уточненията). WRITE само ако сериализираното съдържание РЕАЛНО се е
+// променило (read-modify-write в рамките на ЕДНО извикване на
+// scanSymbolSignals за този символ - виж call site-а по-долу - никога два
+// пъти в една инвокация, огледално на liqdiag:/sigstate: прецедента).
+// Финализирани (затворени този тик) lifecycle записи се пишат по ЕДИН
+// отделен KV ключ всеки - рядко събитие, НЕ на всеки тик.
+const CLUSTER_TRACK_KV_PREFIX = 'clustertrack:';
+const CLUSTER_EVENT_KV_PREFIX = 'clusterevent:';
+function clusterTrackKey(symbol) { return `${CLUSTER_TRACK_KV_PREFIX}${symbol}`; }
+function clusterEventKey(record) { return `${CLUSTER_EVENT_KV_PREFIX}${record.symbol}:${record.openedAt}:${record.side}_${record.kind}`; }
+
+// Извиква се от scanSymbolSignals (виж wiring-а там, редом до
+// runLiqShadowDiagnostics) - САМО READ-peek на liqGravity.buckets, подадени
+// отвън като обикновен обект (НЕ самия `state`). Никога не хвърля - грешка
+// тук е изолирана и не може да прекъсне ENTRY/VETO пътя (огледално на
+// runLiqShadowDiagnostics по-долу).
+async function trackSymbolClusterOutcome(env, symbol, buckets, price, now = Date.now()) {
+  try {
+    if (!env?.ALERT_STATE) return null;
+    const key = clusterTrackKey(symbol);
+    const raw = await env.ALERT_STATE.get(key);
+    const prevState = raw ? JSON.parse(raw) : null;
+    const { nextState, closedRecords } = advanceClusterTracking(prevState, symbol, buckets, price, now);
+    if (nextState != null) {
+      const nextRaw = JSON.stringify(nextState);
+      if (nextRaw !== raw) await env.ALERT_STATE.put(key, nextRaw);
+    }
+    for (const record of closedRecords) {
+      await env.ALERT_STATE.put(clusterEventKey(record), JSON.stringify(record));
+    }
+    return { nextState, closedRecords };
+  } catch (e) {
+    console.error('trackSymbolClusterOutcome error:', e);
+    return null;
+  }
+}
+
 // ═══ COINGLASS LIQUIDATION DIAGNOSTICS (SHADOW, diagnostic-only) ════════════════
 // Диагностика на `/futures/liquidation/order` интеграцията (виж доклада
 // "CoinGlass liquidation/order - symbol diagnostics"). ПРИНЦИПИ:
@@ -5609,6 +5909,13 @@ async function scanSymbolSignals(env, symbol) {
       legacyBuyUsd: liquidationCascade.buySumUsd, legacySellUsd: liquidationCascade.sellSumUsd,
     });
   }
+  // LIQUIDATION CLUSTER OUTCOME TRACKER (виж discussion-а "клъстер срещу
+  // контролна група") - само READ-peek на state.liqGravity.buckets (вече
+  // актуализиран от accumulateLiquidationGravity по-горе), пише в собствен
+  // `clustertrack:`/`clusterevent:` KV namespace. Не чете/пише `state`, не
+  // влияе на никоя стойност в този return - огледално на shadow диагностиката
+  // точно над този ред.
+  await trackSymbolClusterOutcome(env, symbol, state.liqGravity?.buckets, price);
 
   // ENTRY ENGINE - ЕТАП 1: "SETUP" (виж calcSetupState по-горе) - реюзва вече
   // изчислените TARGET/VAH/VAL/TRAP/AUCTION/MIGRATION резултати по-горе, БЕЗ
@@ -8086,6 +8393,14 @@ export {
   buildRotationCandidates, trackCoinRotation, ROTATION_STATE_KEY, ROTATION_PENDING_KEY,
   filterRecentRotationExits, buildRotationDigestMessage, shouldSendDailyRotationDigest,
   maybeSendDailyRotationDigest, ROTATION_DIGEST_LAST_SENT_KEY, ROTATION_DIGEST_INTERVAL_MS,
+  // LIQUIDATION CLUSTER OUTCOME TRACKER - изложени само за unit тестове.
+  CLUSTER_TRACK_PROXIMITY_PCT, CLUSTER_TRACK_NEGLIGIBLE_RATIO, CLUSTER_TRACK_WATCH_RATIO,
+  CLUSTER_TRACK_MAX_AGE_MS, buildClusterLedgerBaseline, updateClusterLedger,
+  selectTrackedLevelForSide, openLevelLifecycle, stepLevelLifecycle, isLevelLifecycleExpired,
+  expireLevelLifecycle, finalizeClusterLifecycleRecord, advanceClusterTracking,
+  priceToLiqBucket, liqBucketToPrice,
+  CLUSTER_TRACK_KV_PREFIX, CLUSTER_EVENT_KV_PREFIX, clusterTrackKey, clusterEventKey,
+  trackSymbolClusterOutcome,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
@@ -8352,6 +8667,36 @@ export default {
         active,
         exitedCount: records.length,
         exited: records.slice(0, limit),
+      });
+    }
+    // LIQUIDATION CLUSTER OUTCOME TRACKER diagnostics - read-only,
+    // token-gated като /rotation-diagnostics. Показва за даден символ (или за
+    // всички от WATCHLIST) текущо отворените слота (clustertrack:<symbol>) +
+    // вече финализирани lifecycle записи (clusterevent:*) - за собствена
+    // проверка на данните, виж discussion-а "клъстер срещу контролна група".
+    if (path === "/cluster-diagnostics" && request.method === "GET") {
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+      if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
+      if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
+      const symbolParam = (url.searchParams.get("symbol") || "").trim().toUpperCase();
+      const symbols = symbolParam ? [symbolParam] : WATCHLIST;
+      const trackedEntries = await Promise.all(symbols.map(async symbol => {
+        const raw = await env.ALERT_STATE.get(clusterTrackKey(symbol));
+        return { symbol, state: raw ? JSON.parse(raw) : null };
+      }));
+      const openCount = trackedEntries.reduce((n, e) => n + Object.values(e.state?.slots || {}).filter(Boolean).length, 0);
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "200", 10) || 200, 1000);
+      const listResult = await env.ALERT_STATE.list({ prefix: CLUSTER_EVENT_KV_PREFIX });
+      const recordKeys = listResult.keys.map(k => k.name);
+      const records = (await Promise.all(recordKeys.map(k => env.ALERT_STATE.get(k)))).filter(Boolean).map(r => JSON.parse(r));
+      records.sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0));
+      return json({
+        openCount,
+        tracked: Object.fromEntries(trackedEntries.map(e => [e.symbol, e.state])),
+        closedCount: records.length,
+        closed: records.slice(0, limit),
       });
     }
     // PUBLIC GRAVITY (виж buildLiqGravityPublicSnapshot по-горе) - ЕДИНСТВЕНИЯТ
