@@ -1,7 +1,5 @@
 # Cloudflare Worker (orange-grass-d809) — setup
 
-<!-- ci-diagnostic-test: трае само докато установим защо CI не се задейства за PR#149 -->
-
 Този Worker прави две неща: (1) прокси за Yahoo/football-data.org/api-sports.io/CoinGlass заявките на приложенията, и (2) на cron разписание следи личен watchlist за DCA нива И/ИЛИ пазарни сигнали (WARMING/HOT/SUPER, MM LONG/SHORT/x25, FLUSH/BASE/SQUEEZE/SHIFT/IMPULSE) и праща WhatsApp известие през TextMeBot.
 
 `worker.js` **не съдържа никакви ключове в кода** — всички се четат от Worker Secrets, за да могат безопасно да стоят в публичния Signal-scanner repo.
