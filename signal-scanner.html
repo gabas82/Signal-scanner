@@ -361,11 +361,14 @@ const EXTREME_SCORE_PCT = 0.8;
 const EXTREME_SCORE = Math.round(MAX_SIGNAL_SCORE * EXTREME_SCORE_PCT);
 let allCoins = [];
 let currentFilter = 'all';
-// filter200/capitulation имат собствени изгледи (loadFilter200/loadCapitulation),
-// които НЕ минават през renderList() - тя не ги разпознава и би показала "няма
-// монети" върху резултатите им. Всяко място, което обмисля да вика renderList()
-// "отстрани" (auto-refresh, промяна на wall bias и т.н.), трябва да провери това първо.
-function isSpecialTab() { return currentFilter === 'filter200' || currentFilter === 'capitulation'; }
+// filter200/capitulation/spark имат собствени изгледи (loadFilter200/
+// loadCapitulation/loadSpark), които НЕ минават през renderList() - тя не ги
+// разпознава и би показала "няма монети" върху резултатите им. Всяко място,
+// което обмисля да вика renderList() "отстрани" (auto-refresh, промяна на wall
+// bias и т.н.), трябва да провери това първо. Списъкът идва от
+// isScanNowTab() в signal-logic.js - единен източник на истината, ползван и от
+// loadAll() по-долу, за да не се разминат отново (SPARK липсваше точно оттук).
+function isSpecialTab() { return isScanNowTab(currentFilter); }
 let searchQuery = '';
 let refreshTimer = null;
 let trendingSymbols = new Set();
@@ -1827,6 +1830,7 @@ async function loadAll(isAuto) {
     updateStats();
     if (currentFilter === 'filter200') { if (!isAuto) loadFilter200(); }
     else if (currentFilter === 'capitulation') { if (!isAuto) loadCapitulation(); }
+    else if (currentFilter === 'spark') { if (!isAuto) loadSpark(); }
     else { renderList(); }
     loadWalls();
     const now = new Date();

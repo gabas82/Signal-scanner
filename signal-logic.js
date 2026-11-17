@@ -1554,6 +1554,16 @@ function getValueMigrationTier(score, hasHardFactor) {
   return 'none';
 }
 
+// Табове със собствен тежък скан (loadFilter200/loadCapitulation/loadSpark),
+// които пишат директно в main-content и НЕ минават през renderList() - тя не ги
+// разпознава и би презаписала резултатите им с "няма монети". Единен източник
+// на истината за кои табове спадат тук, ползван и от isSpecialTab() (пази от
+// презаписване при auto-refresh), и от loadAll() (кой handler да викне) в
+// signal-scanner.html.
+function isScanNowTab(filter) {
+  return filter === 'filter200' || filter === 'capitulation' || filter === 'spark';
+}
+
 // fetchCoinData() в signal-scanner.html пресъздава allCoins обекта за всяка монета
 // при всеки refresh цикъл, преди loadAthAtlAsync() да е имал шанс да презареди
 // бавните (rate-limited) CoinGecko ATH/ATL/MCap данни за тази монета. Без това,
@@ -1600,6 +1610,6 @@ if (typeof module !== 'undefined' && module.exports) {
     calcAuctionQualityScore, getAuctionQualityTier, AUCTION_LABELS, AUCTION_NARROW_WIDTH_PCT, AUCTION_SKEW_THRESHOLD,
     splitCandlesByUtcDay, getTodayYesterdayCandles, calcValueMigrationScore, getValueMigrationTier,
     MIGRATION_LABELS, MIGRATION_MIN_PCT, MIGRATION_MIN_CANDLES,
-    carryForwardCoinExtras
+    carryForwardCoinExtras, isScanNowTab
   };
 }
