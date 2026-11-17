@@ -8681,7 +8681,7 @@ export default {
       if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
       if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
       const symbolParam = (url.searchParams.get("symbol") || "").trim().toUpperCase();
-      const symbols = symbolParam ? [symbolParam] : WATCHLIST;
+      const symbols = symbolParam ? [symbolParam] : WATCHLIST.map(p => p.symbol);
       const trackedEntries = await Promise.all(symbols.map(async symbol => {
         const raw = await env.ALERT_STATE.get(clusterTrackKey(symbol));
         return { symbol, state: raw ? JSON.parse(raw) : null };

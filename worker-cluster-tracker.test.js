@@ -432,4 +432,12 @@ describe('/cluster-diagnostics endpoint', () => {
     await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret&symbol=BTCUSDT');
     expect(wrote).toBe(false);
   });
+
+  it('без symbol параметър итерира WATCHLIST по .symbol, не по обекта (regression)', async () => {
+    const kv = makeKv({ [clusterTrackKey('BTCUSDT')]: JSON.stringify({ ledger: {}, slots: {} }) });
+    const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret');
+    const body = await res.json();
+    expect(Object.keys(body.tracked)).not.toContain('[object Object]');
+    expect(body.tracked.BTCUSDT).toEqual({ ledger: {}, slots: {} });
+  });
 });
