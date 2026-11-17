@@ -4510,6 +4510,42 @@ function buildCmeGapAlertMessage(event) {
   return `${label}\n${event.symbol} (${event.ticker})\nЦена: ${event.price}\n${new Date(event.at).toISOString()}`;
 }
 
+// Stage 2 - KV wiring. ЕДИН отворен запис на символ (`cmegap:<symbol>`,
+// изтрит щом се затвори) + ЕДИН отделен KV ключ на всеки финализиран запис
+// (`cmegapevent:<symbol>:<filledAt>`) - рядко събитие (на всеки webhook, НЕ
+// на тик), огледално на `clustertrack:`/`clusterevent:` именуването.
+const CME_GAP_KV_PREFIX = 'cmegap:';
+const CME_GAP_EVENT_KV_PREFIX = 'cmegapevent:';
+function cmeGapOpenKey(symbol) { return `${CME_GAP_KV_PREFIX}${symbol}`; }
+function cmeGapEventKey(record) { return `${CME_GAP_EVENT_KV_PREFIX}${record.symbol}:${record.filledAt}`; }
+
+// Главната orchestration функция, викана от /tv-cme-gap по-долу - връща
+// {ok:false} при невалиден текст (webhook endpoint-ът връща 400), иначе праща
+// WhatsApp известието ВИНАГИ (дори ако KV записът се провали - виж точка
+// "и двете" от решението: известието е критичният път, записът за анализ е
+// best-effort, грешка там никога не бива да скрие реално известие).
+async function processCmeGapWebhook(env, rawText) {
+  const event = parseCmeGapAlertText(rawText);
+  if (!event) return { ok: false, error: 'invalid_payload' };
+  try {
+    if (env?.ALERT_STATE) {
+      const key = cmeGapOpenKey(event.symbol);
+      const raw = await env.ALERT_STATE.get(key);
+      const prevOpen = raw ? JSON.parse(raw) : null;
+      const { nextOpen, closedRecords } = handleCmeGapEvent(prevOpen, event);
+      if (nextOpen) await env.ALERT_STATE.put(key, JSON.stringify(nextOpen));
+      else await env.ALERT_STATE.delete(key);
+      for (const record of closedRecords) {
+        await env.ALERT_STATE.put(cmeGapEventKey(record), JSON.stringify(record));
+      }
+    }
+  } catch (e) {
+    console.error('processCmeGapWebhook KV error:', e);
+  }
+  const cmResult = await sendWhatsApp(env, buildCmeGapAlertMessage(event));
+  return { ok: true, event, callmebot: cmResult };
+}
+
 // ═══ COINGLASS LIQUIDATION DIAGNOSTICS (SHADOW, diagnostic-only) ════════════════
 // Диагностика на `/futures/liquidation/order` интеграцията (виж доклада
 // "CoinGlass liquidation/order - symbol diagnostics"). ПРИНЦИПИ:
@@ -8485,6 +8521,8 @@ export {
   // CME GAP TRACKER - изложени само за unit тестове.
   parseCmeGapAlertText, normalizeCmeGapSymbol, openCmeGapRecord, finalizeCmeGapRecord,
   handleCmeGapEvent, buildCmeGapAlertMessage,
+  CME_GAP_KV_PREFIX, CME_GAP_EVENT_KV_PREFIX, cmeGapOpenKey, cmeGapEventKey,
+  processCmeGapWebhook,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
@@ -8694,6 +8732,32 @@ export default {
       return new Response(JSON.stringify({ ok: true, callmebot: cmResult }), { headers: { "Content-Type": "application/json" } });
     }
 
+    // CME GAP TRACKER webhook - огледално на /tv-alert по-горе (СЪЩИЯ
+    // TV_ALERT_TOKEN, не е нужен нов secret), но тялото е PLAIN TEXT (3 реда),
+    // не JSON - виж parseCmeGapAlertText/processCmeGapWebhook по-горе за
+    // пълния формат и KV wiring-а.
+    if (path === "/tv-cme-gap" && (request.method === "POST" || request.method === "GET")) {
+      const suppliedToken = (url.searchParams.get("token") || "").trim();
+      const expectedToken = (env.TV_ALERT_TOKEN || "").trim();
+      if (!expectedToken || suppliedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      // GET - за ръчно тестване (?text=<url-encoded 3-редов текст>), огледално
+      // на /tv-alert GET-а по-горе. Реалният TradingView webhook винаги праща POST.
+      const rawText = request.method === "GET" ? (url.searchParams.get("text") || "") : await request.text();
+      const result = await processCmeGapWebhook(env, rawText);
+      if (!result.ok) {
+        return new Response(JSON.stringify({ error: "Invalid alert text" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return new Response(JSON.stringify({ ok: true, callmebot: result.callmebot }), { headers: { "Content-Type": "application/json" } });
+    }
+
     // ENTRY ENGINE TELEMETRY - read-only debug ендпойнт (виж buildTelemetrySummary
     // по-горе). Fail-closed token auth (TELEMETRY_TOKEN secret), огледално на
     // /tv-alert по-горе. Чисто READ - никакво управление/промяна на прагове,
@@ -8779,6 +8843,29 @@ export default {
       return json({
         openCount,
         tracked: Object.fromEntries(trackedEntries.map(e => [e.symbol, e.state])),
+        closedCount: records.length,
+        closed: records.slice(0, limit),
+      });
+    }
+    // CME GAP TRACKER diagnostics - read-only, token-gated като /cluster-diagnostics.
+    // Показва текущо отворените гапове (BTC/ETH, ако изобщо има) + вече
+    // финализираните (filled/superseded) записи.
+    if (path === "/cme-gap-diagnostics" && request.method === "GET") {
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+      if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
+      if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
+      const openEntries = await Promise.all(['BTC', 'ETH'].map(async symbol => {
+        const raw = await env.ALERT_STATE.get(cmeGapOpenKey(symbol));
+        return [symbol, raw ? JSON.parse(raw) : null];
+      }));
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "200", 10) || 200, 1000);
+      const listResult = await env.ALERT_STATE.list({ prefix: CME_GAP_EVENT_KV_PREFIX });
+      const records = (await Promise.all(listResult.keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
+      records.sort((a, b) => (b.filledAt || 0) - (a.filledAt || 0));
+      return json({
+        open: Object.fromEntries(openEntries),
         closedCount: records.length,
         closed: records.slice(0, limit),
       });
