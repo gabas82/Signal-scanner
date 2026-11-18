@@ -385,13 +385,29 @@ const oiPrevMap = {};
 let gravityCache = { clusters: {}, ts: 0 };
 
 function handleSearch(val) { searchQuery = val.toUpperCase().trim(); renderList(); }
-async function cgFetch(path) { const r = await fetch(`${WORKER_URL}${path}`); return r.json(); }
+// Защита срещу увиснала мрежова заявка (мобилна връзка пада по средата,
+// сървърът не отговаря без да върне грешка) - без timeout, isLoading в
+// loadAll() може да остане true завинаги, тихо блокирайки всички бъдещи
+// опреснявания (авто и ръчния REFRESH бутон) до ръчно презареждане на
+// страницата. Огледално на FETCH_TIMEOUT_MS/fetchWithTimeout в worker.js.
+const FETCH_TIMEOUT_MS = 15000;
+async function fetchT(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function cgFetch(path) { const r = await fetchT(`${WORKER_URL}${path}`); return r.json(); }
 
 // Малък helper с retry за fetch-ове, които може да гърмят на rate limit (429)
 async function fetchWithRetry(url, options, retries = 2, backoffMs = 1500) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const r = await fetch(url, options);
+      const r = await fetchT(url, options);
       if (r.status === 429 && attempt < retries) {
         await new Promise(res => setTimeout(res, backoffMs * (attempt + 1)));
         continue;
@@ -431,7 +447,7 @@ function recordAltRadarSample(btcD, total3, others, altBtc) {
 }
 async function fetchTop10MarketCap() {
   try {
-    const r = await fetch('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1');
+    const r = await fetchT('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1');
     const d = await r.json();
     if (!Array.isArray(d)) return null;
     return d.reduce((s,c) => s + (c.market_cap||0), 0);
@@ -476,7 +492,7 @@ async function loadAltRadar(btcD, total3, btcMcap) {
 
 async function loadCryptoMarketRow() {
   try {
-    const r = await fetch('https://api.coingecko.com/api/v3/global');
+    const r = await fetchT('https://api.coingecko.com/api/v3/global');
     const d = await r.json();
     if (d && d.data) {
       const g = d.data;
@@ -494,7 +510,7 @@ async function loadCryptoMarketRow() {
       if (altMcap) { el('mkt-alt').textContent = '$'+formatNum(altMcap); el('mkt-alt-chg').textContent = 'без BTC+ETH'; }
       if (btcD != null && totalMcap && btcMcap) loadAltRadar(btcD, altMcap, btcMcap);
     }
-    const fg = await fetch('https://api.alternative.me/fng/?limit=1');
+    const fg = await fetchT('https://api.alternative.me/fng/?limit=1');
     const fgd = await fg.json();
     if (fgd && fgd.data && fgd.data[0]) {
       const val = parseInt(fgd.data[0].value);
@@ -517,7 +533,7 @@ async function loadMacroRow() {
   ];
   for (const s of symbols) {
     try {
-      const r = await fetch(`${WORKER_URL}/yahoo/${s.id}`);
+      const r = await fetchT(`${WORKER_URL}/yahoo/${s.id}`);
       const d = await r.json();
       const result = d?.chart?.result?.[0];
       if (!result) continue;
@@ -542,7 +558,7 @@ async function loadMacroRow() {
 } async function fetchOrderBookWalls(symbol, price) {
   if (wallCache[symbol] && wallCache[symbol].ts > Date.now() - 120000) return wallCache[symbol].data;
   try {
-    const r = await fetch(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=500`);
+    const r = await fetchT(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=500`);
     const d = await r.json();
     if (!d.bids || !d.asks) return null;
     const bids = d.bids.map(b => ({price: parseFloat(b[0]), usd: parseFloat(b[0])*parseFloat(b[1])}));
@@ -627,25 +643,32 @@ async function loadWalls(refreshed) {
 async function fetchGravityPublic() {
   if (gravityCache.ts > Date.now() - 60000) return gravityCache.clusters;
   try {
-    const r = await fetch(`${WORKER_URL}/liq-gravity-public`);
+    const r = await fetchT(`${WORKER_URL}/liq-gravity-public`);
     const d = await r.json();
     gravityCache = { clusters: d.clusters || {}, ts: Date.now() };
   } catch(e) { /* запазва последния успешен кеш, ако мрежата се провали за момент */ }
   return gravityCache.clusters;
 }
 async function loadGravity() {
+  // fetchGravityPublic() никога не хвърля (пази последния успешен кеш при
+  // мрежова грешка) - но извикващият loadWalls() прави `await loadGravity();
+  // updateStats();` без own обвивка, затова и тук добавяме per-card try/catch
+  // + null-защита на g.distancePct: една неочаквана форма на данни не бива да
+  // спре updateStats() за целия тик (виж discussion-а "табовете замръзват").
   const clusters = await fetchGravityPublic();
   const visible = document.querySelectorAll('.coin-card');
   for (const card of visible) {
-    const el = card.querySelector('[id^="gravity-"]'); if (!el) continue;
-    const sym = el.id.replace('gravity-','');
-    const g = clusters[sym];
-    if (!g) { el.style.display = 'none'; el.innerHTML = ''; continue; }
-    const dirArrow = g.direction === 'long' ? '▲' : '▼';
-    const dirColor = g.direction === 'long' ? 'var(--green)' : 'var(--red)';
-    const distTxt = (g.distancePct > 0 ? '+' : '') + g.distancePct.toFixed(1) + '%';
-    el.style.display = '';
-    el.innerHTML = `<div class="wall-row"><span style="color:var(--blue)">🧲 GRAVITY: $${formatPrice(g.clusterPrice)} (${formatNum(g.clusterUsd)})</span><span style="color:${dirColor}">${dirArrow} ${distTxt}</span></div>`;
+    try {
+      const el = card.querySelector('[id^="gravity-"]'); if (!el) continue;
+      const sym = el.id.replace('gravity-','');
+      const g = clusters[sym];
+      if (!g || g.distancePct == null) { el.style.display = 'none'; el.innerHTML = ''; continue; }
+      const dirArrow = g.direction === 'long' ? '▲' : '▼';
+      const dirColor = g.direction === 'long' ? 'var(--green)' : 'var(--red)';
+      const distTxt = (g.distancePct > 0 ? '+' : '') + g.distancePct.toFixed(1) + '%';
+      el.style.display = '';
+      el.innerHTML = `<div class="wall-row"><span style="color:var(--blue)">🧲 GRAVITY: $${formatPrice(g.clusterPrice)} (${formatNum(g.clusterUsd)})</span><span style="color:${dirColor}">${dirArrow} ${distTxt}</span></div>`;
+    } catch (e) { /* не блокираме updateStats() заради една карта */ }
   }
 }
 
@@ -682,9 +705,16 @@ async function loadFilter200() {
   }
   allCoins = [...allCoins.filter(c => !results.find(r => r.fullSymbol === c.fullSymbol)), ...results];
   if (results.length === 0) { content.innerHTML = `<div class="no-results">НЯМА МОНЕТИ С ВСИЧКИ ФИЛТРИ (-80% ATH + OI↑ + VOL SPIKE)</div>`; return; }
-  const html = results.map((c, i) => renderCard(c, i)).join('');
-  content.innerHTML = `<div style="padding:8px 14px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);">📊 ${results.length} МОНЕТИ · -80% ATH + OI↑ + VOL SPIKE</div><div class="coins-list">${html}</div>`;
-  loadWalls();
+  // try/catch тук, НЕ само в горния цикъл - ако renderCard() хвърли грешка за
+  // която и да е резултатна монета, без тази защита екранът би останал
+  // завинаги на "ЗАРЕЖДАНЕ..." (виж discussion-а "табовете замръзват").
+  try {
+    const html = results.map((c, i) => renderCard(c, i)).join('');
+    content.innerHTML = `<div style="padding:8px 14px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);">📊 ${results.length} МОНЕТИ · -80% ATH + OI↑ + VOL SPIKE</div><div class="coins-list">${html}</div>`;
+    loadWalls();
+  } catch (e) {
+    content.innerHTML = `<div class="error-msg">ГРЕШКА ПРИ ПОКАЗВАНЕ НА РЕЗУЛТАТИТЕ<br>${e.message}</div>`;
+  }
 }
 
 function klinesToCandles(klines) {
@@ -938,24 +968,31 @@ async function loadCapitulation() {
   }
   if (results.length === 0) { content.innerHTML = `<div class="no-results">НЯМА АКТИВНИ CAPITULATION/WARMING СИГНАЛИ В МОМЕНТА</div>`; return; }
 
-  // BASE монетите ("направило дъно, но с отслабващ момент - вероятно предстои втори,
-  // по-нисък под") се качват най-отгоре, ранжирани по силата на скритата дивергенция.
-  // Първите (до) 3 получават "TOP N ДЪНО" бадж - виж renderCard().
-  results.sort((a, b) => {
-    const aBase = !!a.capSignals?.base, bBase = !!b.capSignals?.base;
-    if (aBase && bBase) return (b.capSignals.baseStrength?.score || 0) - (a.capSignals.baseStrength?.score || 0);
-    if (aBase !== bBase) return aBase ? -1 : 1;
-    return 0;
-  });
-  let baseRank = 0;
-  for (const c of results) {
-    if (c.capSignals?.base && baseRank < 3) { baseRank++; c._topBaseRank = baseRank; }
-    else { c._topBaseRank = null; }
-  }
+  // try/catch тук, НЕ само в горния цикъл - ако сортирането или renderCard()
+  // хвърлят грешка, без тази защита екранът би останал завинаги на
+  // "СКАНИРАНЕ..." (виж discussion-а "табовете замръзват").
+  try {
+    // BASE монетите ("направило дъно, но с отслабващ момент - вероятно предстои втори,
+    // по-нисък под") се качват най-отгоре, ранжирани по силата на скритата дивергенция.
+    // Първите (до) 3 получават "TOP N ДЪНО" бадж - виж renderCard().
+    results.sort((a, b) => {
+      const aBase = !!a.capSignals?.base, bBase = !!b.capSignals?.base;
+      if (aBase && bBase) return (b.capSignals.baseStrength?.score || 0) - (a.capSignals.baseStrength?.score || 0);
+      if (aBase !== bBase) return aBase ? -1 : 1;
+      return 0;
+    });
+    let baseRank = 0;
+    for (const c of results) {
+      if (c.capSignals?.base && baseRank < 3) { baseRank++; c._topBaseRank = baseRank; }
+      else { c._topBaseRank = null; }
+    }
 
-  const html = results.map((c,i) => renderCard(c,i)).join('');
-  content.innerHTML = `<div style="padding:8px 14px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);">🔥 ${results.length} МОНЕТИ С АКТИВЕН CAPITULATION/WARMING СИГНАЛ</div><div class="coins-list">${html}</div>`;
-  loadWalls();
+    const html = results.map((c,i) => renderCard(c,i)).join('');
+    content.innerHTML = `<div style="padding:8px 14px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);">🔥 ${results.length} МОНЕТИ С АКТИВЕН CAPITULATION/WARMING СИГНАЛ</div><div class="coins-list">${html}</div>`;
+    loadWalls();
+  } catch (e) {
+    content.innerHTML = `<div class="error-msg">ГРЕШКА ПРИ ПОКАЗВАНЕ НА РЕЗУЛТАТИТЕ<br>${e.message}</div>`;
+  }
 }
 
 // ═══ SPARK - ранно откриване ПРЕДИ импулса ═════════════════════════════════
@@ -969,7 +1006,7 @@ const SPARK_KLINE_TTL_MS = 60000;
 // delta-и от ЕДИН fetch, виж calcOiMultiDelta в signal-logic.js).
 async function fetchOiMultiHist(symbol) {
   try {
-    const r = await fetch(`https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=5m&limit=13`);
+    const r = await fetchT(`https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=5m&limit=13`);
     const data = await r.json();
     if (!Array.isArray(data)) return null;
     return data.map(d => ({ time: d.timestamp, oi: parseFloat(d.sumOpenInterest) })).filter(d => isFinite(d.oi));
@@ -981,7 +1018,7 @@ async function fetchOiMultiHist(symbol) {
 // same period=5m/limit=13 конвенция за 5m/15m/1h delta от ЕДИН fetch.
 async function fetchTakerFlowHist(symbol) {
   try {
-    const r = await fetch(`https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=${symbol}&period=5m&limit=13`);
+    const r = await fetchT(`https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=${symbol}&period=5m&limit=13`);
     const data = await r.json();
     if (!Array.isArray(data)) return null;
     return data.map(d => ({ time: d.timestamp, buyVol: parseFloat(d.buyVol), sellVol: parseFloat(d.sellVol) })).filter(d => isFinite(d.buyVol) && isFinite(d.sellVol));
@@ -1161,37 +1198,44 @@ async function loadSpark() {
   }
   if (results.length === 0) { content.innerHTML = `<div class="no-results">НЯМА SPARK КАНДИДАТИ В МОМЕНТА</div>`; return; }
 
-  // Точка 11 от предложението - сортиране: 1) най-висок SPARK score, 2) IDEA 07
-  // COIN-SPECIFIC напред (виж calcRelativeFlow) - "монетата се събужда сама" е
-  // по-интересно от "цял пазар/BTC се движи заедно", 3) най-силно OI ускорение,
-  // 4) най-силно обемно ускорение, 5) най-малко Price Extension.
-  results.sort((a, b) => {
-    // IDEA 05 - "FLOW WARMING" - "leader" tier е приоритет ПРЕД самия SPARK
-    // score: точно тази комбинация (виж calcFlowWarmingScore) е сигналът,
-    // който трябва да изпъкне НАЙ-ОТГОРЕ, дори ако все още няма достатъчно
-    // "меки" точки за висок sparkTier - целта е да се хване РАНО, не след
-    // като вече е събрала точки другаде.
-    const aLeader = a.sparkSignal.flowWarmingTier === 'leader' ? 1 : 0;
-    const bLeader = b.sparkSignal.flowWarmingTier === 'leader' ? 1 : 0;
-    if (bLeader !== aLeader) return bLeader - aLeader;
-    const aMax = Math.max(a.sparkSignal.longScore, a.sparkSignal.shortScore);
-    const bMax = Math.max(b.sparkSignal.longScore, b.sparkSignal.shortScore);
-    if (bMax !== aMax) return bMax - aMax;
-    const aSpecific = a.sparkSignal.relativeFlow === 'coinSpecific' ? 1 : 0;
-    const bSpecific = b.sparkSignal.relativeFlow === 'coinSpecific' ? 1 : 0;
-    if (bSpecific !== aSpecific) return bSpecific - aSpecific;
-    const aOi = Math.abs(a.sparkSignal.oiDelta15m || 0), bOi = Math.abs(b.sparkSignal.oiDelta15m || 0);
-    if (bOi !== aOi) return bOi - aOi;
-    const aVol = a.sparkSignal.volRatio || 0, bVol = b.sparkSignal.volRatio || 0;
-    if (bVol !== aVol) return bVol - aVol;
-    return Math.abs(a.sparkSignal.chg1h || 0) - Math.abs(b.sparkSignal.chg1h || 0);
-  });
+  // try/catch тук, НЕ само в горния цикъл - ако сортирането или renderCard()
+  // хвърлят грешка, без тази защита екранът би останал завинаги на
+  // "СКАНИРАНЕ..." (виж discussion-а "табовете замръзват").
+  try {
+    // Точка 11 от предложението - сортиране: 1) най-висок SPARK score, 2) IDEA 07
+    // COIN-SPECIFIC напред (виж calcRelativeFlow) - "монетата се събужда сама" е
+    // по-интересно от "цял пазар/BTC се движи заедно", 3) най-силно OI ускорение,
+    // 4) най-силно обемно ускорение, 5) най-малко Price Extension.
+    results.sort((a, b) => {
+      // IDEA 05 - "FLOW WARMING" - "leader" tier е приоритет ПРЕД самия SPARK
+      // score: точно тази комбинация (виж calcFlowWarmingScore) е сигналът,
+      // който трябва да изпъкне НАЙ-ОТГОРЕ, дори ако все още няма достатъчно
+      // "меки" точки за висок sparkTier - целта е да се хване РАНО, не след
+      // като вече е събрала точки другаде.
+      const aLeader = a.sparkSignal.flowWarmingTier === 'leader' ? 1 : 0;
+      const bLeader = b.sparkSignal.flowWarmingTier === 'leader' ? 1 : 0;
+      if (bLeader !== aLeader) return bLeader - aLeader;
+      const aMax = Math.max(a.sparkSignal.longScore, a.sparkSignal.shortScore);
+      const bMax = Math.max(b.sparkSignal.longScore, b.sparkSignal.shortScore);
+      if (bMax !== aMax) return bMax - aMax;
+      const aSpecific = a.sparkSignal.relativeFlow === 'coinSpecific' ? 1 : 0;
+      const bSpecific = b.sparkSignal.relativeFlow === 'coinSpecific' ? 1 : 0;
+      if (bSpecific !== aSpecific) return bSpecific - aSpecific;
+      const aOi = Math.abs(a.sparkSignal.oiDelta15m || 0), bOi = Math.abs(b.sparkSignal.oiDelta15m || 0);
+      if (bOi !== aOi) return bOi - aOi;
+      const aVol = a.sparkSignal.volRatio || 0, bVol = b.sparkSignal.volRatio || 0;
+      if (bVol !== aVol) return bVol - aVol;
+      return Math.abs(a.sparkSignal.chg1h || 0) - Math.abs(b.sparkSignal.chg1h || 0);
+    });
 
-  const longCount = results.filter(c => c.sparkSignal.longScore >= c.sparkSignal.shortScore).length;
-  const shortCount = results.length - longCount;
-  const html = results.map((c,i) => renderCard(c,i)).join('');
-  content.innerHTML = `<div style="padding:8px 14px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);">🚀 ${results.length} SPARK КАНДИДАТА · LONG: ${longCount} / SHORT: ${shortCount}</div><div class="coins-list">${html}</div>`;
-  loadWalls();
+    const longCount = results.filter(c => c.sparkSignal.longScore >= c.sparkSignal.shortScore).length;
+    const shortCount = results.length - longCount;
+    const html = results.map((c,i) => renderCard(c,i)).join('');
+    content.innerHTML = `<div style="padding:8px 14px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--orange);">🚀 ${results.length} SPARK КАНДИДАТА · LONG: ${longCount} / SHORT: ${shortCount}</div><div class="coins-list">${html}</div>`;
+    loadWalls();
+  } catch (e) {
+    content.innerHTML = `<div class="error-msg">ГРЕШКА ПРИ ПОКАЗВАНЕ НА РЕЗУЛТАТИТЕ<br>${e.message}</div>`;
+  }
 }
 
 const BASE_SYMBOLS = [
@@ -1213,7 +1257,7 @@ async function fetchKlines(symbol, interval, limit, maxAgeMs = 3600000) {
   const key = `${symbol}_${interval}_${limit}`;
   if (klineCache[key] && klineCache[key].ts > Date.now() - maxAgeMs) return klineCache[key].data;
   try {
-    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+    const r = await fetchT(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
     const data = await r.json(); klineCache[key] = {data, ts: Date.now()}; return data;
   } catch(e) { return []; }
 }
@@ -1224,7 +1268,7 @@ async function fetchKlines(symbol, interval, limit, maxAgeMs = 3600000) {
 async function fetchBtcAth() {
   if (btcAthCache.value && btcAthCache.ts > Date.now() - 3600000) return btcAthCache.value;
   try {
-    const r = await fetch('https://api.coingecko.com/api/v3/coins/bitcoin?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false');
+    const r = await fetchT('https://api.coingecko.com/api/v3/coins/bitcoin?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false');
     const d = await r.json();
     const ath = d?.market_data?.ath?.usd;
     if (ath && ath > 0) { btcAthCache = { value: ath, ts: Date.now() }; return ath; }
@@ -1299,26 +1343,26 @@ async function fetchCoinKlineData(symbol) {
 }
 
 async function fetchTrending() {
-  try { const r = await fetch('https://api.coingecko.com/api/v3/search/trending'); const d = await r.json(); return d.coins.map(c => c.item.symbol.toUpperCase()); } catch(e) { return []; }
+  try { const r = await fetchT('https://api.coingecko.com/api/v3/search/trending'); const d = await r.json(); return d.coins.map(c => c.item.symbol.toUpperCase()); } catch(e) { return []; }
 }
 
 async function fetchTopGainers() {
   try {
-    const r = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr'); const data = await r.json();
+    const r = await fetchT('https://fapi.binance.com/fapi/v1/ticker/24hr'); const data = await r.json();
     return data.filter(t => t.symbol.endsWith('USDT') && parseFloat(t.priceChangePercent) > 5 && parseFloat(t.quoteVolume) > 5000000).sort((a,b) => parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent)).slice(0,15).map(t => t.symbol);
   } catch(e) { return []; }
 }
 
 async function fetchTopOI() {
   try {
-    const r = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr'); const data = await r.json();
+    const r = await fetchT('https://fapi.binance.com/fapi/v1/ticker/24hr'); const data = await r.json();
     return data.filter(t => t.symbol.endsWith('USDT') && parseFloat(t.quoteVolume) > 100000000).sort((a,b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume)).slice(0,10).map(t => t.symbol);
   } catch(e) { return []; }
 }
 
 async function fetchOIDelta(symbol) {
   try {
-    const r = await fetch(`https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=15m&limit=2`);
+    const r = await fetchT(`https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=15m&limit=2`);
     const data = await r.json();
     if (!Array.isArray(data) || data.length < 2) return 0;
     const prev = parseFloat(data[0].sumOpenInterestValue); const curr = parseFloat(data[1].sumOpenInterestValue);
@@ -1577,7 +1621,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     tags.push(`<span class="tag" style="background:${mgDir==='long'?'rgba(0,200,160,0.25)':'rgba(220,100,60,0.25)'};color:${mgDir==='long'?'#4ee8c0':'#f0946a'}">${migrationLabel} ${mgDir==='long'?'▲':'▼'} (${coin.sparkSignal.migrationMaxScore}/4)</span>`);
   }
   if (coin.sparkSignal?.extended) tags.push(`<span class="tag" style="background:rgba(180,140,0,0.2);color:var(--yellow)">⚠️ LATE/EXTENDED - DO NOT CHASE</span>`);
-  const detectorBanner = isBottom ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>` : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding.toFixed(3)}% · L/S>${coin.longPct.toFixed(0)}% · OI↓</div>` : '';
+  const detectorBanner = isBottom ? `<div class="detector-banner bottom">🟢 ДЪНО ДЕТЕКТОР · OI↑ · Funding неутрален · Oversold</div>` : isTop ? `<div class="detector-banner top">🔴 ВРЪХ ДЕТЕКТОР · Funding>${coin.funding!=null?coin.funding.toFixed(3):'--'}% · L/S>${coin.longPct!=null?coin.longPct.toFixed(0):'--'}% · OI↓</div>` : '';
   let setupBanner = '';
   if (setup.label) {
     const ptClass = setup.grade==='setup' ? (setup.side==='long'?'on-l':'on-s') : 'on-w';
@@ -1682,7 +1726,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
       </div>
       <div class="coin-right">
         <div class="coin-price">$${formatPrice(coin.price)}</div>
-        <div class="coin-chg ${coin.chg24>=0?'pos':'neg'}">${coin.chg24>=0?'+':''}${coin.chg24.toFixed(2)}%</div>
+        <div class="coin-chg ${coin.chg24>=0?'pos':'neg'}">${coin.chg24>=0?'+':''}${coin.chg24!=null?coin.chg24.toFixed(2):'--'}%</div>
       </div>
     </div>
     ${athBarHtml}
@@ -1690,7 +1734,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
       <div class="metric"><div class="metric-label">OI</div><div class="metric-value" style="color:var(--accent)">$${formatNum(coin.oi)}</div></div>
       <div class="metric"><div class="metric-label">OI Δ 15M</div><div class="metric-value">${formatOIDelta(coin.oiDelta)}</div></div>
       <div class="metric"><div class="metric-label">VOL 24H</div><div class="metric-value" style="color:${coin.volSpike?'var(--purple)':'var(--text)'}">$${formatNum(coin.vol24)}</div></div>
-      <div class="metric"><div class="metric-label">FUNDING</div><div class="metric-value" style="color:${fColor}">${fSign}${coin.funding.toFixed(4)}%</div></div>
+      <div class="metric"><div class="metric-label">FUNDING</div><div class="metric-value" style="color:${fColor}">${fSign}${coin.funding!=null?coin.funding.toFixed(4):'--'}%</div></div>
     </div>
     <div class="card-metrics2">
       <div class="metric2"><div class="metric2-label">VOL 1H</div><div class="metric2-value vol1h-val" style="color:var(--text2)">${coin.vol1h?'$'+formatNum(coin.vol1h):'...'}</div></div>
@@ -1701,7 +1745,7 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     <div class="ls-section">
       <div class="ls-row">
         <div class="ls-label">LONG / SHORT</div>
-        <div class="ls-values"><span class="pos">${coin.longPct.toFixed(1)}%</span><span style="color:var(--border)">|</span><span class="neg">${coin.shortPct.toFixed(1)}%</span></div>
+        <div class="ls-values"><span class="pos">${coin.longPct!=null?coin.longPct.toFixed(1):'--'}%</span><span style="color:var(--border)">|</span><span class="neg">${coin.shortPct!=null?coin.shortPct.toFixed(1):'--'}%</span></div>
       </div>
       <div class="ls-bar-wrap"><div class="ls-bar-fill" style="width:${coin.longPct}%"></div></div>
     </div>
