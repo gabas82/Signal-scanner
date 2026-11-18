@@ -274,6 +274,7 @@
     <div class="btc-macro-item"><div class="btc-macro-label">MAYER</div><div class="btc-macro-value" id="btc-mayer" style="color:var(--text2)">--</div><div class="btc-macro-sub">Цена/200DMA</div></div>
     <div class="btc-macro-item"><div class="btc-macro-label">RSI 90D</div><div class="btc-macro-value" id="btc-rsi90" style="color:var(--text2)">--</div><div class="btc-macro-sub" id="btc-rsi-sub">--</div></div>
   </div>
+  <div id="btc-cross-projection" style="display:none;padding:6px 2px 0;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2);border-top:1px solid var(--border);margin-top:6px;"></div>
 </div>
 <div class="btc-macro" id="alt-radar-panel">
   <div class="btc-macro-header">
@@ -1304,7 +1305,38 @@ async function loadBTCMacro() {
     if (mayer) { mayerEl.textContent = mayer.toFixed(2); mayerEl.style.color = mayer > 2.4 ? 'var(--red)' : mayer < 1 ? 'var(--green)' : 'var(--yellow)'; }
     const rsiEl = document.getElementById('btc-rsi90');
     if (rsi90) { rsiEl.textContent = rsi90.toFixed(0); rsiEl.style.color = rsi90 > 70 ? 'var(--red)' : rsi90 < 35 ? 'var(--green)' : 'var(--yellow)'; document.getElementById('btc-rsi-sub').textContent = rsi90 > 70 ? 'ПРЕГРЯЛО' : rsi90 < 35 ? 'OVERSOLD' : 'НЕУТРАЛЕН'; }
+    await loadBTCCrossProjection(closes);
   } catch(e) { console.error('BTC Macro error:', e); }
+}
+
+// MA CROSS ПРОЕКЦИЯ (виж projectMACrossDate в signal-logic.js) - дневната
+// прогноза реизползва вече изтеглените 200 дневни свещи (closes, подадени
+// отгоре), седмичната тегли СВОИ 200 седмични свещи (нов fetch, кеширан като
+// останалите през fetchKlines). Собствена try/catch обвивка + отделна от
+// loadBTCMacro-то UI елемент - грешка тук никога не бива да скрие
+// ATH/Mayer/RSI показателите, които вече работят.
+function formatCrossProjectionLine(label, projection, stepUnit) {
+  if (!projection) return `${label}: няма пресичане в прогнозния хоризонт`;
+  const ms = stepUnit === 'week' ? projection.stepsAhead * 7 * 86400000 : projection.stepsAhead * 86400000;
+  const date = new Date(Date.now() + ms);
+  const icon = projection.direction === 'death' ? '💀' : '🟡';
+  const name = projection.direction === 'death' ? 'Death Cross' : 'Golden Cross';
+  return `${icon} ${label} ${name}: ~${date.toLocaleDateString('bg')}`;
+}
+async function loadBTCCrossProjection(dailyCloses) {
+  const el = document.getElementById('btc-cross-projection');
+  try {
+    const dailyProjection = projectMACrossDate(dailyCloses, 50, 200, 400);
+    const weeklyKlines = await fetchKlines('BTCUSDT', '1w', 200);
+    const weeklyCloses = (weeklyKlines || []).map(k => parseFloat(k[4]));
+    const weeklyProjection = projectMACrossDate(weeklyCloses, 50, 200, 200);
+    if (!dailyProjection && !weeklyProjection) { el.style.display = 'none'; return; }
+    const lines = [];
+    if (dailyProjection) lines.push(formatCrossProjectionLine('Дневна (50/200DMA)', dailyProjection, 'day'));
+    if (weeklyProjection) lines.push(formatCrossProjectionLine('Седмична (50/200WMA)', weeklyProjection, 'week'));
+    el.innerHTML = `📅 ПРОЕКЦИЯ ПРИ НЕПРОМЕНЕНА ЦЕНА<br>${lines.join('<br>')}`;
+    el.style.display = '';
+  } catch (e) { el.style.display = 'none'; }
 }
 
 function updateSeasonBadge(dma50, dma200, mayer, rsi90, athPct) {

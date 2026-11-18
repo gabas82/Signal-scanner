@@ -51,6 +51,57 @@ function calcSMA(closes, period) {
   return closes.slice(-period).reduce((a,b) => a+b, 0) / period;
 }
 
+// ═══ MA CROSS ПРОЕКЦИЯ ПРИ ПОСТОЯННА ЦЕНА ══════════════════════════════════
+// (виж discussion-а "Death Cross проекция" - идея, взета от Telegram пост с
+// дневна+седмична SMA50/SMA200 прогноза). ЧИСТО математическа екстраполация
+// на вече познатата SMA формула, при предположение че цената "замръзва" на
+// последното реално затваряне - НЕ е прогноза за цената, само за това какво
+// би станало на самите индикатори, ако движение изобщо няма.
+
+// Разширява реалната история с `extraSteps` копия на последното затваряне -
+// основата, върху която се симулира всяка бъдеща стъпка.
+function buildProjectedSeries(closes, extraSteps) {
+  const lastClose = closes[closes.length - 1];
+  return closes.concat(Array(extraSteps).fill(lastClose));
+}
+
+// SMA в даден индекс на вече разширен series (не самия calcSMA, защото той
+// винаги гледа последните N елемента на целия масив - тук ни трябва SMA В
+// КОНКРЕТЕН минал/бъдещ момент, не само "последните N").
+function smaAt(series, endIndexInclusive, period) {
+  if (endIndexInclusive - period + 1 < 0) return null;
+  let sum = 0;
+  for (let i = endIndexInclusive - period + 1; i <= endIndexInclusive; i++) sum += series[i];
+  return sum / period;
+}
+
+// Симулира напред (ден по ден / седмица по седмица, според гранулярността на
+// `closes`) докато SMA(shortPeriod) пресече SMA(longPeriod) - при
+// предположение за постоянна бъдеща цена. Връща
+// {stepsAhead, direction:'golden'|'death', fromState} при намерено
+// пресичане в рамките на `maxStepsAhead`, иначе null (недостатъчно история,
+// текущите SMA вече са точно равни - двусмислено, или няма пресичане в
+// прозореца).
+function projectMACrossDate(closes, shortPeriod, longPeriod, maxStepsAhead) {
+  if (!Array.isArray(closes) || closes.length < longPeriod) return null;
+  const series = buildProjectedSeries(closes, maxStepsAhead);
+  const baseIndex = closes.length - 1;
+  const shortNow = smaAt(series, baseIndex, shortPeriod);
+  const longNow = smaAt(series, baseIndex, longPeriod);
+  if (shortNow == null || longNow == null) return null;
+  const startState = shortNow > longNow ? 'golden' : (shortNow < longNow ? 'death' : 'flat');
+  if (startState === 'flat') return null;
+  const direction = startState === 'golden' ? 'death' : 'golden';
+  for (let k = 1; k <= maxStepsAhead; k++) {
+    const idx = baseIndex + k;
+    const s = smaAt(series, idx, shortPeriod);
+    const l = smaAt(series, idx, longPeriod);
+    const state = s > l ? 'golden' : (s < l ? 'death' : 'flat');
+    if (state !== startState) return { stepsAhead: k, direction, fromState: startState };
+  }
+  return null;
+}
+
 function calcStdDev(closes, period) {
   if (closes.length < period) return null;
   const slice = closes.slice(-period);
@@ -1609,6 +1660,7 @@ if (typeof module !== 'undefined' && module.exports) {
     DCA_LEVERAGE, DCA_ENTRY, MAJOR_COINS, SEMI_MAJOR_COINS,
     MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
     SYMBOL_MAP, fixSymbol, calcSMA, calcStdDev, calcRSI, detectBottom, detectTop,
+    buildProjectedSeries, smaAt, projectMACrossDate,
     calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
     calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcBaseDivergenceStrength, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
     calcBlowoffSignal, calcDistributionSignal, calcDumpSqueezeSignal, calcShiftDownSignal,
