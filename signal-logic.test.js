@@ -13,7 +13,7 @@ import {
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
   DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras, isScanNowTab, carryForwardKlineExtras,
-  isDeepAthDropCandidate
+  isDeepAthDropCandidate, buildProjectedSeries, smaAt, projectMACrossDate
 } from './signal-logic.js';
 
 function baseCoin(overrides = {}) {
@@ -33,6 +33,45 @@ describe('calcSMA', () => {
   });
   it('изчислява проста средна за последните N стойности', () => {
     expect(calcSMA([1, 2, 3, 4, 5], 3)).toBeCloseTo(4); // (3+4+5)/3
+  });
+});
+
+describe('buildProjectedSeries / smaAt', () => {
+  it('buildProjectedSeries добавя N копия на последното затваряне', () => {
+    expect(buildProjectedSeries([1, 2, 3], 2)).toEqual([1, 2, 3, 3, 3]);
+  });
+  it('smaAt връща null, ако прозорецът излиза извън началото на масива', () => {
+    expect(smaAt([1, 2, 3], 1, 5)).toBeNull();
+  });
+  it('smaAt смята SMA в конкретен индекс, не непременно последния', () => {
+    expect(smaAt([1, 2, 3, 4, 5], 2, 3)).toBeCloseTo(2); // (1+2+3)/3, индекс 2 вкл.
+  });
+});
+
+describe('projectMACrossDate', () => {
+  it('недостатъчно история (под longPeriod) -> null', () => {
+    expect(projectMACrossDate([1, 2, 3], 2, 5, 10)).toBeNull();
+  });
+  it('текущите SMA вече са точно равни (flat) -> null, без извод', () => {
+    expect(projectMACrossDate([50, 50, 50, 50], 2, 4, 10)).toBeNull();
+  });
+  it('намира Death Cross при постоянна бъдеща цена (golden -> death)', () => {
+    // SMA2 сега = 100, SMA4 сега = 55 -> golden. При замръзнала цена 100,
+    // SMA4 стига точно 100 (= SMA2) след 2 стъпки -> death cross на k=2.
+    const closes = [10, 10, 10, 10, 100, 100];
+    expect(projectMACrossDate(closes, 2, 4, 5)).toEqual({ stepsAhead: 2, direction: 'death', fromState: 'golden' });
+  });
+  it('намира Golden Cross при постоянна бъдеща цена (death -> golden, огледално)', () => {
+    const closes = [100, 100, 100, 100, 10, 10];
+    expect(projectMACrossDate(closes, 2, 4, 5)).toEqual({ stepsAhead: 2, direction: 'golden', fromState: 'death' });
+  });
+  it('без пресичане в рамките на maxStepsAhead -> null', () => {
+    const closes = [10, 10, 10, 10, 100, 100];
+    expect(projectMACrossDate(closes, 2, 4, 1)).toBeNull(); // пресичането е на k=2, прозорецът спира на k=1
+  });
+  it('невалиден вход (не масив) -> null, без грешка', () => {
+    expect(() => projectMACrossDate(null, 2, 4, 10)).not.toThrow();
+    expect(projectMACrossDate(undefined, 2, 4, 10)).toBeNull();
   });
 });
 
