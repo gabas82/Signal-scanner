@@ -1749,6 +1749,13 @@ function openDCAView() {
 }
 
 function renderList() {
+  // Единна защита тук, вместо да разчитаме на всяко повикване "отстрани"
+  // (search, loadWalls, бъдещ код) да помни да проверява isSpecialTab() само
+  // то - виж коментара при isSpecialTab() по-горе ("SPARK липсваше точно
+  // оттук"). handleSearch() беше точно такова забравено място - input
+  // събитие в полето за търсене (ред над таб-реда) презаписваше SPARK
+  // резултатите с празния "няма монети" екран без никаква проверка.
+  if (isSpecialTab()) return;
   const content = document.getElementById('main-content');
   let filtered = allCoins;
   if (searchQuery.length > 0) { filtered = allCoins.filter(c => c.symbol.includes(searchQuery)); }
