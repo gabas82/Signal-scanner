@@ -2635,6 +2635,41 @@ function pctExcursionToAtrRatio(pct, entryPrice, atr) {
   return priceDelta / atr;
 }
 
+// ═══ SIGNAL TAG OUTCOME TRACKER (наблюдателен, Етап 1, 2026-11-19) ══════════
+// Отговаря на конкретния въпрос от discussion-а "FLUSH+DUMP SQUEEZE
+// едновременно - две фази на едно движение, или просто противоречиви
+// сигнали": за всеки ГЕНУИННО нов (newFired, виж wiring-а в
+// scanSymbolSignals) сигнал от TAG_OUTCOME_TRACKED_TYPES по-долу, записва
+// pending outcome запис (5/15/30/60/240м хоризонти + MFE/MAE) - СЪЩИЯТ,
+// вече доказан механизъм като ENTRY ENGINE телеметрията по-горе
+// (buildPendingOutcomeHorizons/resolvePendingOutcomeHorizons/updateExcursion),
+// само приложен към "суровите" market-signal тагове вместо към SETUP/ARMED/
+// ENTRY епизодите. Изцяло observability - НЕ participва в longScore/
+// shortScore/WhatsApp съобщението, никога не блокира нищо съществуващо.
+// Нарочно само шепа типове (не всичките 20+ тага), за да остане KV обемът
+// малък, докато не докажем реалната диагностична стойност - виж списъка на
+// явно обсъдените припокривания (FLUSH/BLOWOFF/SQUEEZE/DUMP SQUEEZE) плюс
+// MM/MM x25/IMPULSE+ATR (вторият, по-малко спешен случай от discussion-а).
+const TAG_OUTCOME_TRACKED_TYPES = new Set(['flush', 'blowoff', 'squeeze', 'dumpSqueeze', 'mm', 'mmX25', 'impulseAtr']);
+// concurrentTypes - ВСИЧКИ останали newFired типове (от произволен тип, не
+// само от TAG_OUTCOME_TRACKED_TYPES) в СЪЩИЯ тик за тази монета, независимо
+// от посока - именно тук се вижда дали FLUSH и DUMP SQUEEZE реално се
+// задействат едновременно на практика (виж buildTagCoFireCounts по-долу),
+// а не само теоретично от условията им.
+function buildTagOutcomeRecord({ symbol, type, direction, at, price, concurrentTypes }) {
+  return {
+    symbol, type, direction, at: at ?? Date.now(), entryPrice: price ?? null,
+    concurrentTypes: concurrentTypes ?? [],
+    outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome240m: null,
+    mfe5m: null, mae5m: null, mfe5mAtr: null, mae5mAtr: null,
+    mfe15m: null, mae15m: null, mfe15mAtr: null, mae15mAtr: null,
+    mfe30m: null, mae30m: null, mfe30mAtr: null, mae30mAtr: null,
+    mfe60m: null, mae60m: null, mfe60mAtr: null, mae60mAtr: null,
+    mfe240m: null, mae240m: null, mfe240mAtr: null, mae240mAtr: null,
+    timeToMfeMin: null, timeToMaeMin: null, maeBeforeMfePct: null, mfeBeforeMaePct: null,
+  };
+}
+
 // ═══ PR #105 - TC LIFECYCLE TELEMETRY (diagnostic-only) ═══════════════════════
 // Отговаря на въпроса "КЪДЕ се губят TC сигналите между SETUP -> ARMED ->
 // ENTRY?" (виж discussion-а за BTC 05:40/05:45 повторно ARMED). Само
@@ -2889,6 +2924,54 @@ function buildFieldHorizonBreakdown(records, keyFn) {
     for (const m of OUTCOME_HORIZONS_MIN) out[k][`m${m}`] = buildOutcomeStatsForField(groups[k], `outcome${m}m`);
   }
   return out;
+}
+
+// SIGNAL TAG OUTCOME TRACKER - диагностични агрегатори (виж
+// buildTagOutcomeRecord по-горе). tagTypeKey/tagSoloKey реюзват
+// buildFieldHorizonBreakdown директно (без нова аритметика) - keyFn-овете
+// са единствената разлика спрямо ENTRY SCORE DECOMPOSITION по-горе.
+function tagTypeKey(r) { return r.type ?? null; }
+function tagSoloKey(r) { return (r.concurrentTypes && r.concurrentTypes.length) ? 'coFired' : 'solo'; }
+// За всеки тип - отделна solo/coFired разбивка (виж discussion-а: "FLUSH сам
+// срещу FLUSH+DUMP SQUEEZE заедно - реално различен forward outcome ли
+// имат"). Филтрираме, после пак пускаме buildFieldHorizonBreakdown с keyFn,
+// който връща константа - реюзва СЪЩАТА count/avgOutcomePct/winRatePct
+// аритметика, не дублира ръчно броене.
+function buildTagOutcomeTypeSoloBreakdown(records) {
+  const types = [...new Set(records.map(r => r.type).filter(Boolean))];
+  const out = {};
+  for (const t of types) {
+    const forType = records.filter(r => r.type === t);
+    out[t] = {
+      solo: buildFieldHorizonBreakdown(forType.filter(r => tagSoloKey(r) === 'solo'), () => 'all').all
+        ?? { m5: { count: 0, avgOutcomePct: null, winRatePct: null }, m15: { count: 0, avgOutcomePct: null, winRatePct: null }, m30: { count: 0, avgOutcomePct: null, winRatePct: null }, m60: { count: 0, avgOutcomePct: null, winRatePct: null }, m240: { count: 0, avgOutcomePct: null, winRatePct: null } },
+      coFired: buildFieldHorizonBreakdown(forType.filter(r => tagSoloKey(r) === 'coFired'), () => 'all').all
+        ?? { m5: { count: 0, avgOutcomePct: null, winRatePct: null }, m15: { count: 0, avgOutcomePct: null, winRatePct: null }, m30: { count: 0, avgOutcomePct: null, winRatePct: null }, m60: { count: 0, avgOutcomePct: null, winRatePct: null }, m240: { count: 0, avgOutcomePct: null, winRatePct: null } },
+    };
+  }
+  return out;
+}
+// Чиста честотна таблица "type+concurrentType -> колко пъти реално се е
+// случило заедно" - отговаря директно на "теоретично се припокриват, но
+// колко често реално" без да чакаме достатъчно outcome данни за статистика.
+function buildTagCoFireCounts(records) {
+  const counts = {};
+  for (const r of records) {
+    if (!r.concurrentTypes || !r.concurrentTypes.length) continue;
+    for (const other of r.concurrentTypes) {
+      const key = `${r.type}+${other}`;
+      counts[key] = (counts[key] || 0) + 1;
+    }
+  }
+  return counts;
+}
+function buildTagOutcomeSummary(records) {
+  return {
+    byType: buildFieldHorizonBreakdown(records, tagTypeKey),
+    bySolo: buildFieldHorizonBreakdown(records, tagSoloKey),
+    byTypeSolo: buildTagOutcomeTypeSoloBreakdown(records),
+    coFireCounts: buildTagCoFireCounts(records),
+  };
 }
 // Едно "разрезно гнездо" (direction/entryScore/setupBreakdown/confirmation15m/
 // htfAligned), всяко по m5/15/30/60 - реюзвано и за "overall", и за bySetupMode
@@ -5716,6 +5799,26 @@ async function scanSymbolSignals(env, symbol) {
   const { support, resistance } = calcSupportResistance(c1h, 20);
   const confidence = computeDirectionConfidence(longScore, shortScore);
 
+  // SIGNAL TAG OUTCOME TRACKER - пише нов pending запис за всеки ГЕНУИННО нов
+  // (newFired) сигнал от TAG_OUTCOME_TRACKED_TYPES (виж коментара при
+  // buildTagOutcomeRecord по-горе). Reuse-ва вече изчисления `price`/`now` -
+  // БЕЗ нова мрежова заявка. concurrentTypes хваща ВСИЧКИ останали newFired
+  // типове в тоя тик (не само tracked), за да видим реалната co-fire честота.
+  if (env.ALERT_STATE && price != null) {
+    const trackedNewFired = newFired.filter(sig => TAG_OUTCOME_TRACKED_TYPES.has(sig.type));
+    if (trackedNewFired.length) {
+      if (!state.pendingTagOutcomes) state.pendingTagOutcomes = [];
+      const allNewTypes = newFired.map(sig => sig.type);
+      for (const sig of trackedNewFired) {
+        const concurrentTypes = allNewTypes.filter(t => t !== sig.type);
+        const record = buildTagOutcomeRecord({ symbol, type: sig.type, direction: sig.direction, at: now, price, concurrentTypes });
+        const tagOutcomeKey = `tagoutcome:${symbol}:${record.at}:${sig.type}`;
+        await env.ALERT_STATE.put(tagOutcomeKey, JSON.stringify(record));
+        state.pendingTagOutcomes.push({ key: tagOutcomeKey, horizons: buildPendingOutcomeHorizons(record.at), entryPrice: price, direction: sig.direction, entryAt: record.at });
+      }
+    }
+  }
+
   // ---- PHASE CYCLE ENGINE (виж дефинициите на константите/функциите по-горе,
   // непосредствено след fetchFundingWorker) - реюзва вече изчислените в тази
   // функция detektori (warmTier/warming/bigVol4h/early/buildUpConfirmLong-Short/
@@ -6529,6 +6632,28 @@ async function scanSymbolSignals(env, symbol) {
       if (!allResolved) stillPending.push(p);
     }
     state.pendingOutcomes = stillPending;
+  }
+
+  // SIGNAL TAG OUTCOME TRACKER - довършва чакащите tag-outcome записи,
+  // огледално на pendingOutcomes резолюцията точно по-горе (виж
+  // buildTagOutcomeRecord по-горе за контекста).
+  if (state.pendingTagOutcomes && state.pendingTagOutcomes.length && env.ALERT_STATE) {
+    const stillPendingTags = [];
+    const lastClosed5mForTagExcursion = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+    for (const p of state.pendingTagOutcomes) {
+      updateExcursion(p, lastClosed5mForTagExcursion);
+      const { updates, allResolved } = resolvePendingOutcomeHorizons(p, price);
+      if (Object.keys(updates).length) {
+        const raw = await env.ALERT_STATE.get(p.key);
+        if (raw) {
+          const rec = JSON.parse(raw);
+          Object.assign(rec, updates);
+          await env.ALERT_STATE.put(p.key, JSON.stringify(rec));
+        }
+      }
+      if (!allResolved) stillPendingTags.push(p);
+    }
+    state.pendingTagOutcomes = stillPendingTags;
   }
 
   await saveSymbolState(env, symbol, state);
@@ -8566,6 +8691,10 @@ export {
   handleCmeGapEvent, buildCmeGapAlertMessage,
   CME_GAP_KV_PREFIX, CME_GAP_EVENT_KV_PREFIX, cmeGapOpenKey, cmeGapEventKey,
   processCmeGapWebhook,
+  // SIGNAL TAG OUTCOME TRACKER (Step 1, observational) - изложени само за
+  // unit тестове.
+  TAG_OUTCOME_TRACKED_TYPES, buildTagOutcomeRecord, tagTypeKey, tagSoloKey,
+  buildTagOutcomeTypeSoloBreakdown, buildTagCoFireCounts, buildTagOutcomeSummary,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
@@ -8911,6 +9040,30 @@ export default {
         open: Object.fromEntries(openEntries),
         closedCount: records.length,
         closed: records.slice(0, limit),
+      });
+    }
+    // SIGNAL TAG OUTCOME TRACKER diagnostics - read-only, token-gated като
+    // /cme-gap-diagnostics. Показва записите от buildTagOutcomeRecord
+    // (tagoutcome: KV prefix) + агрегирания buildTagOutcomeSummary (виж
+    // discussion-а "FLUSH/DUMP SQUEEZE - две фази или противоречие").
+    // Опционален ?type= филтър (напр. flush) за по-малки отговори.
+    if (path === "/tag-outcome-diagnostics" && request.method === "GET") {
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+      if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
+      if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
+      const typeParam = (url.searchParams.get("type") || "").trim();
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "2000", 10) || 2000, 5000);
+      const listResult = await env.ALERT_STATE.list({ prefix: "tagoutcome:" });
+      let records = (await Promise.all(listResult.keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
+      if (typeParam) records = records.filter(r => r.type === typeParam);
+      records.sort((a, b) => (b.at || 0) - (a.at || 0));
+      return json({
+        count: records.length,
+        truncated: records.length > limit,
+        summary: buildTagOutcomeSummary(records),
+        records: records.slice(0, limit),
       });
     }
     // PUBLIC GRAVITY (виж buildLiqGravityPublicSnapshot по-горе) - ЕДИНСТВЕНИЯТ
