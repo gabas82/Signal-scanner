@@ -15,7 +15,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import {
-  calcLiqVeto, calcFlowVeto, calcFlowBoost, calcEntryTrigger, buildTelemetryRecord,
+  calcLiqVeto, calcLiqVetoDetail, calcFlowVeto, calcFlowBoost, calcEntryTrigger, buildTelemetryRecord,
 } from './worker/worker.js';
 
 const workerSrc = fs.readFileSync('./worker/worker.js', 'utf8');
@@ -54,6 +54,44 @@ describe('(A) calcLiqVeto - CASCADE + GRAVITY, никога от липсващ�
   });
   it('нищо не е против -> няма veto', () => {
     expect(calcLiqVeto({ direction: 'long', cascade: neutral, hasData: true, gravityDirection: 'long', gravityTier: 'watch' })).toBe(false);
+  });
+});
+
+// (A2) СМЕКЧАВАНЕ (12ч LIQ доклад предложение #1, 2026-11-19) - calcLiqVetoDetail
+// (не голият calcLiqVeto) - само TREND_CONTINUATION + GRAVITY против в
+// по-слабия 'watch' tier (БЕЗ cascadeAgainst) минава (veto:false, softened:true).
+// CASCADE остава твърд veto винаги. GRAVITY 'confirmed' tier остава твърд veto.
+// MEAN REVERSION (или setupMode изобщо неподаден) - непроменено поведение.
+describe('(A2) calcLiqVetoDetail - СМЕКЧАВАНЕ за TREND_CONTINUATION + GRAVITY watch', () => {
+  const neutral = { bullish: false, bearish: false };
+  const bearish = { bullish: false, bearish: true };
+
+  it("trend_continuation + GRAVITY против в 'watch' tier, БЕЗ cascade -> veto:false, softened:true", () => {
+    const r = calcLiqVetoDetail({ direction: 'long', cascade: neutral, hasData: true, gravityDirection: 'short', gravityTier: 'watch', setupMode: 'trend_continuation' });
+    expect(r).toEqual({ veto: false, softened: true });
+  });
+  it("trend_continuation + GRAVITY против в 'confirmed' tier -> остава ТВЪРД veto (само watch се смекчава)", () => {
+    const r = calcLiqVetoDetail({ direction: 'long', cascade: neutral, hasData: true, gravityDirection: 'short', gravityTier: 'confirmed', setupMode: 'trend_continuation' });
+    expect(r).toEqual({ veto: true, softened: false });
+  });
+  it('trend_continuation + CASCADE против (hasData=true) + GRAVITY watch против -> остава ТВЪРД veto (cascade печели)', () => {
+    const r = calcLiqVetoDetail({ direction: 'long', cascade: bearish, hasData: true, gravityDirection: 'short', gravityTier: 'watch', setupMode: 'trend_continuation' });
+    expect(r).toEqual({ veto: true, softened: false });
+  });
+  it("mean_reversion + GRAVITY против в 'watch' tier -> НЕ се смекчава (доклад предложение #2 - запазено непроменено)", () => {
+    const r = calcLiqVetoDetail({ direction: 'long', cascade: neutral, hasData: true, gravityDirection: 'short', gravityTier: 'watch', setupMode: 'mean_reversion' });
+    expect(r).toEqual({ veto: true, softened: false });
+  });
+  it('setupMode неподаден (стари call-сайтове) -> твърд veto, никаква промяна в поведението', () => {
+    const r = calcLiqVetoDetail({ direction: 'long', cascade: neutral, hasData: true, gravityDirection: 'short', gravityTier: 'watch' });
+    expect(r).toEqual({ veto: true, softened: false });
+  });
+  it('trend_continuation + GRAVITY watch, НО посоката съвпада (не е against) -> veto:false, softened:false (няма какво да се смекчава)', () => {
+    const r = calcLiqVetoDetail({ direction: 'long', cascade: neutral, hasData: true, gravityDirection: 'long', gravityTier: 'watch', setupMode: 'trend_continuation' });
+    expect(r).toEqual({ veto: false, softened: false });
+  });
+  it('calcLiqVeto (голият boolean wrapper) връща точно .veto от calcLiqVetoDetail - включително в softened случая', () => {
+    expect(calcLiqVeto({ direction: 'long', cascade: neutral, hasData: true, gravityDirection: 'short', gravityTier: 'watch', setupMode: 'trend_continuation' })).toBe(false);
   });
 });
 
@@ -103,12 +141,33 @@ describe('(C) buildTelemetryRecord - vetoSource поле', () => {
       expect(buildTelemetryRecord({ ...baseArgs, vetoSource: v }).vetoSource).toBe(v);
     }
   });
+  it('liqSoftVetoed неподадено -> default false (не undefined/null)', () => {
+    expect(buildTelemetryRecord(baseArgs).liqSoftVetoed).toBe(false);
+  });
+  it("liqSoftVetoed:true -> entryQualityTier принудително 'D' (score непроменен) - доклад предложение #1, 'понижаване на confidence вместо твърд veto'", () => {
+    const tcArgs = {
+      symbol: 'BTCUSDT', direction: 'long', decision: 'confirmed', setupScore: 3, setupBreakdown: {},
+      armedAt: Date.now(), structRef: 90, triggerClose: 90.2, atr5m: 1, triggerRange: 1,
+      confirmation15m: null, flowState: 'neutral', setupMode: 'trend_continuation', htfAligned: null,
+    };
+    const normal = buildTelemetryRecord(tcArgs);
+    expect(normal.entryQualityTier).toBe('B'); // sanity - без liqSoftVetoed, нормален tier (не D)
+    expect(normal.liqSoftVetoed).toBe(false);
+    const softened = buildTelemetryRecord({ ...tcArgs, liqSoftVetoed: true });
+    expect(softened.entryQualityTier).toBe('D');
+    expect(softened.entryQualityScore).toBe(normal.entryQualityScore);
+    expect(softened.liqSoftVetoed).toBe(true);
+  });
 });
 
 describe('(D) Структурна проверка на wiring-а в РЕАЛНИЯ source (MR + TC ENTRY TRIGGER)', () => {
-  it('и двата ENTRY TRIGGER call-сайта (MR, TC) изчисляват liqVeto гейтнато зад liqLiveEnabled', () => {
+  it('MR call-сайтът изчислява liqVeto през голия calcLiqVeto (непроменено - доклад предложение #2)', () => {
     const matches = workerSrc.match(/const liqVeto = liqLiveEnabled\s*\n\s*\? calcLiqVeto\(\{[^}]+\}\)\s*\n\s*: false;/g) || [];
-    expect(matches).toHaveLength(2); // MR + TC
+    expect(matches).toHaveLength(1); // само MR вече - TC мина на calcLiqVetoDetail
+  });
+  it('TC call-сайтът изчислява liqVetoDetail през calcLiqVetoDetail със setupMode: trend_continuation (доклад предложение #1 - смекчаване)', () => {
+    const matches = workerSrc.match(/const liqVetoDetail = liqLiveEnabled\s*\n\s*\? calcLiqVetoDetail\(\{[^}]*setupMode: 'trend_continuation'[^}]*\}\)\s*\n\s*: \{ veto: false, softened: false \};/g) || [];
+    expect(matches).toHaveLength(1);
   });
   it('и двата calcEntryTrigger извиквания подават liqVeto параметъра', () => {
     const matches = [...workerSrc.matchAll(/structRef, flowVeto, flowBoost, htfAligned, liqVeto,/g)];
@@ -117,5 +176,17 @@ describe('(D) Структурна проверка на wiring-а в РЕАЛН
   it('и двата buildTelemetryRecord извиквания подават vetoSource от съответния entryResult/trendEntryResult', () => {
     expect(workerSrc).toContain('vetoSource: entryResult.vetoSource,');
     expect(workerSrc).toContain('vetoSource: trendEntryResult.vetoSource,');
+  });
+  it('TC buildTelemetryRecord подава liqSoftVetoed от liqVetoDetail.softened (MR НЕ го подава - никога не се смекчава)', () => {
+    expect(workerSrc).toContain('liqSoftVetoed: liqVetoDetail.softened,');
+  });
+  it("LIQ_SOFTENED лог съществува, с отделен needle от LIQ_VETO/LIQ_CONFIRM (без споделен префикс - за да не обърка 12ч анализа)", () => {
+    expect(workerSrc).toContain('LIQ_SOFTENED trend_continuation');
+    expect(workerSrc).not.toContain('LIQ_VETO_SOFTENED');
+    expect(workerSrc).not.toContain('LIQ_CONFIRM_SOFTENED');
+  });
+  it('LIQ_VETO и LIQ_CONFIRM логовете (MR + TC, доклад предложение #3) включват gravityDistancePct/cascadeBuyUsd/cascadeSellUsd - 4 реда общо', () => {
+    const matches = [...workerSrc.matchAll(/gravityDistancePct=\$\{liqGravityScore\.distancePct[^}]*\}.*cascadeBuyUsd=.*cascadeSellUsd=/g)];
+    expect(matches).toHaveLength(4); // MR veto, MR confirm, TC veto, TC confirm
   });
 });
