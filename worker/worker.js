@@ -2521,7 +2521,7 @@ function buildTelemetryRecord({
   timeFromArmMin, pctMoveFromArm, atrMoveFromArm, setupAt,
   targetScore, targetTier, targetDirection,
   reArmCount, triggerSource, structuralReferenceAtArm, structRefUnchanged,
-  liqConfirm, vetoSource,
+  liqConfirm, vetoSource, liqSoftVetoed,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
   const chaseDistanceAtrRatio = (atr5m > 0 && chaseDistance != null) ? chaseDistance / atr5m : null;
@@ -2568,6 +2568,11 @@ function buildTelemetryRecord({
     // Разграничава кой veto източник реално е спрял входа - за бъдещ анализ
     // на ефективността на новия Binance-базиран filter.
     vetoSource: vetoSource ?? null,
+    // LIQ VETO СМЕКЧАВАНЕ (виж calcLiqVetoDetail по-горе) - true само когато
+    // ENTRY-то е преминало ИМЕННО защото GRAVITY/watch veto-то е било
+    // смекчено (не е хард veto инак) - за бъдещ анализ дали смекчаването
+    // реално помага (сравнение срещу старото поведение чрез LIQ_SOFTENED лог).
+    liqSoftVetoed: liqSoftVetoed === true,
     outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome240m: null, // попълват се по-късно от resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals
     // PR #103 PATH DIAGNOSTICS (MFE/MAE) - попълват се по-късно от
     // updateExcursion/resolvePendingOutcomeHorizons, огледално на outcome{X}m.
@@ -2585,7 +2590,11 @@ function buildTelemetryRecord({
     // производно от вече изчислените по-горе chaseDistanceAtrRatio/htfAligned/
     // confirmation15m/setupMode. null само ако setupMode не е разпознат.
     entryQualityScore: entryQuality ? entryQuality.score : null,
-    entryQualityTier: entryQuality ? entryQuality.tier : null,
+    // liqSoftVetoed -> принудително 'D' (огледално на PR #119 D-tier WhatsApp
+    // suppression по-долу) - "понижаване на confidence вместо твърд veto",
+    // точно формулировката от доклада - сигналът влиза и се проследява
+    // (telemetry/pending outcomes), но не стига до WhatsApp като силен сигнал.
+    entryQualityTier: liqSoftVetoed === true ? 'D' : (entryQuality ? entryQuality.tier : null),
     // PR #105 - TC LIFECYCLE TELEMETRY (виж buildTcArmedResetRecord по-долу) -
     // само за TREND CONTINUATION call site-а (MR никога не ги подава, остават
     // null) - ARMED -> ENTRY EVALUATION latency/move контекст.
@@ -4775,10 +4784,25 @@ function buildLiqConfirmLine(liqLiveEnabled, cascade, hasData, direction) {
 //       Gravity профилът е дълготраен accumulated state (не еднотиков), затова
 //       НЕ се гейтва от текущия тик-ов hasData - собственият му hasHardFactor
 //       праг (OI/CVD потвърждение) вече е калибрацията за надеждност.
-function calcLiqVeto({ direction, cascade, hasData, gravityDirection, gravityTier }) {
+// СМЕКЧАВАНЕ (12ч LIQ доклад предложение #1, 2026-11-19 - одобрено от
+// потребителя съзнателно въпреки малка извадка, n=14, вместо препоръчителното
+// изчакване на 2-3 дни повече данни - виж discussion-а): извадката показа, че
+// при TREND_CONTINUATION, GRAVITY против В ПО-СЛАБИЯ 'watch' tier, 10/14
+// блокирани шортове реално биха печелили на 30m (ср. MFE +0.64% срещу MAE
+// -0.37%) - пазарът продължава в посоката на тренда въпреки "магнита".
+// CASCADE остава ТВЪРД veto ВИНАГИ (15мин форсиран поток - текущо събитие,
+// не статичен клъстер). GRAVITY в по-силния 'confirmed' tier остава ТВЪРД
+// veto - смекчава се само най-слабият tier. MEAN REVERSION НЕ се пипа
+// (доклад предложение #2 - "запази както е", там VETO работи отлично: 0/8
+// блокирани сделки биха печелили).
+function calcLiqVetoDetail({ direction, cascade, hasData, gravityDirection, gravityTier, setupMode }) {
   const cascadeAgainst = hasData === true && liqConfirmStatus(cascade, hasData, direction) === 'against';
   const gravityAgainst = gravityTier !== 'none' && gravityDirection != null && gravityDirection !== direction;
-  return cascadeAgainst || gravityAgainst;
+  const softened = setupMode === 'trend_continuation' && !cascadeAgainst && gravityAgainst && gravityTier === 'watch';
+  return { veto: cascadeAgainst || (gravityAgainst && !softened), softened };
+}
+function calcLiqVeto(args) {
+  return calcLiqVetoDetail(args).veto;
 }
 
 function liqDiagUsdBin(usd) {
@@ -6187,15 +6211,17 @@ async function scanSymbolSignals(env, symbol) {
       // console.log при liqVeto, видимо на живо в Cloudflare Observability →
       // Logs, НЕЗАВИСИМО от KV telemetry записа по-горе (не го заменя, не
       // променя decision/score логиката).
+      // gravityDistancePct/cascadeBuyUsd/cascadeSellUsd - доклад предложение #3
+      // (2026-11-19) - виж огледалния коментар в TREND CONTINUATION блока по-долу.
       if (decision === 'veto' && record.vetoSource !== 'flow') {
-        console.log(`LIQ_VETO mean_reversion ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null}`);
+        console.log(`LIQ_VETO mean_reversion ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)}`);
       }
       // OBSERVABILITY-ONLY, огледално на LIQ_VETO по-горе - за CONFIRMED записи
       // С налични LIQ данни (liqConfirm != 'no_data'), за да могат VETO и
       // CONFIRMED сигналите да се сравняват обективно в анализа. Записи БЕЗ
       // LIQ данни (null/'no_data') НЕ логват тук - разграничени са нарочно.
       if (decision === 'confirmed' && record.liqConfirm != null && record.liqConfirm !== 'no_data') {
-        console.log(`LIQ_CONFIRM mean_reversion ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null}`);
+        console.log(`LIQ_CONFIRM mean_reversion ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)}`);
       }
       entryResult.entryQualityScore = record.entryQualityScore;
       entryResult.entryQualityTier = record.entryQualityTier;
@@ -6350,9 +6376,12 @@ async function scanSymbolSignals(env, symbol) {
     const flowVeto = calcFlowVeto({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
     const flowBoost = calcFlowBoost({ direction: entryDirection, flowWarmingDirection, flowWarmingTier, trapDirection, trapTier });
     const htfAligned = entryDirection === 'long' ? (trend4h.bull || emaFilter.bull) : (trend4h.bear || emaFilter.bear);
-    const liqVeto = liqLiveEnabled
-      ? calcLiqVeto({ direction: entryDirection, cascade: liquidationCascade, hasData: liquidationHasData, gravityDirection: liqGravityDirection, gravityTier: liqGravityTier })
-      : false;
+    // calcLiqVetoDetail (не голият calcLiqVeto) - само тук (TC), за да вземем
+    // softened флага за смекчаването (виж коментара при calcLiqVetoDetail).
+    const liqVetoDetail = liqLiveEnabled
+      ? calcLiqVetoDetail({ direction: entryDirection, cascade: liquidationCascade, hasData: liquidationHasData, gravityDirection: liqGravityDirection, gravityTier: liqGravityTier, setupMode: 'trend_continuation' })
+      : { veto: false, softened: false };
+    const liqVeto = liqVetoDetail.veto;
     const lastClosed5mCandle = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
     trendEntryResult = calcEntryTrigger({
       direction: entryDirection,
@@ -6403,15 +6432,29 @@ async function scanSymbolSignals(env, symbol) {
         targetScore: targetScore.score, targetTier, targetDirection: targetScore.direction,
         liqConfirm: liqLiveEnabled ? liqConfirmStatus(liquidationCascade, liquidationHasData, entryDirection) : null,
         vetoSource: trendEntryResult.vetoSource,
+        liqSoftVetoed: liqVetoDetail.softened,
       });
       // OBSERVABILITY-ONLY (наблюдателен период, Binance Liquidation Etap 3) -
-      // виж огледалния коментар в MEAN REVERSION блока по-горе.
+      // виж огледалния коментар в MEAN REVERSION блока по-горе. gravityDistancePct/
+      // cascadeBuyUsd/cascadeSellUsd - доклад предложение #3 (2026-11-19) - числови
+      // стойности за бъдещ анализ на реалния праг, при който confirm=confirm
+      // реално подобрява резултата (виж calcLiqVetoDetail за gravityDistancePct
+      // контекста, calcLiquidationCascade за buySumUsd/sellSumUsd).
       if (decision === 'veto' && record.vetoSource !== 'flow') {
-        console.log(`LIQ_VETO trend_continuation ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null}`);
+        console.log(`LIQ_VETO trend_continuation ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)}`);
       }
       // OBSERVABILITY-ONLY - виж огледалния коментар в MEAN REVERSION блока по-горе.
       if (decision === 'confirmed' && record.liqConfirm != null && record.liqConfirm !== 'no_data') {
-        console.log(`LIQ_CONFIRM trend_continuation ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null}`);
+        console.log(`LIQ_CONFIRM trend_continuation ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)}`);
+      }
+      // LIQ_SOFTENED - доклад предложение #1 (2026-11-19) - отделен needle от
+      // LIQ_VETO/LIQ_CONFIRM нарочно (не споделя префикс с нито едно от двете),
+      // за да не се обърка бъдещият 12ч анализ - маркира ИМЕННО случаите, в
+      // които ENTRY е преминал само защото GRAVITY/watch veto-то е било
+      // смекчено (виж calcLiqVetoDetail) - за да можем да сравним дали
+      // смекчаването реално помага.
+      if (decision === 'confirmed' && liqVetoDetail.softened) {
+        console.log(`LIQ_SOFTENED trend_continuation ${symbol} ${entryDirection} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null}`);
       }
       trendEntryResult.entryQualityScore = record.entryQualityScore;
       trendEntryResult.entryQualityTier = record.entryQualityTier;
@@ -8494,7 +8537,7 @@ export {
   fetchLiquidationOrdersRelayDiag, getLiqDiagSource, fetchLiquidationOrdersShadow,
   // BINANCE LIQUIDATION LIVE - изложени само за unit тестове.
   isLiqLiveEnabled, fetchLiquidationOrdersLive, liqConfirmStatus, LIQ_CONFIRM_LABELS,
-  buildLiqConfirmLine, calcLiqVeto,
+  buildLiqConfirmLine, calcLiqVeto, calcLiqVetoDetail,
   // ENTRY ENGINE core - изложени само за unit тестове (виж calcLiqVeto wiring-а).
   calcFlowVeto, calcFlowBoost, calcEntryTrigger,
   // CAPITULATION ALERT (FLUSH/BASE hysteresis + претоварна защита) - изложени
