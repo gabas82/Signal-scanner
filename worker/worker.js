@@ -2973,6 +2973,161 @@ function buildTagOutcomeSummary(records) {
     coFireCounts: buildTagCoFireCounts(records),
   };
 }
+
+// ═══ TREND BALANCE OBSERVATION TRACKER (наблюдателен, Етап 2, 2026-11-20) ═══
+// Отговаря на discussion-а "EVAA - POC сочи SHORT, но трендът сочи LONG":
+// ⚖️ ТРЕНД БАЛАНС/🎯 TREND TARGET/📊 ИСТОРИЧЕСКИ POC (signal-logic.js,
+// signal-scanner.html) се изчисляват ИЗЦЯЛО на клиента (goldenCross изисква
+// 200+ дни история, momentum изисква 24ч тикер данни - Worker-ът НЕ тегли
+// нищо от двете за всеки сканиран символ). Вместо да дублираме тази логика
+// сървърно (Вариант А, отхвърлен - виж discussion-а), клиентът докладва
+// ГОТОВ снимък САМО при реална промяна (виж shouldRecordTrendObservation в
+// signal-logic.js - не всеки тик), а Worker-ът само записва + резолвира
+// резултати, реюзвайки СЪЩИЯ доказан механизъм като SIGNAL TAG OUTCOME
+// TRACKER по-горе (buildPendingOutcomeHorizons/resolvePendingOutcomeHorizons/
+// updateExcursion). Изцяло observability - НЕ пипа ENTRY/VETO/longScore/
+// shortScore/ТРЕНД БАЛАНС клиентската формула никъде.
+// direction тук е ОБЩАТА посока на наблюдението (longSharePct>=50 -> 'long'),
+// не отделна за trendTarget/historicalPoc - затова hit detection-ът по-долу
+// пази СОБСТВЕНА direction за всяка от двете цели (могат да сочат различни
+// посоки, виж точно EVAA случая).
+function buildTrendObservationRecord({
+  symbol, price, at, direction,
+  goldenCross, ls, ss, crossPct, momentumPct, magnetPct, longSharePct,
+  magnetAboveCount, magnetBelowCount,
+  magnetNearestAboveDistancePct, magnetNearestAboveStrengthPct,
+  magnetNearestBelowDistancePct, magnetNearestBelowStrengthPct,
+  trendTargetPrice, trendTargetTier, trendTargetDirection, trendTargetDistancePct,
+  historicalPocPrice, historicalPocTier, historicalPocDirection, historicalPocDistancePct,
+}) {
+  return {
+    symbol, at: at ?? Date.now(), entryPrice: price ?? null, direction: direction ?? null,
+    goldenCross: goldenCross ?? null, ls: ls ?? null, ss: ss ?? null,
+    crossPct: crossPct ?? null, momentumPct: momentumPct ?? null, magnetPct: magnetPct ?? null,
+    longSharePct: longSharePct ?? null,
+    // "няма магнит над цената" (magnetAboveCount:0) и "силен магнит под
+    // цената" (magnetBelowCount>0, висок strengthPct) НЕ са едно и също,
+    // въпреки че и двете дърпат magnetPct надолу - виж discussion-а.
+    magnetAboveCount: magnetAboveCount ?? 0, magnetBelowCount: magnetBelowCount ?? 0,
+    magnetNearestAboveDistancePct: magnetNearestAboveDistancePct ?? null,
+    magnetNearestAboveStrengthPct: magnetNearestAboveStrengthPct ?? null,
+    magnetNearestBelowDistancePct: magnetNearestBelowDistancePct ?? null,
+    magnetNearestBelowStrengthPct: magnetNearestBelowStrengthPct ?? null,
+    trendTargetPrice: trendTargetPrice ?? null, trendTargetTier: trendTargetTier ?? null,
+    trendTargetDirection: trendTargetDirection ?? null, trendTargetDistancePct: trendTargetDistancePct ?? null,
+    historicalPocPrice: historicalPocPrice ?? null, historicalPocTier: historicalPocTier ?? null,
+    historicalPocDirection: historicalPocDirection ?? null, historicalPocDistancePct: historicalPocDistancePct ?? null,
+    outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome240m: null,
+    mfe5m: null, mae5m: null, mfe5mAtr: null, mae5mAtr: null,
+    mfe15m: null, mae15m: null, mfe15mAtr: null, mae15mAtr: null,
+    mfe30m: null, mae30m: null, mfe30mAtr: null, mae30mAtr: null,
+    mfe60m: null, mae60m: null, mfe60mAtr: null, mae60mAtr: null,
+    mfe240m: null, mae240m: null, mfe240mAtr: null, mae240mAtr: null,
+    timeToMfeMin: null, timeToMaeMin: null, maeBeforeMfePct: null, mfeBeforeMaePct: null,
+    // "Удари ли се" целта (виж resolveTargetHits по-долу) - ОТДЕЛНО от
+    // outcome%-овете на фиксираните хоризонти, защото "достигане на точно
+    // ниво" и "% движение след X минути" отговарят на различни въпроси.
+    trendTargetHit: false, trendTargetHitAt: null,
+    historicalPocHit: false, historicalPocHitAt: null,
+  };
+}
+
+// Проверява дали ценово ниво (свещ high/low) е "ударило" дадена цел -
+// direction-aware: LONG цел се удря отгоре (candle.high >= targetPrice),
+// SHORT - отдолу (candle.low <= targetPrice). Мутира pending.*Hit/*HitAt НА
+// МЯСТО (огледално на updateExcursion по-горе) - веднъж ударена, остава
+// ударена (idempotent, никога не се "отударя").
+function resolveTargetHits(pending, candle, now = Date.now()) {
+  if (!candle || candle.high == null || candle.low == null) return;
+  if (!pending.trendTargetHit && pending.trendTargetPrice != null && pending.trendTargetDirection) {
+    const hit = pending.trendTargetDirection === 'long' ? candle.high >= pending.trendTargetPrice : candle.low <= pending.trendTargetPrice;
+    if (hit) { pending.trendTargetHit = true; pending.trendTargetHitAt = now; }
+  }
+  if (!pending.historicalPocHit && pending.historicalPocPrice != null && pending.historicalPocDirection) {
+    const hit = pending.historicalPocDirection === 'long' ? candle.high >= pending.historicalPocPrice : candle.low <= pending.historicalPocPrice;
+    if (hit) { pending.historicalPocHit = true; pending.historicalPocHitAt = now; }
+  }
+}
+
+// Валидира тялото на /trend-observation POST-а (виж endpoint-а в fetch()
+// handler-а по-долу) - ЕДИНСТВЕНАТА защита срещу невалидни/malформирани
+// данни, тъй като endpoint-ът нарочно НЯМА таен token (публичен клиентски
+// JS не може да го скрие - виж CoinGlass/football прецедента). Символният
+// формат (не WATCHLIST exact-match) - скенерът покрива динамична вселена от
+// монети (топ по обем), не фиксиран списък.
+const TREND_OBS_SYMBOL_RE = /^[A-Z0-9]{2,20}USDT$/;
+const TREND_OBS_VALID_TIERS = new Set(['none', 'watch', 'strong']);
+function isValidTrendObservationPayload(p) {
+  if (!p || typeof p !== 'object') return false;
+  if (typeof p.symbol !== 'string' || !TREND_OBS_SYMBOL_RE.test(p.symbol)) return false;
+  if (!(typeof p.price === 'number' && p.price > 0 && Number.isFinite(p.price))) return false;
+  if (!(typeof p.longSharePct === 'number' && p.longSharePct >= 0 && p.longSharePct <= 100)) return false;
+  if (p.goldenCross !== true && p.goldenCross !== false && p.goldenCross !== null) return false;
+  if (typeof p.ls !== 'number' || typeof p.ss !== 'number' || p.ls < 0 || p.ss < 0) return false;
+  if (p.trendTargetTier != null && !TREND_OBS_VALID_TIERS.has(p.trendTargetTier)) return false;
+  if (p.historicalPocTier != null && !TREND_OBS_VALID_TIERS.has(p.historicalPocTier)) return false;
+  if (p.trendTargetPrice != null && !(typeof p.trendTargetPrice === 'number' && p.trendTargetPrice > 0)) return false;
+  if (p.historicalPocPrice != null && !(typeof p.historicalPocPrice === 'number' && p.historicalPocPrice > 0)) return false;
+  if (p.trendTargetDirection != null && p.trendTargetDirection !== 'long' && p.trendTargetDirection !== 'short') return false;
+  if (p.historicalPocDirection != null && p.historicalPocDirection !== 'long' && p.historicalPocDirection !== 'short') return false;
+  return true;
+}
+
+// Лек rate limit (без нова платена услуга - само KV, вече ползван навсякъде
+// в проекта) - per-IP брояч в 1-минутен "bucket" ключ, TTL 120s (достатъчно
+// за expiry дори при леко закъснял следващ request). Fail-OPEN при липсваща
+// инфраструктура/IP - никога не блокираме легитимно наблюдение заради това.
+const TREND_OBS_RATE_LIMIT_PER_MIN = 20;
+async function checkTrendObservationRateLimit(env, ip) {
+  if (!env.ALERT_STATE || !ip) return true;
+  const bucket = Math.floor(Date.now() / 60000);
+  const key = `trendobsrate:${ip}:${bucket}`;
+  const raw = await env.ALERT_STATE.get(key);
+  const count = raw ? parseInt(raw, 10) : 0;
+  if (count >= TREND_OBS_RATE_LIMIT_PER_MIN) return false;
+  await env.ALERT_STATE.put(key, String(count + 1), { expirationTtl: 120 });
+  return true;
+}
+
+// Дедупликация per-символ (защита в дълбочина ОТВЪД клиентския debounce в
+// shouldRecordTrendObservation - виж signal-logic.js) - не толкова строга,
+// колкото клиентския 5-минутен праг, колкото просто "не по-често от"
+// граница, в случай че клиентската логика бъде заобиколена/сгрешена.
+const TREND_OBS_DEDUP_MS = 4 * 60 * 1000;
+async function isTrendObservationDuplicate(env, symbol, now = Date.now()) {
+  if (!env.ALERT_STATE) return false;
+  const raw = await env.ALERT_STATE.get(`trendobslast:${symbol}`);
+  if (!raw) return false;
+  const lastAt = parseInt(raw, 10);
+  return Number.isFinite(lastAt) && (now - lastAt) < TREND_OBS_DEDUP_MS;
+}
+
+// Диагностични агрегатори (виж /trend-observation-diagnostics по-долу) -
+// пряко отговарят на обсъдените аналитични въпроси: "удари ли се
+// Trend Target/Historical POC", "по-добре ли се представя тренда, когато
+// има (срещу няма) HVN магнит в посоката му".
+function trendObsHasTrendTargetKey(r) { return (r.trendTargetTier && r.trendTargetTier !== 'none') ? 'withTrendTarget' : 'noTrendTarget'; }
+function trendObsMagnetAboveKey(r) { return (r.magnetAboveCount || 0) > 0 ? 'hasMagnetAbove' : 'noMagnetAbove'; }
+function buildTrendObservationHitStats(records, priceField, hitField, hitAtField) {
+  const withTarget = records.filter(r => r[priceField] != null);
+  const hits = withTarget.filter(r => r[hitField] === true);
+  const hitTimes = hits.map(r => (r[hitAtField] - r.at) / 60000).filter(v => Number.isFinite(v));
+  return {
+    count: withTarget.length,
+    hitCount: hits.length,
+    hitRatePct: withTarget.length ? (hits.length / withTarget.length) * 100 : null,
+    avgTimeToHitMin: hitTimes.length ? hitTimes.reduce((a, b) => a + b, 0) / hitTimes.length : null,
+  };
+}
+function buildTrendObservationSummary(records) {
+  return {
+    overall: buildFieldHorizonBreakdown(records, () => 'all'),
+    byTrendTargetPresence: buildFieldHorizonBreakdown(records, trendObsHasTrendTargetKey),
+    byMagnetAbovePresence: buildFieldHorizonBreakdown(records, trendObsMagnetAboveKey),
+    trendTargetHitStats: buildTrendObservationHitStats(records, 'trendTargetPrice', 'trendTargetHit', 'trendTargetHitAt'),
+    historicalPocHitStats: buildTrendObservationHitStats(records, 'historicalPocPrice', 'historicalPocHit', 'historicalPocHitAt'),
+  };
+}
 // Едно "разрезно гнездо" (direction/entryScore/setupBreakdown/confirmation15m/
 // htfAligned), всяко по m5/15/30/60 - реюзвано и за "overall", и за bySetupMode
 // по-долу (виж заявката: "Ефектът еднакъв ли е при TC и MR?").
@@ -6656,6 +6811,33 @@ async function scanSymbolSignals(env, symbol) {
     state.pendingTagOutcomes = stillPendingTags;
   }
 
+  // TREND BALANCE OBSERVATION TRACKER - довършва чакащите наблюдения,
+  // записани от /trend-observation POST-а (виж buildTrendObservationRecord
+  // по-горе) - огледално на pendingTagOutcomes резолюцията точно по-горе,
+  // плюс resolveTargetHits за "удари ли се Trend Target/Historical POC".
+  if (state.pendingTrendObservations && state.pendingTrendObservations.length && env.ALERT_STATE) {
+    const stillPendingTrendObs = [];
+    const lastClosed5mForTrendObs = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+    for (const p of state.pendingTrendObservations) {
+      updateExcursion(p, lastClosed5mForTrendObs);
+      const wasTrendTargetHit = p.trendTargetHit, wasHistoricalPocHit = p.historicalPocHit;
+      resolveTargetHits(p, lastClosed5mForTrendObs);
+      const { updates, allResolved } = resolvePendingOutcomeHorizons(p, price);
+      if (!wasTrendTargetHit && p.trendTargetHit) { updates.trendTargetHit = true; updates.trendTargetHitAt = p.trendTargetHitAt; }
+      if (!wasHistoricalPocHit && p.historicalPocHit) { updates.historicalPocHit = true; updates.historicalPocHitAt = p.historicalPocHitAt; }
+      if (Object.keys(updates).length) {
+        const raw = await env.ALERT_STATE.get(p.key);
+        if (raw) {
+          const rec = JSON.parse(raw);
+          Object.assign(rec, updates);
+          await env.ALERT_STATE.put(p.key, JSON.stringify(rec));
+        }
+      }
+      if (!allResolved) stillPendingTrendObs.push(p);
+    }
+    state.pendingTrendObservations = stillPendingTrendObs;
+  }
+
   await saveSymbolState(env, symbol, state);
 
   return {
@@ -8695,6 +8877,13 @@ export {
   // unit тестове.
   TAG_OUTCOME_TRACKED_TYPES, buildTagOutcomeRecord, tagTypeKey, tagSoloKey,
   buildTagOutcomeTypeSoloBreakdown, buildTagCoFireCounts, buildTagOutcomeSummary,
+  // TREND BALANCE OBSERVATION TRACKER (Etап 2, observational) - изложени
+  // само за unit тестове.
+  buildTrendObservationRecord, resolveTargetHits, isValidTrendObservationPayload,
+  checkTrendObservationRateLimit, isTrendObservationDuplicate,
+  trendObsHasTrendTargetKey, trendObsMagnetAboveKey, buildTrendObservationHitStats,
+  buildTrendObservationSummary, TREND_OBS_SYMBOL_RE, TREND_OBS_VALID_TIERS,
+  TREND_OBS_RATE_LIMIT_PER_MIN, TREND_OBS_DEDUP_MS,
 };
 
 // Transport mitigation (виж discussion-а "Provider rate-limit root-cause
@@ -9063,6 +9252,60 @@ export default {
         count: records.length,
         truncated: records.length > limit,
         summary: buildTagOutcomeSummary(records),
+        records: records.slice(0, limit),
+      });
+    }
+    // TREND BALANCE OBSERVATION TRACKER - записващ endpoint (виж
+    // buildTrendObservationRecord по-горе, discussion-а "EVAA"). Нарочно БЕЗ
+    // таен token (публичен клиентски JS не може да го скрие - виж CoinGlass/
+    // football прецедента по-горе) - защитата е валидация+rate limit+dedup.
+    // Грешка тук НЕ трябва да пипа основното сканиране никога - изцяло
+    // самостоятелен handler, извикван само от signal-scanner.html, никога от
+    // scanSymbolSignals/scheduled().
+    if (path === "/trend-observation" && request.method === "POST") {
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+      if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
+      let payload;
+      try { payload = await request.json(); } catch (e) { return json({ error: "Invalid JSON" }, 400); }
+      if (!isValidTrendObservationPayload(payload)) return json({ error: "Invalid payload" }, 400);
+      const ip = request.headers.get("CF-Connecting-IP") || "";
+      const rateOk = await checkTrendObservationRateLimit(env, ip);
+      if (!rateOk) return json({ error: "Rate limit exceeded" }, 429);
+      const now = Date.now();
+      if (await isTrendObservationDuplicate(env, payload.symbol, now)) return json({ ok: true, deduped: true });
+      const direction = payload.longSharePct >= 50 ? 'long' : 'short';
+      const record = buildTrendObservationRecord({ ...payload, at: now, direction });
+      const key = `trendobs:${payload.symbol}:${now}`;
+      await env.ALERT_STATE.put(key, JSON.stringify(record));
+      await env.ALERT_STATE.put(`trendobslast:${payload.symbol}`, String(now), { expirationTtl: 86400 });
+      const state = await loadSymbolState(env, payload.symbol);
+      if (!state.pendingTrendObservations) state.pendingTrendObservations = [];
+      state.pendingTrendObservations.push({
+        key, horizons: buildPendingOutcomeHorizons(now), entryPrice: payload.price, direction, entryAt: now,
+        trendTargetPrice: payload.trendTargetPrice ?? null, trendTargetDirection: payload.trendTargetDirection ?? null,
+        historicalPocPrice: payload.historicalPocPrice ?? null, historicalPocDirection: payload.historicalPocDirection ?? null,
+        trendTargetHit: false, trendTargetHitAt: null, historicalPocHit: false, historicalPocHitAt: null,
+      });
+      await saveSymbolState(env, payload.symbol, state);
+      return json({ ok: true });
+    }
+    // TREND BALANCE OBSERVATION TRACKER diagnostics - read-only, token-gated
+    // като /tag-outcome-diagnostics. summary смята СЕ от пълния (непресят)
+    // набор записи, дори когато ?limit= връща по-малка извадка от records.
+    if (path === "/trend-observation-diagnostics" && request.method === "GET") {
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+      if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
+      if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "500", 10) || 500, 2000);
+      const listResult = await env.ALERT_STATE.list({ prefix: "trendobs:" });
+      const records = (await Promise.all(listResult.keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
+      records.sort((a, b) => (b.at || 0) - (a.at || 0));
+      return json({
+        count: records.length,
+        truncated: records.length > limit,
+        summary: buildTrendObservationSummary(records),
         records: records.slice(0, limit),
       });
     }

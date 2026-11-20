@@ -14,7 +14,7 @@ import {
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
   DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras, isScanNowTab, carryForwardKlineExtras,
   isDeepAthDropCandidate, buildProjectedSeries, smaAt, projectMACrossDate, findLastMACross,
-  getTrendDirection, findNearestHvnInDirection, calcMagnetBalance, calcTrendBalance
+  getTrendDirection, findNearestHvnInDirection, calcMagnetBalance, calcTrendBalance, shouldRecordTrendObservation
 } from './signal-logic.js';
 
 function baseCoin(overrides = {}) {
@@ -153,9 +153,22 @@ describe('calcMagnetBalance', () => {
     const result = calcMagnetBalance(100, hvnList, 100);
     expect(result.longSharePct).toBeCloseTo((10 / 13) * 100, 1);
   });
-  it('без данни -> 50/50 неутрално', () => {
-    expect(calcMagnetBalance(100, [], 100)).toEqual({ longSharePct: 50, shortSharePct: 50 });
-    expect(calcMagnetBalance(null, [{ price: 110, volume: 1 }], 100)).toEqual({ longSharePct: 50, shortSharePct: 50 });
+  it('без данни -> 50/50 неутрално, нулеви брояч/липсващи nearest полета', () => {
+    expect(calcMagnetBalance(100, [], 100)).toEqual({ longSharePct: 50, shortSharePct: 50, aboveCount: 0, belowCount: 0, nearestAbove: null, nearestBelow: null });
+    expect(calcMagnetBalance(null, [{ price: 110, volume: 1 }], 100)).toEqual({ longSharePct: 50, shortSharePct: 50, aboveCount: 0, belowCount: 0, nearestAbove: null, nearestBelow: null });
+  });
+  it('различава "няма магнит над цената" от "силен магнит под цената" (Etап 2 discussion-а) - и двете водят до нисък longSharePct, но aboveCount/belowCount ги разграничават', () => {
+    const result = calcMagnetBalance(100, [{ price: 80, volume: 20 }], 100);
+    expect(result.aboveCount).toBe(0);
+    expect(result.belowCount).toBe(1);
+    expect(result.nearestAbove).toBeNull();
+    expect(result.nearestBelow).toMatchObject({ distancePct: 20 });
+  });
+  it('nearestAbove/nearestBelow сочат НАЙ-БЛИЗКИЯ магнит от всяка страна, не произволен', () => {
+    const hvnList = [{ price: 110, volume: 5 }, { price: 103, volume: 5 }, { price: 90, volume: 5 }, { price: 95, volume: 5 }];
+    const result = calcMagnetBalance(100, hvnList, 100);
+    expect(result.nearestAbove.distancePct).toBeCloseTo(3, 1);
+    expect(result.nearestBelow.distancePct).toBeCloseTo(5, 1);
   });
 });
 
@@ -179,6 +192,56 @@ describe('calcTrendBalance', () => {
   it('липсващи данни навсякъде -> 50/50', () => {
     const result = calcTrendBalance({ goldenCross: null, ls: 0, ss: 0, price: null, hvnList: [], profileTotalVolume: 0 });
     expect(result.longSharePct).toBe(50);
+  });
+  it('пренася magnetAboveCount/belowCount/nearest полетата от calcMagnetBalance (Etап 2 телеметрия)', () => {
+    const hvnList = [{ price: 103, volume: 10 }];
+    const result = calcTrendBalance({ goldenCross: true, ls: 1, ss: 1, price: 100, hvnList, profileTotalVolume: 100 });
+    expect(result.magnetAboveCount).toBe(1);
+    expect(result.magnetBelowCount).toBe(0);
+    expect(result.magnetNearestAbove).toMatchObject({ distancePct: 3 });
+    expect(result.magnetNearestBelow).toBeNull();
+  });
+});
+
+// shouldRecordTrendObservation (Etап 2 телеметрия, discussion-а "EVAA"
+// уточнение 1) - решава КОГА клиентът праща наблюдение към Worker-а.
+describe('shouldRecordTrendObservation', () => {
+  const base = { at: 1000000, longSharePct: 50, magnetAboveCount: 1, magnetBelowCount: 1 };
+  it('няма current -> false', () => {
+    expect(shouldRecordTrendObservation(base, null)).toBe(false);
+  });
+  it('няма last (първо наблюдение) -> true', () => {
+    expect(shouldRecordTrendObservation(null, { ...base, at: 2000000 })).toBe(true);
+  });
+  it('в рамките на MIN_INTERVAL_MS от последния запис -> false, дори при реална промяна', () => {
+    const now = base.at + 60000; // 1 минута по-късно, под 5-минутния праг
+    const current = { ...base, longSharePct: 90 };
+    expect(shouldRecordTrendObservation(base, current, now)).toBe(false);
+  });
+  it('съществена промяна на баланса (>=10 пункта) след прага -> true', () => {
+    const now = base.at + 6 * 60000;
+    const current = { ...base, longSharePct: 61 };
+    expect(shouldRecordTrendObservation(base, current, now)).toBe(true);
+  });
+  it('малка промяна на баланса (под прага) след интервала -> false', () => {
+    const now = base.at + 6 * 60000;
+    const current = { ...base, longSharePct: 55 };
+    expect(shouldRecordTrendObservation(base, current, now)).toBe(false);
+  });
+  it('смяна на страната през средата (50%), дори под delta прага -> true', () => {
+    const now = base.at + 6 * 60000;
+    const last = { ...base, longSharePct: 51 };
+    const current = { ...base, longSharePct: 49 };
+    expect(shouldRecordTrendObservation(last, current, now)).toBe(true);
+  });
+  it('промяна в броя HVN магнити (над ИЛИ под цената) -> true', () => {
+    const now = base.at + 6 * 60000;
+    expect(shouldRecordTrendObservation(base, { ...base, magnetAboveCount: 2 }, now)).toBe(true);
+    expect(shouldRecordTrendObservation(base, { ...base, magnetBelowCount: 0 }, now)).toBe(true);
+  });
+  it('нищо съществено не се е променило -> false', () => {
+    const now = base.at + 6 * 60000;
+    expect(shouldRecordTrendObservation(base, { ...base, at: now }, now)).toBe(false);
   });
 });
 
