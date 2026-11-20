@@ -1683,7 +1683,12 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
   // IDEA 02 - "TARGET / DESTINATION SCORE" (виж calcTargetScore в
   // signal-logic.js) - самостоятелен таг, огледален на FLOW WARMING/TRAP -
   // излиза дори без другите тагове (POC mean-reversion не зависи от SPARK).
-  const targetLabel = coin.sparkSignal ? TARGET_LABELS[coin.sparkSignal.targetTier] : null;
+  // PR #169 review - видимостта зависи от ВАЛИДНИ POC данни (targetPrice !=
+  // null), НЕ от targetTier/WATCH/STRONG прага - оценката остава само
+  // допълнителен контекст в самия таг/банер, не условие дали POC-ът изобщо
+  // се показва (историческият POC е ВИНАГИ полезен неутрален контекст).
+  const hasHistoricalPoc = coin.sparkSignal && coin.sparkSignal.targetPrice != null;
+  const targetLabel = hasHistoricalPoc ? (TARGET_LABELS[coin.sparkSignal.targetTier] || '📊 ИСТОРИЧЕСКИ POC') : null;
   if (targetLabel && !coin.sparkSignal.extended) {
     const tgDir = coin.sparkSignal.targetDirection;
     tags.push(`<span class="tag" style="background:${tgDir==='long'?'rgba(0,180,220,0.25)':'rgba(0,140,220,0.25)'};color:#5ec8e8">${targetLabel} ${tgDir==='long'?'▲':'▼'} (${coin.sparkSignal.targetScoreValue}/5)</span>`);

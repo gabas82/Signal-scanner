@@ -104,11 +104,18 @@ describe('findLastMACross', () => {
 // решават КЪДЕ да търсим trend-aligned цел; calcMagnetBalance/calcTrendBalance
 // дават прозрачния "⚖️ ТРЕНД БАЛАНС" %.
 describe('getTrendDirection', () => {
-  it('Golden Cross + моментум LONG (ls>=ss) -> "long"', () => {
+  it('Golden Cross + моментум LONG (ls>ss) -> "long"', () => {
     expect(getTrendDirection(true, 3, 2)).toBe('long');
   });
   it('Death Cross + моментум SHORT (ss>ls) -> "short"', () => {
     expect(getTrendDirection(false, 1, 4)).toBe('short');
+  });
+  it('равен моментум (L:2/S:2) -> null, дори при Golden Cross - равенството НЕ е потвърдена посока', () => {
+    expect(getTrendDirection(true, 2, 2)).toBeNull();
+  });
+  it('нулев моментум (L:0/S:0) -> null, не "long" по подразбиране', () => {
+    expect(getTrendDirection(true, 0, 0)).toBeNull();
+    expect(getTrendDirection(false, 0, 0)).toBeNull();
   });
   it('Death Cross + силен LONG моментум -> конфликт -> null (без изкуствена посока)', () => {
     expect(getTrendDirection(false, 4, 1)).toBeNull();

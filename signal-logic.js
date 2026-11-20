@@ -1521,11 +1521,16 @@ function findNearestMagnets(price, direction, targetPrice, hvnList = [], limit =
 // null при неизвестен cross (goldenCross == null) - никога не гадаем посока
 // от липсваща информация. Използва СУРОВОТО ls/ss съотношение (не
 // calcSignal() категорията LONG/SHORT/NEUTRAL/SQUEEZE), за да отразява
-// реалната сила, не само прага - виж calcTrendBalance по-долу.
+// реалната сила, не само прага - виж calcTrendBalance по-долу. Равен
+// моментум (вкл. L:0/S:0) -> null, НЕ "long" по подразбиране - при реално
+// равенство няма потвърдена посока, дори Cross-ът сам по себе си да сочи
+// нещо (PR #169 review - "L:2/S:2 не би трябвало да активира TREND TARGET").
 function getTrendDirection(goldenCross, ls, ss) {
   if (goldenCross == null) return null;
+  const lsVal = ls || 0, ssVal = ss || 0;
+  if (lsVal === ssVal) return null;
   const crossDir = goldenCross ? 'long' : 'short';
-  const momentumDir = (ls || 0) >= (ss || 0) ? 'long' : 'short';
+  const momentumDir = lsVal > ssVal ? 'long' : 'short';
   return crossDir === momentumDir ? crossDir : null;
 }
 
