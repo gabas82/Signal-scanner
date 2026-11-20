@@ -13,7 +13,8 @@ import {
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
   DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras, isScanNowTab, carryForwardKlineExtras,
-  isDeepAthDropCandidate, buildProjectedSeries, smaAt, projectMACrossDate, findLastMACross
+  isDeepAthDropCandidate, buildProjectedSeries, smaAt, projectMACrossDate, findLastMACross,
+  getTrendDirection, findNearestHvnInDirection, calcMagnetBalance, calcTrendBalance
 } from './signal-logic.js';
 
 function baseCoin(overrides = {}) {
@@ -95,6 +96,82 @@ describe('findLastMACross', () => {
   it('невалиден вход (не масив) -> null, без грешка', () => {
     expect(() => findLastMACross(null, 2, 4)).not.toThrow();
     expect(findLastMACross(undefined, 2, 4)).toBeNull();
+  });
+});
+
+// TREND TARGET / ТРЕНД БАЛАНС (виж discussion-а "EVAA - POC сочи SHORT, но
+// трендът/моментумът сочат LONG") - getTrendDirection/findNearestHvnInDirection
+// решават КЪДЕ да търсим trend-aligned цел; calcMagnetBalance/calcTrendBalance
+// дават прозрачния "⚖️ ТРЕНД БАЛАНС" %.
+describe('getTrendDirection', () => {
+  it('Golden Cross + моментум LONG (ls>=ss) -> "long"', () => {
+    expect(getTrendDirection(true, 3, 2)).toBe('long');
+  });
+  it('Death Cross + моментум SHORT (ss>ls) -> "short"', () => {
+    expect(getTrendDirection(false, 1, 4)).toBe('short');
+  });
+  it('Death Cross + силен LONG моментум -> конфликт -> null (без изкуствена посока)', () => {
+    expect(getTrendDirection(false, 4, 1)).toBeNull();
+  });
+  it('Golden Cross + силен SHORT моментум -> конфликт -> null', () => {
+    expect(getTrendDirection(true, 1, 4)).toBeNull();
+  });
+  it('неизвестен cross (null) -> null, никога не гадае', () => {
+    expect(getTrendDirection(null, 5, 0)).toBeNull();
+  });
+});
+
+describe('findNearestHvnInDirection', () => {
+  const hvnList = [{ price: 110, volume: 10 }, { price: 105, volume: 20 }, { price: 90, volume: 15 }, { price: 95, volume: 5 }];
+  it('long -> най-близкия HVN СТРОГО над цената', () => {
+    expect(findNearestHvnInDirection(100, 'long', hvnList)).toEqual({ price: 105, volume: 20 });
+  });
+  it('short -> най-близкия HVN СТРОГО под цената', () => {
+    expect(findNearestHvnInDirection(100, 'short', hvnList)).toEqual({ price: 95, volume: 5 });
+  });
+  it('няма HVN в посоката -> null', () => {
+    expect(findNearestHvnInDirection(100, 'long', [{ price: 90, volume: 5 }])).toBeNull();
+  });
+  it('невалиден вход -> null, без грешка', () => {
+    expect(() => findNearestHvnInDirection(null, 'long', hvnList)).not.toThrow();
+    expect(findNearestHvnInDirection(100, null, hvnList)).toBeNull();
+  });
+});
+
+describe('calcMagnetBalance', () => {
+  it('по-близък магнит тежи повече от по-силен, но далечен (обратно на mean-reversion логиката)', () => {
+    // LONG магнит: 3% разстояние, 10% сила -> тегло 10*1=10.
+    // SHORT магнит: 20% разстояние, 10% сила -> тегло 10*0.3=3.
+    const hvnList = [{ price: 103, volume: 10 }, { price: 80, volume: 10 }];
+    const result = calcMagnetBalance(100, hvnList, 100);
+    expect(result.longSharePct).toBeCloseTo((10 / 13) * 100, 1);
+  });
+  it('без данни -> 50/50 неутрално', () => {
+    expect(calcMagnetBalance(100, [], 100)).toEqual({ longSharePct: 50, shortSharePct: 50 });
+    expect(calcMagnetBalance(null, [{ price: 110, volume: 1 }], 100)).toEqual({ longSharePct: 50, shortSharePct: 50 });
+  });
+});
+
+describe('calcTrendBalance', () => {
+  it('Golden Cross + силен LONG моментум (L:5/S:0) + LONG-heavy магнити -> силно LONG (>80%)', () => {
+    const hvnList = [{ price: 103, volume: 10 }];
+    const result = calcTrendBalance({ goldenCross: true, ls: 5, ss: 0, price: 100, hvnList, profileTotalVolume: 100 });
+    expect(result.longSharePct).toBeGreaterThan(80);
+    expect(result.crossPct).toBe(100);
+    expect(result.momentumPct).toBe(100);
+  });
+  it('Golden Cross + по-слаб моментум (L:3/S:2) -> по-слабо LONG от L:5/S:0 случая', () => {
+    const strong = calcTrendBalance({ goldenCross: true, ls: 5, ss: 0, price: 100, hvnList: [], profileTotalVolume: 0 });
+    const weak = calcTrendBalance({ goldenCross: true, ls: 3, ss: 2, price: 100, hvnList: [], profileTotalVolume: 0 });
+    expect(weak.longSharePct).toBeLessThan(strong.longSharePct);
+  });
+  it('Death Cross + силен LONG моментум -> близо до средата (реално смесена картина, не изкуствен екстремум)', () => {
+    const result = calcTrendBalance({ goldenCross: false, ls: 4, ss: 1, price: 100, hvnList: [], profileTotalVolume: 0 });
+    expect(result.longSharePct).toBeCloseTo(43.33, 1); // (0 + 80 + 50) / 3
+  });
+  it('липсващи данни навсякъде -> 50/50', () => {
+    const result = calcTrendBalance({ goldenCross: null, ls: 0, ss: 0, price: null, hvnList: [], profileTotalVolume: 0 });
+    expect(result.longSharePct).toBe(50);
   });
 });
 
