@@ -1279,7 +1279,11 @@ async function fetchBtcAth() {
 
 async function loadBTCMacro() {
   try {
-    const klines = await fetchKlines('BTCUSDT', '1d', 200);
+    // 450 вместо 200 - DMA50/200/RSI90 пак гледат само последните си N свещи
+    // (calcSMA/calcRSI слайсват от края), но findLastMACross по-долу се нуждае
+    // от разстояние ПРЕДИ cutoff-а, за да засече кога последно е имало реално
+    // пресичане, не само текущото състояние.
+    const klines = await fetchKlines('BTCUSDT', '1d', 450);
     if (!klines || klines.length < 100) return;
     const closes = klines.map(k => parseFloat(k[4]));
     const currentPrice = closes[closes.length - 1];
@@ -1323,17 +1327,37 @@ function formatCrossProjectionLine(label, projection, stepUnit) {
   const name = projection.direction === 'death' ? 'Death Cross' : 'Golden Cross';
   return `${icon} ${label} ${name}: ~${date.toLocaleDateString('bg')}`;
 }
+// findLastMACross в signal-logic.js - показва ясно "пресичането вече настъпи"
+// вместо само мълчаливо да смени цвета на горния бейдж (виж discussion-а).
+// recentSteps прагът е произволен "наскоро" праг - колко дни/седмици назад още
+// си заслужава да го show-ваме като "новина", не само историческа бележка.
+function formatLastCrossLine(label, lastCross, stepUnit, recentSteps) {
+  if (!lastCross || lastCross.stepsAgo > recentSteps) return null;
+  const ms = stepUnit === 'week' ? lastCross.stepsAgo * 7 * 86400000 : lastCross.stepsAgo * 86400000;
+  const date = new Date(Date.now() - ms);
+  const icon = lastCross.direction === 'death' ? '💀' : '🟡';
+  const name = lastCross.direction === 'death' ? 'Death Cross' : 'Golden Cross';
+  const agoUnit = stepUnit === 'week' ? 'седм.' : 'дни';
+  const agoText = lastCross.stepsAgo === 0 ? 'днес' : `преди ${lastCross.stepsAgo} ${agoUnit}`;
+  return `✅ ${label} ${name} НАСТЪПИ: ${date.toLocaleDateString('bg')} (${agoText})`;
+}
 async function loadBTCCrossProjection(dailyCloses) {
   const el = document.getElementById('btc-cross-projection');
   try {
+    const dailyLastCross = findLastMACross(dailyCloses, 50, 200);
     const dailyProjection = projectMACrossDate(dailyCloses, 50, 200, 400);
     const weeklyKlines = await fetchKlines('BTCUSDT', '1w', 200);
     const weeklyCloses = (weeklyKlines || []).map(k => parseFloat(k[4]));
+    const weeklyLastCross = findLastMACross(weeklyCloses, 50, 200);
     const weeklyProjection = projectMACrossDate(weeklyCloses, 50, 200, 200);
-    if (!dailyProjection && !weeklyProjection) { el.style.display = 'none'; return; }
     const lines = [];
+    const dailyLastLine = formatLastCrossLine('Дневна (50/200DMA)', dailyLastCross, 'day', 14);
+    const weeklyLastLine = formatLastCrossLine('Седмична (50/200WMA)', weeklyLastCross, 'week', 8);
+    if (dailyLastLine) lines.push(dailyLastLine);
+    if (weeklyLastLine) lines.push(weeklyLastLine);
     if (dailyProjection) lines.push(formatCrossProjectionLine('Дневна (50/200DMA)', dailyProjection, 'day'));
     if (weeklyProjection) lines.push(formatCrossProjectionLine('Седмична (50/200WMA)', weeklyProjection, 'week'));
+    if (!lines.length) { el.style.display = 'none'; return; }
     el.innerHTML = `📅 ПРОЕКЦИЯ ПРИ НЕПРОМЕНЕНА ЦЕНА<br>${lines.join('<br>')}`;
     el.style.display = '';
   } catch (e) { el.style.display = 'none'; }
