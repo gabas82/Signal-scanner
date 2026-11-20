@@ -1164,11 +1164,15 @@ async function loadSpark() {
       // TREND BALANCE OBSERVATION TRACKER (Etап 2) - докладва на Worker-а
       // САМО при реална промяна (shouldRecordTrendObservation в
       // signal-logic.js), не всеки тик - виж discussion-а уточнение 1.
-      // Fire-and-forget (.catch, без await на самия resolve) - мрежова
-      // грешка тук НЕ трябва да бави/чупи рендъра на картата никога.
+      // Fire-and-forget (без await на самия resolve) - мрежова грешка тук
+      // НЕ трябва да бави/чупи рендъра на картата никога. PR #170 review,
+      // т.3 - trendObsLastBySymbol се обновява САМО след ПОТВЪРДЕН успех
+      // (res.ok), не веднага при изпращане: ако заявката се провали (мрежа/
+      // 429/500), следващия тик пак ще види "нищо не е пратено" и ще опита
+      // отново (естествен retry, без да пазим отделна опашка) - вместо
+      // тихо да приемем провала за "вече докладвано" завинаги.
       const trendObsSnapshot = { at: Date.now(), longSharePct: trendBalance.longSharePct, magnetAboveCount: trendBalance.magnetAboveCount, magnetBelowCount: trendBalance.magnetBelowCount };
       if (shouldRecordTrendObservation(trendObsLastBySymbol[coin.fullSymbol], trendObsSnapshot)) {
-        trendObsLastBySymbol[coin.fullSymbol] = trendObsSnapshot;
         fetchT(`${WORKER_URL}/trend-observation`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1186,7 +1190,7 @@ async function loadSpark() {
             historicalPocPrice: targetScore.targetPrice, historicalPocTier: targetTier, historicalPocDirection: targetScore.direction,
             historicalPocDistancePct: targetScore.distancePct,
           }),
-        }, 5000).catch(() => {});
+        }, 5000).then(res => { if (res.ok) trendObsLastBySymbol[coin.fullSymbol] = trendObsSnapshot; }).catch(() => {});
       }
       // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore в
       // signal-logic.js) - баланс на Value Area (широчина+скос), потвърден от

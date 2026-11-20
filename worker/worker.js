@@ -3037,15 +3037,29 @@ function buildTrendObservationRecord({
 // SHORT - отдолу (candle.low <= targetPrice). Мутира pending.*Hit/*HitAt НА
 // МЯСТО (огледално на updateExcursion по-горе) - веднъж ударена, остава
 // ударена (idempotent, никога не се "отударя").
-function resolveTargetHits(pending, candle, now = Date.now()) {
-  if (!candle || candle.high == null || candle.low == null) return;
+// PR #170 review, т.2 - ДВЕ корекции за точност:
+// (а) candle.openTime < pending.entryAt -> пропускаме я ИЗЦЯЛО, дори ако
+//     частично застъпва entryAt - свещ, започнала ПРЕДИ наблюдението, може
+//     нивото да е докоснала преди то изобщо да е записано (виж discussion-а
+//     "EVAA"). Цената на това: ~до 5 мин "сляпо петно" точно след запис,
+//     съзнателно приет компромис - честна липса на данни е по-добра от
+//     подвеждащо ранен "удар".
+// (б) *HitAt = closeTime на свещта (пазарни данни), НЕ Date.now() на cron
+//     тика - вторият може да изостава с минути от реалния пазарен момент.
+//     Все още е ПРИБЛИЗИТЕЛНА стойност (знаем само "в рамките на тази
+//     5-минутна свещ", не точната секунда) - честно отразено в коментара,
+//     не представено като по-точно, отколкото е.
+function resolveTargetHits(pending, candle) {
+  if (!candle || candle.high == null || candle.low == null || candle.openTime == null) return;
+  if (pending.entryAt != null && candle.openTime < pending.entryAt) return;
+  const approxHitAt = candle.openTime + 5 * 60000;
   if (!pending.trendTargetHit && pending.trendTargetPrice != null && pending.trendTargetDirection) {
     const hit = pending.trendTargetDirection === 'long' ? candle.high >= pending.trendTargetPrice : candle.low <= pending.trendTargetPrice;
-    if (hit) { pending.trendTargetHit = true; pending.trendTargetHitAt = now; }
+    if (hit) { pending.trendTargetHit = true; pending.trendTargetHitAt = approxHitAt; }
   }
   if (!pending.historicalPocHit && pending.historicalPocPrice != null && pending.historicalPocDirection) {
     const hit = pending.historicalPocDirection === 'long' ? candle.high >= pending.historicalPocPrice : candle.low <= pending.historicalPocPrice;
-    if (hit) { pending.historicalPocHit = true; pending.historicalPocHitAt = now; }
+    if (hit) { pending.historicalPocHit = true; pending.historicalPocHitAt = approxHitAt; }
   }
 }
 
@@ -6815,27 +6829,40 @@ async function scanSymbolSignals(env, symbol) {
   // записани от /trend-observation POST-а (виж buildTrendObservationRecord
   // по-горе) - огледално на pendingTagOutcomes резолюцията точно по-горе,
   // плюс resolveTargetHits за "удари ли се Trend Target/Historical POC".
+  // PR #170 review, т.3 ("изолация от основното сканиране") - ДВУНИВОВ
+  // try/catch: вътрешният пази ЕДИН повреден pending запис (връща се в
+  // stillPendingTrendObs за следващ опит, вместо тихо да изчезне), външният
+  // е последна защита - дори напълно неочаквана грешка тук НИКОГА не трябва
+  // да попречи на saveSymbolState() по-долу да се изпълни за символа.
   if (state.pendingTrendObservations && state.pendingTrendObservations.length && env.ALERT_STATE) {
-    const stillPendingTrendObs = [];
-    const lastClosed5mForTrendObs = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
-    for (const p of state.pendingTrendObservations) {
-      updateExcursion(p, lastClosed5mForTrendObs);
-      const wasTrendTargetHit = p.trendTargetHit, wasHistoricalPocHit = p.historicalPocHit;
-      resolveTargetHits(p, lastClosed5mForTrendObs);
-      const { updates, allResolved } = resolvePendingOutcomeHorizons(p, price);
-      if (!wasTrendTargetHit && p.trendTargetHit) { updates.trendTargetHit = true; updates.trendTargetHitAt = p.trendTargetHitAt; }
-      if (!wasHistoricalPocHit && p.historicalPocHit) { updates.historicalPocHit = true; updates.historicalPocHitAt = p.historicalPocHitAt; }
-      if (Object.keys(updates).length) {
-        const raw = await env.ALERT_STATE.get(p.key);
-        if (raw) {
-          const rec = JSON.parse(raw);
-          Object.assign(rec, updates);
-          await env.ALERT_STATE.put(p.key, JSON.stringify(rec));
+    try {
+      const stillPendingTrendObs = [];
+      const lastClosed5mForTrendObs = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+      for (const p of state.pendingTrendObservations) {
+        try {
+          updateExcursion(p, lastClosed5mForTrendObs);
+          const wasTrendTargetHit = p.trendTargetHit, wasHistoricalPocHit = p.historicalPocHit;
+          resolveTargetHits(p, lastClosed5mForTrendObs);
+          const { updates, allResolved } = resolvePendingOutcomeHorizons(p, price);
+          if (!wasTrendTargetHit && p.trendTargetHit) { updates.trendTargetHit = true; updates.trendTargetHitAt = p.trendTargetHitAt; }
+          if (!wasHistoricalPocHit && p.historicalPocHit) { updates.historicalPocHit = true; updates.historicalPocHitAt = p.historicalPocHitAt; }
+          if (Object.keys(updates).length) {
+            const raw = await env.ALERT_STATE.get(p.key);
+            if (raw) {
+              try {
+                const rec = JSON.parse(raw);
+                Object.assign(rec, updates);
+                await env.ALERT_STATE.put(p.key, JSON.stringify(rec));
+              } catch (e) { /* повреден KV запис - пропускаме записа, pending-а остава за следващ опит */ }
+            }
+          }
+          if (!allResolved) stillPendingTrendObs.push(p);
+        } catch (e) {
+          stillPendingTrendObs.push(p); // не изхвърляме pending-а заради неочаквана грешка
         }
       }
-      if (!allResolved) stillPendingTrendObs.push(p);
-    }
-    state.pendingTrendObservations = stillPendingTrendObs;
+      state.pendingTrendObservations = stillPendingTrendObs;
+    } catch (e) { /* виж коментара по-горе - никога не пипа scanSymbolSignals за символа */ }
   }
 
   await saveSymbolState(env, symbol, state);
@@ -9262,8 +9289,24 @@ export default {
     // Грешка тук НЕ трябва да пипа основното сканиране никога - изцяло
     // самостоятелен handler, извикван само от signal-scanner.html, никога от
     // scanSymbolSignals/scheduled().
+    // CORS (PR #170 review) - signal-scanner.html е на gabas82.github.io,
+    // друг origin от Worker-а, и праща Content-Type: application/json ->
+    // браузърът винаги прави OPTIONS preflight преди истинския POST. Без
+    // двете по-долу (OPTIONS handler + заглавие на самия POST отговор)
+    // заявката би била блокирана тихо от браузъра, независимо че unit
+    // тестовете (fetch() директно, без браузърния CORS слой) минават чисто.
+    if (path === "/trend-observation" && request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        },
+      });
+    }
     if (path === "/trend-observation" && request.method === "POST") {
-      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
       if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
       let payload;
       try { payload = await request.json(); } catch (e) { return json({ error: "Invalid JSON" }, 400); }
@@ -9292,6 +9335,13 @@ export default {
     // TREND BALANCE OBSERVATION TRACKER diagnostics - read-only, token-gated
     // като /tag-outcome-diagnostics. summary смята СЕ от пълния (непресят)
     // набор записи, дори когато ?limit= връща по-малка извадка от records.
+    // PR #170 review, т.4 - listKvKeysWithTruncation (вече ползван от
+    // /telemetry и /tc-lifecycle, виж бележката при функцията) вместо еднa
+    // страница list() - KV.list() връща макс. 1000 ключа на страница; при
+    // >1000 натрупани записа единична заявка би върнала само ЧАСТ (по
+    // лексикографски ред на ключа, не по време), давайки подвеждаща,
+    // непредставителна статистика без явно обозначение. `truncated` сега
+    // честно отразява И реалната KV пагинация, не само ?limit= среза.
     if (path === "/trend-observation-diagnostics" && request.method === "GET") {
       const suppliedToken = getSuppliedTelemetryToken(request, url);
       const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
@@ -9299,12 +9349,18 @@ export default {
       if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
       if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
       const limit = Math.min(parseInt(url.searchParams.get("limit") || "500", 10) || 500, 2000);
-      const listResult = await env.ALERT_STATE.list({ prefix: "trendobs:" });
-      const records = (await Promise.all(listResult.keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
+      const MAX_KEYS_SCANNED = 5000;
+      const { keys, truncated: listTruncated } = await listKvKeysWithTruncation(env.ALERT_STATE, "trendobs:", MAX_KEYS_SCANNED);
+      const records = [];
+      for (const k of keys) {
+        const raw = await env.ALERT_STATE.get(k.name);
+        if (!raw) continue;
+        try { records.push(JSON.parse(raw)); } catch (e) { continue; }
+      }
       records.sort((a, b) => (b.at || 0) - (a.at || 0));
       return json({
         count: records.length,
-        truncated: records.length > limit,
+        truncated: listTruncated || records.length > limit,
         summary: buildTrendObservationSummary(records),
         records: records.slice(0, limit),
       });

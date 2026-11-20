@@ -66,32 +66,43 @@ describe('buildTrendObservationRecord', () => {
 });
 
 describe('resolveTargetHits', () => {
-  it('LONG trend target се удря отгоре (candle.high >= targetPrice)', () => {
-    const p = { trendTargetPrice: 110, trendTargetDirection: 'long', trendTargetHit: false, historicalPocPrice: null, historicalPocDirection: null, historicalPocHit: false };
-    resolveTargetHits(p, { high: 111, low: 105 }, 2000);
+  it('LONG trend target се удря отгоре (candle.high >= targetPrice), hitAt = closeTime на свещта (openTime+5мин)', () => {
+    const p = { entryAt: 1000, trendTargetPrice: 110, trendTargetDirection: 'long', trendTargetHit: false, historicalPocPrice: null, historicalPocDirection: null, historicalPocHit: false };
+    resolveTargetHits(p, { openTime: 2000, high: 111, low: 105 });
     expect(p.trendTargetHit).toBe(true);
-    expect(p.trendTargetHitAt).toBe(2000);
+    expect(p.trendTargetHitAt).toBe(2000 + 5 * 60000);
   });
   it('SHORT historical POC се удря отдолу (candle.low <= targetPrice)', () => {
-    const p = { historicalPocPrice: 90, historicalPocDirection: 'short', historicalPocHit: false, trendTargetPrice: null, trendTargetDirection: null, trendTargetHit: false };
-    resolveTargetHits(p, { high: 100, low: 89 }, 3000);
+    const p = { entryAt: 1000, historicalPocPrice: 90, historicalPocDirection: 'short', historicalPocHit: false, trendTargetPrice: null, trendTargetDirection: null, trendTargetHit: false };
+    resolveTargetHits(p, { openTime: 3000, high: 100, low: 89 });
     expect(p.historicalPocHit).toBe(true);
-    expect(p.historicalPocHitAt).toBe(3000);
+    expect(p.historicalPocHitAt).toBe(3000 + 5 * 60000);
   });
   it('не удря -> остава false', () => {
-    const p = { trendTargetPrice: 110, trendTargetDirection: 'long', trendTargetHit: false, historicalPocPrice: null, historicalPocDirection: null, historicalPocHit: false };
-    resolveTargetHits(p, { high: 105, low: 100 }, 2000);
+    const p = { entryAt: 1000, trendTargetPrice: 110, trendTargetDirection: 'long', trendTargetHit: false, historicalPocPrice: null, historicalPocDirection: null, historicalPocHit: false };
+    resolveTargetHits(p, { openTime: 2000, high: 105, low: 100 });
     expect(p.trendTargetHit).toBe(false);
   });
   it('idempotent - веднъж ударена, не се "отударя" и не пренаписва hitAt', () => {
-    const p = { trendTargetPrice: 110, trendTargetDirection: 'long', trendTargetHit: true, trendTargetHitAt: 1500, historicalPocPrice: null, historicalPocDirection: null, historicalPocHit: false };
-    resolveTargetHits(p, { high: 200, low: 190 }, 9999);
+    const p = { entryAt: 1000, trendTargetPrice: 110, trendTargetDirection: 'long', trendTargetHit: true, trendTargetHitAt: 1500, historicalPocPrice: null, historicalPocDirection: null, historicalPocHit: false };
+    resolveTargetHits(p, { openTime: 99999, high: 200, low: 190 });
     expect(p.trendTargetHitAt).toBe(1500);
   });
-  it('без candle/липсващи high-low -> не throw, не мутира', () => {
-    const p = { trendTargetPrice: 110, trendTargetDirection: 'long', trendTargetHit: false };
+  it('свещ, започнала ПРЕДИ entryAt -> ИГНОРИРА се изцяло, дори да удря нивото (PR #170 review т.2)', () => {
+    const p = { entryAt: 5000, trendTargetPrice: 110, trendTargetDirection: 'long', trendTargetHit: false, historicalPocPrice: null, historicalPocDirection: null, historicalPocHit: false };
+    resolveTargetHits(p, { openTime: 4000, high: 200, low: 190 }); // openTime < entryAt
+    expect(p.trendTargetHit).toBe(false);
+  });
+  it('свещ, започнала ТОЧНО на entryAt -> НЕ се игнорира (граничен случай)', () => {
+    const p = { entryAt: 5000, trendTargetPrice: 110, trendTargetDirection: 'long', trendTargetHit: false, historicalPocPrice: null, historicalPocDirection: null, historicalPocHit: false };
+    resolveTargetHits(p, { openTime: 5000, high: 111, low: 100 });
+    expect(p.trendTargetHit).toBe(true);
+  });
+  it('без candle/липсващи high-low/openTime -> не throw, не мутира', () => {
+    const p = { entryAt: 1000, trendTargetPrice: 110, trendTargetDirection: 'long', trendTargetHit: false };
     expect(() => resolveTargetHits(p, null)).not.toThrow();
     expect(() => resolveTargetHits(p, {})).not.toThrow();
+    expect(() => resolveTargetHits(p, { high: 200, low: 190 })).not.toThrow(); // без openTime
     expect(p.trendTargetHit).toBe(false);
   });
 });
@@ -204,10 +215,33 @@ describe('scanSymbolSignals wiring (structural)', () => {
   it('resolveTargetHits се извиква в резолюционния блок', () => {
     expect(WORKER_SRC.includes('resolveTargetHits(p, lastClosed5mForTrendObs);')).toBe(true);
   });
+  it('резолюцията е обвита в try/catch (PR #170 review т.3 - изолация от основното сканиране)', () => {
+    const needle = 'if (state.pendingTrendObservations && state.pendingTrendObservations.length && env.ALERT_STATE) {';
+    const idx = WORKER_SRC.indexOf(needle);
+    const after = WORKER_SRC.slice(idx, idx + 2500);
+    expect(after).toContain('try {');
+    expect(after.match(/\} catch \(e\) \{/g).length).toBeGreaterThanOrEqual(3); // вътрешен (per-entry) + JSON.parse + външен
+  });
 });
 
 describe('/trend-observation endpoint', () => {
   const call = (env, body) => worker.fetch(new Request('https://w.mock/trend-observation', { method: 'POST', body: JSON.stringify(body) }), env, { waitUntil() {} });
+
+  // PR #170 review, т.1 - signal-scanner.html (gabas82.github.io) е ДРУГ
+  // origin от Worker-а и праща Content-Type: application/json -> браузърът
+  // винаги прави OPTIONS preflight. Без тези два теста рискуваме unit
+  // тестовете да минават (fetch() тук няма браузърен CORS слой), докато
+  // реалният браузър тихо блокира заявката.
+  it('OPTIONS preflight -> 204 + CORS заглавия', async () => {
+    const res = await worker.fetch(new Request('https://w.mock/trend-observation', { method: 'OPTIONS' }), {}, { waitUntil() {} });
+    expect(res.status).toBe(204);
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(res.headers.get('Access-Control-Allow-Methods')).toContain('POST');
+  });
+  it('истинският POST отговор носи Access-Control-Allow-Origin', async () => {
+    const res = await call({ ALERT_STATE: makeKv() }, VALID_PAYLOAD);
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
+  });
 
   it('валиден payload -> 200, записва KV + pending state', async () => {
     const kv = makeKv();
@@ -278,6 +312,19 @@ describe('/trend-observation-diagnostics endpoint', () => {
     expect(body.count).toBe(1);
     expect(body.records[0].symbol).toBe('EVAAUSDT');
     expect(body.summary.byTrendTargetPresence.withTrendTarget).toBeDefined();
+  });
+
+  it('повреден (non-JSON) запис -> пропуска се тихо, останалите валидни записи пак се връщат (PR #170 review т.4)', async () => {
+    const r1 = buildTrendObservationRecord({ ...VALID_PAYLOAD, at: 1000, direction: 'long' });
+    const kv = makeKv({
+      'trendobs:EVAAUSDT:1000': JSON.stringify(r1),
+      'trendobs:EVAAUSDT:2000': 'not valid json {{{',
+    });
+    const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.count).toBe(1);
+    expect(body.records[0].at).toBe(1000);
   });
 
   it('read-only - не пише в KV', async () => {
