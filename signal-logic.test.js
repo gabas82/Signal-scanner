@@ -13,7 +13,7 @@ import {
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
   DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras, isScanNowTab, carryForwardKlineExtras,
-  isDeepAthDropCandidate, buildProjectedSeries, smaAt, projectMACrossDate
+  isDeepAthDropCandidate, buildProjectedSeries, smaAt, projectMACrossDate, findLastMACross
 } from './signal-logic.js';
 
 function baseCoin(overrides = {}) {
@@ -72,6 +72,29 @@ describe('projectMACrossDate', () => {
   it('невалиден вход (не масив) -> null, без грешка', () => {
     expect(() => projectMACrossDate(null, 2, 4, 10)).not.toThrow();
     expect(projectMACrossDate(undefined, 2, 4, 10)).toBeNull();
+  });
+});
+
+describe('findLastMACross', () => {
+  it('недостатъчно история (под longPeriod+1) -> null', () => {
+    expect(findLastMACross([1, 2, 3], 2, 5)).toBeNull();
+  });
+  it('намира последното РЕАЛНО пресичане (golden -> death) с правилен stepsAgo', () => {
+    // short=1 (самото затваряне), long=2 (SMA на последните 2) - golden до i=2,
+    // death cross на i=3, остава death до края (flat на i=6 се пропуска).
+    const closes = [10, 10, 12, 10, 8, 2, 2];
+    expect(findLastMACross(closes, 1, 2)).toEqual({ stepsAgo: 3, direction: 'death' });
+  });
+  it('намира последното РЕАЛНО пресичане (death -> golden, огледално)', () => {
+    const closes = [4, 4, 2, 4, 6, 12, 12];
+    expect(findLastMACross(closes, 1, 2)).toEqual({ stepsAgo: 3, direction: 'golden' });
+  });
+  it('без никакво пресичане в подадената история -> null', () => {
+    expect(findLastMACross([1, 2, 3, 4, 5, 6, 7], 1, 2)).toBeNull();
+  });
+  it('невалиден вход (не масив) -> null, без грешка', () => {
+    expect(() => findLastMACross(null, 2, 4)).not.toThrow();
+    expect(findLastMACross(undefined, 2, 4)).toBeNull();
   });
 });
 

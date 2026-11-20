@@ -102,6 +102,28 @@ function projectMACrossDate(closes, shortPeriod, longPeriod, maxStepsAhead) {
   return null;
 }
 
+// Огледално на projectMACrossDate по-горе, но НАЗАД вместо напред - сканира
+// РЕАЛНАТА (не прогнозната) история за ПОСЛЕДНАТА смяна на GOLDEN/DEATH
+// състоянието, за да покажем ясно "пресичането вече настъпи на дата X", вместо
+// само мълчаливо да сменим цвета на бейджа (виж discussion-а "искам да е ясно,
+// че е настъпил даден Death Cross"). `stepsAgo` е колко свещи назад от
+// последната е станала смяната (0 = на самата последна свещ).
+function findLastMACross(closes, shortPeriod, longPeriod) {
+  if (!Array.isArray(closes) || closes.length < longPeriod + 1) return null;
+  let lastFlipIndex = null, lastFlipDirection = null, prevState = null;
+  for (let i = longPeriod - 1; i < closes.length; i++) {
+    const s = smaAt(closes, i, shortPeriod);
+    const l = smaAt(closes, i, longPeriod);
+    if (s == null || l == null) continue;
+    const state = s > l ? 'golden' : (s < l ? 'death' : 'flat');
+    if (state === 'flat') continue;
+    if (prevState && state !== prevState) { lastFlipIndex = i; lastFlipDirection = state; }
+    prevState = state;
+  }
+  if (lastFlipIndex == null) return null;
+  return { stepsAgo: (closes.length - 1) - lastFlipIndex, direction: lastFlipDirection };
+}
+
 function calcStdDev(closes, period) {
   if (closes.length < period) return null;
   const slice = closes.slice(-period);
@@ -1660,7 +1682,7 @@ if (typeof module !== 'undefined' && module.exports) {
     DCA_LEVERAGE, DCA_ENTRY, MAJOR_COINS, SEMI_MAJOR_COINS,
     MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
     SYMBOL_MAP, fixSymbol, calcSMA, calcStdDev, calcRSI, detectBottom, detectTop,
-    buildProjectedSeries, smaAt, projectMACrossDate,
+    buildProjectedSeries, smaAt, projectMACrossDate, findLastMACross,
     calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
     calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcBaseDivergenceStrength, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
     calcBlowoffSignal, calcDistributionSignal, calcDumpSqueezeSignal, calcShiftDownSignal,
