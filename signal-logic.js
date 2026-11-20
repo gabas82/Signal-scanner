@@ -1468,10 +1468,22 @@ function calcTargetScore({ price, poc, profileTotalVolume }) {
   return { score: distancePts + strengthPts, direction, distancePct, levelStrengthPct, targetPrice: poc.price };
 }
 
+// 📊 (не 🎯) + "ИСТОРИЧЕСКИ" - нарочно преименувано (виж discussion-а "EVAA"):
+// това е mean-reversion към СТАРИЯ POC, чисто контекстуална информация, не
+// активна търговска цел - 🎯 вече е запазено изключително за TREND_TARGET_LABELS
+// по-долу, за да няма визуално дублиране между двете.
 const TARGET_LABELS = {
   none: null,
-  watch: '🎯 TARGET WATCH',
-  strong: '🎯 TARGET STRONG',
+  watch: '📊 ИСТОРИЧЕСКИ POC',
+  strong: '📊 ИСТОРИЧЕСКИ POC (силен)',
+};
+// TREND TARGET (виж calcTrendBalance/getTrendDirection по-горе) - активният,
+// trend-aligned ориентир (НЕ mean-reversion) - показва се само когато Golden/
+// Death Cross И моментум реално съвпадат (виж wiring-а в signal-scanner.html).
+const TREND_TARGET_LABELS = {
+  none: null,
+  watch: '🎯 TREND TARGET',
+  strong: '🎯 TREND TARGET',
 };
 // Изисква ЯВНО минимално разстояние (TARGET_MIN_DISTANCE_PCT) - под него цената
 // е твърде близо до POC, за да има смисъл от "цел" (вече почти е стигнала).
@@ -1491,6 +1503,89 @@ function findNearestMagnets(price, direction, targetPrice, hvnList = [], limit =
     : (n.price < price && n.price >= targetPrice));
   relevant.sort((a, b) => Math.abs(a.price - price) - Math.abs(b.price - price));
   return relevant.slice(0, limit);
+}
+
+// ═══ TREND TARGET / ТРЕНД БАЛАНС (виж discussion-а "EVAA - POC сочи SHORT,
+// но трендът/моментумът сочат LONG") ═══════════════════════════════════════
+// Проблем: calcTargetScore по-горе винаги връща mean-reversion посока ЧИСТО
+// от позицията на историческия POC спрямо цената - коректно изчислено, но
+// след рязка смяна на режима (напр. силен pump) POC-ът носи инерция от
+// СТАРия, вече ирелевантен обхват и подвежда, ако трендът реално продължава.
+// Решение (съвместно решен дизайн с потребителя): НЕ заменяме/скриваме POC-а
+// (остава видим като "исторически" контекст - виж targetBanner в
+// signal-scanner.html), а ДОБАВЯМЕ отделен TREND TARGET - най-близкия HVN
+// магнит В ПОСОКАТА на тренда, само когато Golden/Death Cross И МОМЕНТУМ
+// (L/S от calcSignal) реално съвпадат. При разминаване - null (никаква
+// изкуствена цел), запазва се предпазливото "НЕ Е entry сигнал" поведение.
+
+// null при неизвестен cross (goldenCross == null) - никога не гадаем посока
+// от липсваща информация. Използва СУРОВОТО ls/ss съотношение (не
+// calcSignal() категорията LONG/SHORT/NEUTRAL/SQUEEZE), за да отразява
+// реалната сила, не само прага - виж calcTrendBalance по-долу. Равен
+// моментум (вкл. L:0/S:0) -> null, НЕ "long" по подразбиране - при реално
+// равенство няма потвърдена посока, дори Cross-ът сам по себе си да сочи
+// нещо (PR #169 review - "L:2/S:2 не би трябвало да активира TREND TARGET").
+function getTrendDirection(goldenCross, ls, ss) {
+  if (goldenCross == null) return null;
+  const lsVal = ls || 0, ssVal = ss || 0;
+  if (lsVal === ssVal) return null;
+  const crossDir = goldenCross ? 'long' : 'short';
+  const momentumDir = lsVal > ssVal ? 'long' : 'short';
+  return crossDir === momentumDir ? crossDir : null;
+}
+
+// Най-близкият HVN СТРОГО в дадената посока (без горна граница като
+// findNearestMagnets - тук търсим произволен "следващ" магнит, не магнити
+// по пътя към вече известна цел).
+function findNearestHvnInDirection(price, direction, hvnList = []) {
+  if (price == null || !direction || !Array.isArray(hvnList)) return null;
+  const relevant = hvnList.filter(n => direction === 'long' ? n.price > price : n.price < price);
+  if (!relevant.length) return null;
+  relevant.sort((a, b) => Math.abs(a.price - price) - Math.abs(b.price - price));
+  return relevant[0];
+}
+
+// Тегловен LONG/SHORT дял от HVN "магнитите" спрямо текущата цена - за
+// ТРЕНД БАЛАНС-а по-долу (точка Б от discussion-а: не само БРОЙ магнити,
+// а тегло = сила на нивото (% от общия обем) * близост (по-близки магнити
+// тежат повече за краткосрочно движение - обратно на mean-reversion
+// логиката на calcTargetScore, където по-далечен POC = по-силен "пул").
+// Връща 50/50 при липса на данни - неутрално, не фаворизира посока.
+function calcMagnetBalance(price, hvnList, profileTotalVolume) {
+  if (price == null || !(price > 0) || !Array.isArray(hvnList) || !hvnList.length || !(profileTotalVolume > 0)) {
+    return { longSharePct: 50, shortSharePct: 50 };
+  }
+  let longWeight = 0, shortWeight = 0;
+  for (const node of hvnList) {
+    if (node.price == null || node.volume == null) continue;
+    const distancePct = Math.abs((node.price - price) / price) * 100;
+    const strengthPct = (node.volume / profileTotalVolume) * 100;
+    const tierMultiplier = distancePct <= 5 ? 1 : distancePct <= 15 ? 0.6 : 0.3;
+    const weight = strengthPct * tierMultiplier;
+    if (node.price > price) longWeight += weight;
+    else if (node.price < price) shortWeight += weight;
+  }
+  const total = longWeight + shortWeight;
+  if (!(total > 0)) return { longSharePct: 50, shortSharePct: 50 };
+  const longSharePct = (longWeight / total) * 100;
+  return { longSharePct, shortSharePct: 100 - longSharePct };
+}
+
+// ТРЕНД БАЛАНС - прозрачна ТЕГЛОВНА оценка (НЕ статистически валидирана
+// вероятност - виж discussion-а), средно от 3 НЕЗАВИСИМИ по механизъм
+// компонента (дългосрочна структура / краткосрочен ценови натиск / обемна
+// структура), за да не се "дублират" изкуствено: Golden/Death Cross (бинарно
+// 0/100), моментум (СУРОВО ls/ss съотношение - отразява сила, не само
+// посока), HVN магнитен баланс (виж calcMagnetBalance по-горе). При липса на
+// cross/моментум данни съответният компонент пада на 50 (неутрален), не
+// изключва цялата формула.
+function calcTrendBalance({ goldenCross, ls, ss, price, hvnList, profileTotalVolume }) {
+  const crossPct = goldenCross === true ? 100 : goldenCross === false ? 0 : 50;
+  const totalLS = (ls || 0) + (ss || 0);
+  const momentumPct = totalLS > 0 ? ((ls || 0) / totalLS) * 100 : 50;
+  const magnet = calcMagnetBalance(price, hvnList, profileTotalVolume);
+  const longSharePct = (crossPct + momentumPct + magnet.longSharePct) / 3;
+  return { longSharePct, shortSharePct: 100 - longSharePct, crossPct, momentumPct, magnetPct: magnet.longSharePct };
 }
 
 // ═══ IDEA 03 - "AUCTION QUALITY" ═══════════════════════════════════════════════
@@ -1703,6 +1798,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcLiquiditySweep, calcTrapScore, getTrapTier, TRAP_LABELS, TRAP_TAKER_DELTA_THRESHOLD,
     buildVolumeProfile, calcPOC, calcValueArea, getHVNLVN,
     calcTargetDistancePct, calcTargetScore, getTargetTier, findNearestMagnets, TARGET_LABELS, TARGET_MIN_DISTANCE_PCT,
+    getTrendDirection, findNearestHvnInDirection, calcMagnetBalance, calcTrendBalance, TREND_TARGET_LABELS,
     calcAuctionQualityScore, getAuctionQualityTier, AUCTION_LABELS, AUCTION_NARROW_WIDTH_PCT, AUCTION_SKEW_THRESHOLD,
     splitCandlesByUtcDay, getTodayYesterdayCandles, calcValueMigrationScore, getValueMigrationTier,
     MIGRATION_LABELS, MIGRATION_MIN_PCT, MIGRATION_MIN_CANDLES,

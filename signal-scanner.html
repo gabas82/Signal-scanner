@@ -1135,6 +1135,26 @@ async function loadSpark() {
       const targetScore = calcTargetScore({ price: coin.price, poc: vpPoc, profileTotalVolume: volumeProfile?.totalVolume });
       const targetTier = getTargetTier(targetScore.score, targetScore.distancePct);
       const targetMagnets = findNearestMagnets(coin.price, targetScore.direction, targetScore.targetPrice, vpNodes.hvn);
+      // TREND TARGET / ТРЕНД БАЛАНС (виж getTrendDirection/calcTrendBalance в
+      // signal-logic.js, discussion-а "EVAA - POC сочи SHORT, но трендът сочи
+      // LONG") - ОТДЕЛНО от историческия POC по-горе (targetScore), не го
+      // заменя. momentumSig реюзва СЪЩИЯ calcSignal(), ползван при рендъра на
+      // картата (L:${sig.ls}/S:${sig.ss}) - нулева нова мрежова заявка.
+      const momentumSig = calcSignal(coin);
+      const trendDirection = getTrendDirection(coin.goldenCross, momentumSig.ls, momentumSig.ss);
+      let trendTargetScore = { score: 0, direction: null, distancePct: null, levelStrengthPct: null, targetPrice: null };
+      let trendTargetTier = 'none';
+      if (trendDirection) {
+        const nearestTrendHvn = findNearestHvnInDirection(coin.price, trendDirection, vpNodes.hvn);
+        if (nearestTrendHvn) {
+          trendTargetScore = calcTargetScore({ price: coin.price, poc: nearestTrendHvn, profileTotalVolume: volumeProfile?.totalVolume });
+          trendTargetTier = getTargetTier(trendTargetScore.score, trendTargetScore.distancePct);
+        }
+      }
+      const trendBalance = calcTrendBalance({
+        goldenCross: coin.goldenCross, ls: momentumSig.ls, ss: momentumSig.ss,
+        price: coin.price, hvnList: vpNodes.hvn, profileTotalVolume: volumeProfile?.totalVolume,
+      });
       // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore в
       // signal-logic.js) - баланс на Value Area (широчина+скос), потвърден от
       // OI/CVD. Огледално на TRAP - ИМА hard factor изискване.
@@ -1177,6 +1197,12 @@ async function loadSpark() {
         targetTier, targetDirection: targetScore.direction, targetScoreValue: targetScore.score,
         targetDistancePct: targetScore.distancePct, targetLevelStrengthPct: targetScore.levelStrengthPct,
         targetPrice: targetScore.targetPrice, targetMagnets,
+        trendTargetTier, trendTargetDirection: trendTargetScore.direction, trendTargetScoreValue: trendTargetScore.score,
+        trendTargetDistancePct: trendTargetScore.distancePct, trendTargetLevelStrengthPct: trendTargetScore.levelStrengthPct,
+        trendTargetPrice: trendTargetScore.targetPrice,
+        trendBalanceLongPct: trendBalance.longSharePct, trendBalanceShortPct: trendBalance.shortSharePct,
+        trendBalanceCrossPct: trendBalance.crossPct, trendBalanceMomentumPct: trendBalance.momentumPct,
+        trendBalanceMagnetPct: trendBalance.magnetPct,
         auctionTier, auctionDirection, auctionMaxScore,
         auctionWidthPct: auctionScore.widthPct, auctionSkewRatio: auctionScore.skewRatio,
         migrationTier, migrationDirection, migrationMaxScore,
@@ -1657,10 +1683,23 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
   // IDEA 02 - "TARGET / DESTINATION SCORE" (виж calcTargetScore в
   // signal-logic.js) - самостоятелен таг, огледален на FLOW WARMING/TRAP -
   // излиза дори без другите тагове (POC mean-reversion не зависи от SPARK).
-  const targetLabel = coin.sparkSignal ? TARGET_LABELS[coin.sparkSignal.targetTier] : null;
+  // PR #169 review - видимостта зависи от ВАЛИДНИ POC данни (targetPrice !=
+  // null), НЕ от targetTier/WATCH/STRONG прага - оценката остава само
+  // допълнителен контекст в самия таг/банер, не условие дали POC-ът изобщо
+  // се показва (историческият POC е ВИНАГИ полезен неутрален контекст).
+  const hasHistoricalPoc = coin.sparkSignal && coin.sparkSignal.targetPrice != null;
+  const targetLabel = hasHistoricalPoc ? (TARGET_LABELS[coin.sparkSignal.targetTier] || '📊 ИСТОРИЧЕСКИ POC') : null;
   if (targetLabel && !coin.sparkSignal.extended) {
     const tgDir = coin.sparkSignal.targetDirection;
     tags.push(`<span class="tag" style="background:${tgDir==='long'?'rgba(0,180,220,0.25)':'rgba(0,140,220,0.25)'};color:#5ec8e8">${targetLabel} ${tgDir==='long'?'▲':'▼'} (${coin.sparkSignal.targetScoreValue}/5)</span>`);
+  }
+  // TREND TARGET (виж calcTrendBalance/getTrendDirection в signal-logic.js) -
+  // ОТДЕЛЕН таг от историческия POC по-горе, излиза само когато Golden/Death
+  // Cross И моментум реално съвпадат (виж wiring-а в loadSparkTab по-долу).
+  const trendTargetLabel = coin.sparkSignal ? TREND_TARGET_LABELS[coin.sparkSignal.trendTargetTier] : null;
+  if (trendTargetLabel && !coin.sparkSignal.extended) {
+    const ttDir = coin.sparkSignal.trendTargetDirection;
+    tags.push(`<span class="tag" style="background:${ttDir==='long'?'rgba(0,220,140,0.25)':'rgba(220,60,90,0.25)'};color:${ttDir==='long'?'#4ee8a0':'#f06a90'}">${trendTargetLabel} ${ttDir==='long'?'▲':'▼'} (${coin.sparkSignal.trendTargetScoreValue}/5)</span>`);
   }
   // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore в signal-logic.js) -
   // самостоятелен таг, огледален на TRAP - излиза дори без другите тагове.
@@ -1731,9 +1770,39 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
     targetBanner = `<div style="margin:6px 0;padding:6px 8px;border-radius:4px;background:rgba(0,180,220,0.10);border-left:3px solid #5ec8e8;font-size:10px;">
       <div style="font-weight:600;color:#5ec8e8">${targetLabel} ${s.targetDirection==='long'?'▲ LONG':'▼ SHORT'} · TARGET SCORE: ${s.targetScoreValue}/5</div>
-      <div style="color:var(--text2);margin-top:2px;">POC (цел): $${formatPrice(s.targetPrice)} · Разстояние: ${fmtPct(s.targetDistancePct)}</div>
+      <div style="color:var(--text2);margin-top:2px;">Исторически POC: $${formatPrice(s.targetPrice)} · Разстояние: ${fmtPct(s.targetDistancePct)}</div>
       <div style="color:var(--text2);">Сила на нивото: ${s.targetLevelStrengthPct!=null?s.targetLevelStrengthPct.toFixed(1)+'%':'--'} от обема${s.targetMagnets && s.targetMagnets.length ? ' · Магнити по пътя: '+s.targetMagnets.map(m=>'$'+formatPrice(m.price)).join(' → ') : ''}</div>
-      <div style="color:var(--yellow);margin-top:2px;">⚠️ Ориентировъчна цел (mean-reversion) - НЕ Е entry сигнал</div>
+      <div style="color:var(--yellow);margin-top:2px;">⚠️ Исторически mean-reversion контекст - НЕ Е entry сигнал, НЕ е актуалната търговска цел</div>
+    </div>`;
+  }
+  // TREND TARGET детайлен банер - ОТДЕЛЕН от историческия POC банер по-горе
+  // (виж discussion-а "EVAA"). Показва се само когато Golden/Death Cross И
+  // моментум реално съвпадат (getTrendDirection в signal-logic.js) - при
+  // разминаване трендТargetTier е 'none', банерът просто не излиза.
+  let trendTargetBanner = '';
+  if (trendTargetLabel && !coin.sparkSignal.extended) {
+    const s = coin.sparkSignal;
+    const fmtPct = v => v == null ? '--' : (v > 0 ? '+' : '') + v.toFixed(1) + '%';
+    const ttColor = s.trendTargetDirection === 'long' ? '#4ee8a0' : '#f06a90';
+    trendTargetBanner = `<div style="margin:6px 0;padding:6px 8px;border-radius:4px;background:${s.trendTargetDirection==='long'?'rgba(0,220,140,0.10)':'rgba(220,60,90,0.10)'};border-left:3px solid ${ttColor};font-size:10px;">
+      <div style="font-weight:600;color:${ttColor}">${trendTargetLabel} ${s.trendTargetDirection==='long'?'▲ LONG':'▼ SHORT'} · TREND TARGET SCORE: ${s.trendTargetScoreValue}/5</div>
+      <div style="color:var(--text2);margin-top:2px;">Следващ HVN магнит в посоката на тренда: $${formatPrice(s.trendTargetPrice)} · Разстояние: ${fmtPct(s.trendTargetDistancePct)}</div>
+      <div style="color:var(--text2);">Сила на нивото: ${s.trendTargetLevelStrengthPct!=null?s.trendTargetLevelStrengthPct.toFixed(1)+'%':'--'} от обема</div>
+      <div style="color:var(--yellow);margin-top:2px;">⚠️ Ориентир в посоката на потвърдения тренд - НЕ Е entry сигнал</div>
+    </div>`;
+  }
+  // ⚖️ ТРЕНД БАЛАНС - винаги излиза (независимо от targetLabel/trendTargetLabel),
+  // щом има volume profile данни - не е "сигнал", а прозрачна теглова оценка
+  // (виж calcTrendBalance в signal-logic.js). Изрично НЕ е доказана вероятност.
+  let trendBalanceBanner = '';
+  if (coin.sparkSignal && coin.sparkSignal.trendBalanceLongPct != null && !coin.sparkSignal.extended) {
+    const s = coin.sparkSignal;
+    const longPct = Math.round(s.trendBalanceLongPct), shortPct = 100 - longPct;
+    const balColor = longPct >= 50 ? 'var(--green)' : 'var(--red)';
+    trendBalanceBanner = `<div style="margin:6px 0;padding:6px 8px;border-radius:4px;background:rgba(255,255,255,0.04);border-left:3px solid ${balColor};font-size:10px;">
+      <div style="font-weight:600;color:${balColor}">⚖️ ТРЕНД БАЛАНС: ${longPct}% LONG / ${shortPct}% SHORT</div>
+      <div style="color:var(--text2);margin-top:2px;">Тренд (Golden/Death): ${Math.round(s.trendBalanceCrossPct)}% LONG · Моментум (L/S сила): ${Math.round(s.trendBalanceMomentumPct)}% LONG · Магнити (претеглено): ${Math.round(s.trendBalanceMagnetPct)}% LONG</div>
+      <div style="color:var(--yellow);margin-top:2px;">⚠️ Теглова оценка от 3 фактора, НЕ доказана вероятност за успех</div>
     </div>`;
   }
   // AUCTION QUALITY детайлен банер (IDEA 03) - отделен от другите банери
@@ -1815,6 +1884,8 @@ function getTVLink(symbol) { return `https://www.tradingview.com/chart/?symbol=B
     ${flowWarmingBanner}
     ${trapBanner}
     ${targetBanner}
+    ${trendTargetBanner}
+    ${trendBalanceBanner}
     ${auctionBanner}
     ${migrationBanner}
     <div style="color:var(--text2);font-size:9px;letter-spacing:.5px;margin:6px 0 -2px;">⚡ МОМЕНТУМ ПОСОКА (24ч/L-S/funding/обем) — независимо от паттърн таговете горе</div>
