@@ -1551,24 +1551,38 @@ function findNearestHvnInDirection(price, direction, hvnList = []) {
 // тежат повече за краткосрочно движение - обратно на mean-reversion
 // логиката на calcTargetScore, където по-далечен POC = по-силен "пул").
 // Връща 50/50 при липса на данни - неутрално, не фаворизира посока.
+// РАЗШИРЕНО за Etап 2 (сървърна телеметрия, виж discussion-а "EVAA") -
+// освен дяловете, връща и СУРОВАТА структура (брой/най-близък магнит/сила
+// от всяка страна), за да различаваме ПОСЛЕ "няма магнит над цената"
+// (липса на данни) от "силен магнит под цената" (реално доказателство за
+// SHORT натиск) - двете водят до нисък longSharePct, но имат РАЗЛИЧЕН смисъл.
 function calcMagnetBalance(price, hvnList, profileTotalVolume) {
+  const empty = {
+    longSharePct: 50, shortSharePct: 50, aboveCount: 0, belowCount: 0,
+    nearestAbove: null, nearestBelow: null,
+  };
   if (price == null || !(price > 0) || !Array.isArray(hvnList) || !hvnList.length || !(profileTotalVolume > 0)) {
-    return { longSharePct: 50, shortSharePct: 50 };
+    return empty;
   }
-  let longWeight = 0, shortWeight = 0;
+  let longWeight = 0, shortWeight = 0, aboveCount = 0, belowCount = 0;
+  let nearestAbove = null, nearestBelow = null;
   for (const node of hvnList) {
     if (node.price == null || node.volume == null) continue;
     const distancePct = Math.abs((node.price - price) / price) * 100;
     const strengthPct = (node.volume / profileTotalVolume) * 100;
     const tierMultiplier = distancePct <= 5 ? 1 : distancePct <= 15 ? 0.6 : 0.3;
     const weight = strengthPct * tierMultiplier;
-    if (node.price > price) longWeight += weight;
-    else if (node.price < price) shortWeight += weight;
+    if (node.price > price) {
+      longWeight += weight; aboveCount++;
+      if (!nearestAbove || distancePct < nearestAbove.distancePct) nearestAbove = { distancePct, strengthPct };
+    } else if (node.price < price) {
+      shortWeight += weight; belowCount++;
+      if (!nearestBelow || distancePct < nearestBelow.distancePct) nearestBelow = { distancePct, strengthPct };
+    }
   }
   const total = longWeight + shortWeight;
-  if (!(total > 0)) return { longSharePct: 50, shortSharePct: 50 };
-  const longSharePct = (longWeight / total) * 100;
-  return { longSharePct, shortSharePct: 100 - longSharePct };
+  const longSharePct = total > 0 ? (longWeight / total) * 100 : 50;
+  return { longSharePct, shortSharePct: 100 - longSharePct, aboveCount, belowCount, nearestAbove, nearestBelow };
 }
 
 // ТРЕНД БАЛАНС - прозрачна ТЕГЛОВНА оценка (НЕ статистически валидирана
@@ -1585,7 +1599,36 @@ function calcTrendBalance({ goldenCross, ls, ss, price, hvnList, profileTotalVol
   const momentumPct = totalLS > 0 ? ((ls || 0) / totalLS) * 100 : 50;
   const magnet = calcMagnetBalance(price, hvnList, profileTotalVolume);
   const longSharePct = (crossPct + momentumPct + magnet.longSharePct) / 3;
-  return { longSharePct, shortSharePct: 100 - longSharePct, crossPct, momentumPct, magnetPct: magnet.longSharePct };
+  return {
+    longSharePct, shortSharePct: 100 - longSharePct, crossPct, momentumPct, magnetPct: magnet.longSharePct,
+    // Пълната магнитна структура (Etап 2 телеметрия) - виж бележката при
+    // calcMagnetBalance: "няма магнит" и "силен магнит в обратна посока" НЕ
+    // са едно и също, въпреки че и двете дърпат magnetPct надолу.
+    magnetAboveCount: magnet.aboveCount, magnetBelowCount: magnet.belowCount,
+    magnetNearestAbove: magnet.nearestAbove, magnetNearestBelow: magnet.nearestBelow,
+  };
+}
+
+// Решава КОГА клиентът праща наблюдение към Worker-а (Etап 2 телеметрия,
+// discussion-а "EVAA" уточнение 1) - НЕ само при смяна на LONG/SHORT
+// посоката: първо наблюдение на монетата, съществена промяна на ТРЕНД
+// БАЛАНСА (вкл. смяна на страната през средата, дори под прага за delta),
+// или промяна в броя HVN магнити от която и да е страна. `last` е
+// последният РЕАЛНО записан снимок за символа (null при първо наблюдение) -
+// чиста функция, не пипа мрежа/състояние. MIN_INTERVAL_MS пести обем при
+// бързи повторни рендъри, без да блокира реални, по-редки промени.
+const TREND_OBS_BALANCE_DELTA_PCT = 10;
+const TREND_OBS_MIN_INTERVAL_MS = 5 * 60 * 1000;
+function shouldRecordTrendObservation(last, current, now = Date.now()) {
+  if (!current) return false;
+  if (!last) return true;
+  if (now - (last.at || 0) < TREND_OBS_MIN_INTERVAL_MS) return false;
+  const balanceDelta = Math.abs(current.longSharePct - last.longSharePct);
+  if (balanceDelta >= TREND_OBS_BALANCE_DELTA_PCT) return true;
+  if ((current.longSharePct >= 50) !== (last.longSharePct >= 50)) return true;
+  if (current.magnetAboveCount !== last.magnetAboveCount) return true;
+  if (current.magnetBelowCount !== last.magnetBelowCount) return true;
+  return false;
 }
 
 // ═══ IDEA 03 - "AUCTION QUALITY" ═══════════════════════════════════════════════
@@ -1799,6 +1842,7 @@ if (typeof module !== 'undefined' && module.exports) {
     buildVolumeProfile, calcPOC, calcValueArea, getHVNLVN,
     calcTargetDistancePct, calcTargetScore, getTargetTier, findNearestMagnets, TARGET_LABELS, TARGET_MIN_DISTANCE_PCT,
     getTrendDirection, findNearestHvnInDirection, calcMagnetBalance, calcTrendBalance, TREND_TARGET_LABELS,
+    shouldRecordTrendObservation, TREND_OBS_BALANCE_DELTA_PCT, TREND_OBS_MIN_INTERVAL_MS,
     calcAuctionQualityScore, getAuctionQualityTier, AUCTION_LABELS, AUCTION_NARROW_WIDTH_PCT, AUCTION_SKEW_THRESHOLD,
     splitCandlesByUtcDay, getTodayYesterdayCandles, calcValueMigrationScore, getValueMigrationTier,
     MIGRATION_LABELS, MIGRATION_MIN_PCT, MIGRATION_MIN_CANDLES,

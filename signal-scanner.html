@@ -377,6 +377,12 @@ let isLoading = false; // пречи на презастъпващи се refres
 let btcAthCache = { value: null, ts: 0 };
 const athCache = {};
 const klineCache = {};
+// TREND BALANCE OBSERVATION TRACKER (Etап 2, виж /trend-observation в
+// worker.js) - последния РЕАЛНО докладван снимък по символ, за
+// shouldRecordTrendObservation (signal-logic.js) да реши дали нещо
+// съществено се е променило. Чисто in-memory (per session) - по избор на
+// потребителя за Etап 2 ("данните се събират само при активен клиент").
+const trendObsLastBySymbol = {};
 const wallCache = {};
 const oiPrevMap = {};
 // GRAVITY (виж discussion-а "WLD картата/market maker ликвидност") - ЕДНО
@@ -1155,6 +1161,37 @@ async function loadSpark() {
         goldenCross: coin.goldenCross, ls: momentumSig.ls, ss: momentumSig.ss,
         price: coin.price, hvnList: vpNodes.hvn, profileTotalVolume: volumeProfile?.totalVolume,
       });
+      // TREND BALANCE OBSERVATION TRACKER (Etап 2) - докладва на Worker-а
+      // САМО при реална промяна (shouldRecordTrendObservation в
+      // signal-logic.js), не всеки тик - виж discussion-а уточнение 1.
+      // Fire-and-forget (без await на самия resolve) - мрежова грешка тук
+      // НЕ трябва да бави/чупи рендъра на картата никога. PR #170 review,
+      // т.3 - trendObsLastBySymbol се обновява САМО след ПОТВЪРДЕН успех
+      // (res.ok), не веднага при изпращане: ако заявката се провали (мрежа/
+      // 429/500), следващия тик пак ще види "нищо не е пратено" и ще опита
+      // отново (естествен retry, без да пазим отделна опашка) - вместо
+      // тихо да приемем провала за "вече докладвано" завинаги.
+      const trendObsSnapshot = { at: Date.now(), longSharePct: trendBalance.longSharePct, magnetAboveCount: trendBalance.magnetAboveCount, magnetBelowCount: trendBalance.magnetBelowCount };
+      if (shouldRecordTrendObservation(trendObsLastBySymbol[coin.fullSymbol], trendObsSnapshot)) {
+        fetchT(`${WORKER_URL}/trend-observation`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            symbol: coin.fullSymbol, price: coin.price, longSharePct: trendBalance.longSharePct,
+            goldenCross: coin.goldenCross, ls: momentumSig.ls, ss: momentumSig.ss,
+            crossPct: trendBalance.crossPct, momentumPct: trendBalance.momentumPct, magnetPct: trendBalance.magnetPct,
+            magnetAboveCount: trendBalance.magnetAboveCount, magnetBelowCount: trendBalance.magnetBelowCount,
+            magnetNearestAboveDistancePct: trendBalance.magnetNearestAbove?.distancePct ?? null,
+            magnetNearestAboveStrengthPct: trendBalance.magnetNearestAbove?.strengthPct ?? null,
+            magnetNearestBelowDistancePct: trendBalance.magnetNearestBelow?.distancePct ?? null,
+            magnetNearestBelowStrengthPct: trendBalance.magnetNearestBelow?.strengthPct ?? null,
+            trendTargetPrice: trendTargetScore.targetPrice, trendTargetTier, trendTargetDirection: trendTargetScore.direction,
+            trendTargetDistancePct: trendTargetScore.distancePct,
+            historicalPocPrice: targetScore.targetPrice, historicalPocTier: targetTier, historicalPocDirection: targetScore.direction,
+            historicalPocDistancePct: targetScore.distancePct,
+          }),
+        }, 5000).then(res => { if (res.ok) trendObsLastBySymbol[coin.fullSymbol] = trendObsSnapshot; }).catch(() => {});
+      }
       // IDEA 03 - "AUCTION QUALITY" (виж calcAuctionQualityScore в
       // signal-logic.js) - баланс на Value Area (широчина+скос), потвърден от
       // OI/CVD. Огледално на TRAP - ИМА hard factor изискване.
