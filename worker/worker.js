@@ -6726,7 +6726,7 @@ async function scanSymbolSignals(env, symbol) {
       // смекчено (виж calcLiqVetoDetail) - за да можем да сравним дали
       // смекчаването реално помага.
       if (decision === 'confirmed' && liqVetoDetail.softened) {
-        console.log(`LIQ_SOFTENED trend_continuation ${symbol} ${entryDirection} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null}`);
+        console.log(`LIQ_SOFTENED trend_continuation ${symbol} ${entryDirection} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)}`);
       }
       trendEntryResult.entryQualityScore = record.entryQualityScore;
       trendEntryResult.entryQualityTier = record.entryQualityTier;

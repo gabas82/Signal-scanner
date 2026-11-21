@@ -185,8 +185,15 @@ describe('(D) Структурна проверка на wiring-а в РЕАЛН
     expect(workerSrc).not.toContain('LIQ_VETO_SOFTENED');
     expect(workerSrc).not.toContain('LIQ_CONFIRM_SOFTENED');
   });
-  it('LIQ_VETO и LIQ_CONFIRM логовете (MR + TC, доклад предложение #3) включват gravityDistancePct/cascadeBuyUsd/cascadeSellUsd - 4 реда общо', () => {
+  it('LIQ_VETO/LIQ_CONFIRM/LIQ_SOFTENED логовете включват gravityDistancePct/cascadeBuyUsd/cascadeSellUsd - 5 реда общо', () => {
+    // MR veto, MR confirm, TC veto, TC confirm (доклад предложение #3,
+    // 2026-11-19) + TC softened (доклад предложение #6, 2026-11-21 - виж
+    // discussion-а "LIQ_SOFTENED да носи cascade полета, симетрично на
+    // VETO/CONFIRM").
     const matches = [...workerSrc.matchAll(/gravityDistancePct=\$\{liqGravityScore\.distancePct[^}]*\}.*cascadeBuyUsd=.*cascadeSellUsd=/g)];
-    expect(matches).toHaveLength(4); // MR veto, MR confirm, TC veto, TC confirm
+    expect(matches).toHaveLength(5);
+  });
+  it('LIQ_SOFTENED логът конкретно включва cascadeBuyUsd/cascadeSellUsd (доклад предложение #6)', () => {
+    expect(workerSrc).toMatch(/LIQ_SOFTENED trend_continuation.*cascadeBuyUsd=.*cascadeSellUsd=/);
   });
 });
