@@ -124,6 +124,26 @@ function findLastMACross(closes, shortPeriod, longPeriod) {
   return { stepsAgo: (closes.length - 1) - lastFlipIndex, direction: lastFlipDirection };
 }
 
+// ETH/BTC RATIO SERIES (за ETH/BTC Golden/Death Cross - виж discussion-а "ETH
+// спрямо BTC"): findLastMACross/projectMACrossDate по-горе работят върху
+// произволен масив close цени, значи същата логика важи директно и върху
+// ratio (closeA/closeB) вместо чиста цена - просто трябва двата масива
+// klines да се подравнят по openTime, защото Binance понякога връща леко
+// различен брой свещи за двата символа (fetch в различни моменти).
+function buildRatioSeries(klinesA, klinesB) {
+  if (!Array.isArray(klinesA) || !Array.isArray(klinesB)) return [];
+  const closeByTimeB = new Map();
+  for (const k of klinesB) closeByTimeB.set(k[0], parseFloat(k[4]));
+  const pairs = [];
+  for (const k of klinesA) {
+    const closeB = closeByTimeB.get(k[0]);
+    if (closeB == null || closeB === 0) continue;
+    pairs.push([k[0], parseFloat(k[4]) / closeB]);
+  }
+  pairs.sort((a, b) => a[0] - b[0]);
+  return pairs.map(p => p[1]);
+}
+
 function calcStdDev(closes, period) {
   if (closes.length < period) return null;
   const slice = closes.slice(-period);
@@ -1820,7 +1840,7 @@ if (typeof module !== 'undefined' && module.exports) {
     DCA_LEVERAGE, DCA_ENTRY, MAJOR_COINS, SEMI_MAJOR_COINS,
     MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
     SYMBOL_MAP, fixSymbol, calcSMA, calcStdDev, calcRSI, detectBottom, detectTop,
-    buildProjectedSeries, smaAt, projectMACrossDate, findLastMACross,
+    buildProjectedSeries, smaAt, projectMACrossDate, findLastMACross, buildRatioSeries,
     calcSignal, calcSetupQuality, calcLiquidityBias, calcWallBias, calcAltRadarScore, calcAltRadarSignal,
     calcRSISeries, calcEMASeries, calcFlushSignal, calcBaseSignal, calcBaseDivergenceStrength, calcSqueezeSignal, calcShiftSignal, calcImpulseSignal,
     calcBlowoffSignal, calcDistributionSignal, calcDumpSqueezeSignal, calcShiftDownSignal,
