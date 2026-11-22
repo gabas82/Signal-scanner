@@ -8936,7 +8936,17 @@ export default {
 
     if (path.startsWith("/yahoo/")) {
       const symbol = path.replace("/yahoo/", "");
-      const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`;
+      // interval/range подадени от клиента (SP500 Golden/Death Cross проекция
+      // има нужда от ~2г дневни + ~10г седмични свещи за 50/200 DMA/WMA, не само
+      // текущата цена) - whitelist вместо pass-through, за да не превърнем
+      // proxy-то в отворен relay към произволни Yahoo chart заявки.
+      const ALLOWED_YAHOO_INTERVALS = ['1d', '1wk'];
+      const ALLOWED_YAHOO_RANGES = ['1d', '2y', '10y'];
+      const reqInterval = url.searchParams.get("interval");
+      const reqRange = url.searchParams.get("range");
+      const interval = ALLOWED_YAHOO_INTERVALS.includes(reqInterval) ? reqInterval : '1d';
+      const range = ALLOWED_YAHOO_RANGES.includes(reqRange) ? reqRange : '1d';
+      const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${interval}&range=${range}`;
       const response = await fetch(yahooUrl, {
         headers: {
           "User-Agent": "Mozilla/5.0",

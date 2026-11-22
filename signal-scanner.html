@@ -260,8 +260,9 @@
     <div class="macro-item"><div class="macro-label">DXY</div><div class="macro-value" id="mac-dxy" style="color:var(--text)">--</div><div class="macro-sub" id="mac-dxy-chg">--</div></div>
     <div class="macro-item"><div class="macro-label">ЗЛАТО</div><div class="macro-value" id="mac-gold" style="color:var(--yellow)">--</div><div class="macro-sub" id="mac-gold-chg">--</div></div>
     <div class="macro-item"><div class="macro-label">VIX</div><div class="macro-value" id="mac-vix" style="color:var(--text)">--</div><div class="macro-sub" id="mac-vix-chg">--</div></div>
-    <div class="macro-item"><div class="macro-label">SP500</div><div class="macro-value" id="mac-sp" style="color:var(--green)">--</div><div class="macro-sub" id="mac-sp-chg">--</div></div>
+    <div class="macro-item"><div class="macro-label">SP500</div><div class="macro-value" id="mac-sp" style="color:var(--green)">--</div><div class="macro-sub" id="mac-sp-chg">--</div><div class="macro-sub" id="mac-sp-cross" style="margin-top:2px;">--</div></div>
   </div>
+  <div id="sp500-cross-projection" style="display:none;padding:6px 2px 0;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2);border-top:1px solid var(--border);margin-top:6px;"></div>
 </div>
 <div class="btc-macro" id="btc-macro-panel">
   <div class="btc-macro-header">
@@ -1426,6 +1427,54 @@ async function loadBTCCrossProjection(dailyCloses) {
   } catch (e) { el.style.display = 'none'; }
 }
 
+// SP500 GOLDEN/DEATH CROSS - огледално на loadBTCCrossProjection по-горе, но
+// върху %5EGSPC през /yahoo/ proxy-то (виж worker.js) вместо Binance klines.
+// Кешира се 1ч (yahooHistCache) - 50/200 DMA/WMA историята се мени бавно,
+// няма смисъл да я тегли всеки 60s AUTO refresh цикъл.
+const yahooHistCache = {};
+async function fetchYahooCloses(symbol, interval, range, maxAgeMs = 3600000) {
+  const key = `${symbol}_${interval}_${range}`;
+  if (yahooHistCache[key] && yahooHistCache[key].ts > Date.now() - maxAgeMs) return yahooHistCache[key].data;
+  try {
+    const r = await fetchT(`${WORKER_URL}/yahoo/${symbol}?interval=${interval}&range=${range}`);
+    const d = await r.json();
+    const closesRaw = d?.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
+    if (!Array.isArray(closesRaw)) return null;
+    const closes = closesRaw.filter(c => c != null);
+    yahooHistCache[key] = { data: closes, ts: Date.now() };
+    return closes;
+  } catch(e) { return null; }
+}
+async function loadSP500CrossProjection() {
+  const el = document.getElementById('sp500-cross-projection');
+  const crossEl = document.getElementById('mac-sp-cross');
+  try {
+    const dailyCloses = await fetchYahooCloses('%5EGSPC', '1d', '2y');
+    if (!dailyCloses || dailyCloses.length < 201) { if (el) el.style.display = 'none'; return; }
+    const dma50 = calcSMA(dailyCloses, 50);
+    const dma200 = calcSMA(dailyCloses, 200);
+    if (crossEl && dma50 && dma200) {
+      crossEl.textContent = dma50 > dma200 ? '🟡 GOLDEN' : '💀 DEATH';
+      crossEl.style.color = dma50 > dma200 ? 'var(--yellow)' : 'var(--red)';
+    }
+    const dailyLastCross = findLastMACross(dailyCloses, 50, 200);
+    const dailyProjection = projectMACrossDate(dailyCloses, 50, 200, 400);
+    const weeklyCloses = await fetchYahooCloses('%5EGSPC', '1wk', '10y');
+    const weeklyLastCross = findLastMACross(weeklyCloses || [], 50, 200);
+    const weeklyProjection = projectMACrossDate(weeklyCloses || [], 50, 200, 200);
+    const lines = [];
+    const dailyLastLine = formatLastCrossLine('SP500 Дневна (50/200DMA)', dailyLastCross, 'day', 14);
+    const weeklyLastLine = formatLastCrossLine('SP500 Седмична (50/200WMA)', weeklyLastCross, 'week', 8);
+    if (dailyLastLine) lines.push(dailyLastLine);
+    if (weeklyLastLine) lines.push(weeklyLastLine);
+    if (dailyProjection) lines.push(formatCrossProjectionLine('SP500 Дневна (50/200DMA)', dailyProjection, 'day'));
+    if (weeklyProjection) lines.push(formatCrossProjectionLine('SP500 Седмична (50/200WMA)', weeklyProjection, 'week'));
+    if (!el || !lines.length) { if (el) el.style.display = 'none'; return; }
+    el.innerHTML = `📅 SP500 ПРОЕКЦИЯ ПРИ НЕПРОМЕНЕНА ЦЕНА<br>${lines.join('<br>')}`;
+    el.style.display = '';
+  } catch (e) { if (el) el.style.display = 'none'; }
+}
+
 function updateSeasonBadge(dma50, dma200, mayer, rsi90, athPct) {
   let bullScore = 0, bearScore = 0;
   if (dma50 && dma200) { if (dma50 > dma200) bullScore += 2; else bearScore += 2; }
@@ -2049,7 +2098,7 @@ async function loadAll(isAuto) {
     const now = new Date();
     document.getElementById('last-update').textContent = `ОБНОВЕНО: ${now.toLocaleTimeString('bg')} · AUTO 60s · ${allCoins.length} МОНЕТИ`;
     loadBTCMacro();
-    loadCryptoMarketRow(); loadMacroRow();
+    loadCryptoMarketRow(); loadMacroRow(); loadSP500CrossProjection();
     // ATH/ATL и kline верижните заявки текат бавно (rate-limit пауза между всяка) -
     // изчакваме ги тук, за да не се пресекат със следващия refresh цикъл.
     await Promise.all([loadAthAtlAsync(), loadKlinesAsync()]);
