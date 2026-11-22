@@ -13,7 +13,7 @@ import {
   getMaintenanceRate, calcLiquidationPrice, calcDCALevels,
   MAINTENANCE_RATE_MAJOR, MAINTENANCE_RATE_SEMI, MAINTENANCE_RATE_MINOR,
   DCA_ENTRY, DCA_LEVERAGE, carryForwardCoinExtras, isScanNowTab, carryForwardKlineExtras,
-  isDeepAthDropCandidate, buildProjectedSeries, smaAt, projectMACrossDate, findLastMACross,
+  isDeepAthDropCandidate, buildProjectedSeries, smaAt, projectMACrossDate, findLastMACross, buildRatioSeries,
   getTrendDirection, findNearestHvnInDirection, calcMagnetBalance, calcTrendBalance, shouldRecordTrendObservation
 } from './signal-logic.js';
 
@@ -96,6 +96,40 @@ describe('findLastMACross', () => {
   it('невалиден вход (не масив) -> null, без грешка', () => {
     expect(() => findLastMACross(null, 2, 4)).not.toThrow();
     expect(findLastMACross(undefined, 2, 4)).toBeNull();
+  });
+});
+
+describe('buildRatioSeries', () => {
+  // Binance kline формат: [openTime, open, high, low, close, volume, ...] - само
+  // openTime (index 0) и close (index 4, като string) са релевантни тук.
+  function k(openTime, close) { return [openTime, '0', '0', '0', String(close), '0']; }
+
+  it('подравнява по openTime и дели closeA/closeB поред', () => {
+    const a = [k(1000, 10), k(2000, 20), k(3000, 30)];
+    const b = [k(1000, 2), k(2000, 4), k(3000, 5)];
+    expect(buildRatioSeries(a, b)).toEqual([5, 5, 6]);
+  });
+  it('пропуска timestamp-ове, липсващи само в единия масив', () => {
+    const a = [k(1000, 10), k(2000, 20), k(4000, 40)];
+    const b = [k(1000, 2), k(3000, 3), k(4000, 4)];
+    expect(buildRatioSeries(a, b)).toEqual([5, 10]); // 2000 и 3000 отпадат
+  });
+  it('сортира резултата по openTime, независимо от реда на входа', () => {
+    const a = [k(3000, 30), k(1000, 10), k(2000, 20)];
+    const b = [k(2000, 2), k(3000, 3), k(1000, 1)];
+    expect(buildRatioSeries(a, b)).toEqual([10, 10, 10]);
+  });
+  it('пропуска двойка с closeB = 0 (деление на нула)', () => {
+    const a = [k(1000, 10), k(2000, 20)];
+    const b = [k(1000, 0), k(2000, 4)];
+    expect(buildRatioSeries(a, b)).toEqual([5]);
+  });
+  it('невалиден вход (не масив) -> [], без грешка', () => {
+    expect(buildRatioSeries(null, [])).toEqual([]);
+    expect(buildRatioSeries([], undefined)).toEqual([]);
+  });
+  it('празни масиви -> []', () => {
+    expect(buildRatioSeries([], [])).toEqual([]);
   });
 });
 
