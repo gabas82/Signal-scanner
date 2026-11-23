@@ -185,15 +185,30 @@ describe('(D) Структурна проверка на wiring-а в РЕАЛН
     expect(workerSrc).not.toContain('LIQ_VETO_SOFTENED');
     expect(workerSrc).not.toContain('LIQ_CONFIRM_SOFTENED');
   });
-  it('LIQ_VETO/LIQ_CONFIRM/LIQ_SOFTENED логовете включват gravityDistancePct/cascadeBuyUsd/cascadeSellUsd - 5 реда общо', () => {
-    // MR veto, MR confirm, TC veto, TC confirm (доклад предложение #3,
-    // 2026-11-19) + TC softened (доклад предложение #6, 2026-11-21 - виж
-    // discussion-а "LIQ_SOFTENED да носи cascade полета, симетрично на
-    // VETO/CONFIRM").
+  it('LIQ_VETO/LIQ_CONFIRM/LIQ_PASS/LIQ_SOFTENED логовете включват gravityDistancePct/cascadeBuyUsd/cascadeSellUsd - 7 реда общо', () => {
+    // MR veto, MR confirm, MR pass, TC veto, TC confirm, TC pass (доклад
+    // предложение #3/#4, 2026-11-22 - виж "LIQ_PASS" discussion-а) + TC
+    // softened (доклад предложение #6, 2026-11-21).
     const matches = [...workerSrc.matchAll(/gravityDistancePct=\$\{liqGravityScore\.distancePct[^}]*\}.*cascadeBuyUsd=.*cascadeSellUsd=/g)];
-    expect(matches).toHaveLength(5);
+    expect(matches).toHaveLength(7);
   });
   it('LIQ_SOFTENED логът конкретно включва cascadeBuyUsd/cascadeSellUsd (доклад предложение #6)', () => {
     expect(workerSrc).toMatch(/LIQ_SOFTENED trend_continuation.*cascadeBuyUsd=.*cascadeSellUsd=/);
+  });
+  it('всичките 7 LIQ_* needle-а включват price=${price} (доклад предложение #3, 2026-11-22 - futures-only символи без spot история)', () => {
+    const matches = [...workerSrc.matchAll(/cascadeSellUsd=\$\{Math\.round\(liquidationCascade\.sellSumUsd \?\? 0\)\} price=\$\{price\}/g)];
+    expect(matches).toHaveLength(7);
+  });
+  it('LIQ_CONFIRM логва САМО при реално потвърждение (liqConfirm === "confirm"), не просто "не е no_data" (доклад предложение #4, 2026-11-22)', () => {
+    const matches = [...workerSrc.matchAll(/if \(decision === 'confirmed' && record\.liqConfirm === 'confirm'\) \{/g)];
+    expect(matches).toHaveLength(2); // MR + TC
+    // Старото, разводняващо условие вече не трябва да съществува никъде.
+    expect(workerSrc).not.toContain("record.liqConfirm != null && record.liqConfirm !== 'no_data') {\n        console.log(`LIQ_CONFIRM");
+  });
+  it('LIQ_PASS съществува като ОТДЕЛЕН needle за "neutral"/"against" CONFIRMED записи (доклад предложение #4, 2026-11-22)', () => {
+    expect(workerSrc).toContain('LIQ_PASS mean_reversion');
+    expect(workerSrc).toContain('LIQ_PASS trend_continuation');
+    const matches = [...workerSrc.matchAll(/if \(decision === 'confirmed' && record\.liqConfirm != null && record\.liqConfirm !== 'no_data' && record\.liqConfirm !== 'confirm'\) \{/g)];
+    expect(matches).toHaveLength(2); // MR + TC
   });
 });

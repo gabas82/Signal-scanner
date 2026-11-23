@@ -6486,14 +6486,23 @@ async function scanSymbolSignals(env, symbol) {
       // gravityDistancePct/cascadeBuyUsd/cascadeSellUsd - доклад предложение #3
       // (2026-11-19) - виж огледалния коментар в TREND CONTINUATION блока по-долу.
       if (decision === 'veto' && record.vetoSource !== 'flow') {
-        console.log(`LIQ_VETO mean_reversion ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)}`);
+        console.log(`LIQ_VETO mean_reversion ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)} price=${price}`);
       }
-      // OBSERVABILITY-ONLY, огледално на LIQ_VETO по-горе - за CONFIRMED записи
-      // С налични LIQ данни (liqConfirm != 'no_data'), за да могат VETO и
-      // CONFIRMED сигналите да се сравняват обективно в анализа. Записи БЕЗ
-      // LIQ данни (null/'no_data') НЕ логват тук - разграничени са нарочно.
-      if (decision === 'confirmed' && record.liqConfirm != null && record.liqConfirm !== 'no_data') {
-        console.log(`LIQ_CONFIRM mean_reversion ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)}`);
+      // OBSERVABILITY-ONLY, огледално на LIQ_VETO по-горе - ТОЧНО за реално
+      // потвърдени записи (liqConfirm === 'confirm' - каскадата в СЪЩАТА
+      // посока), не просто "не е no_data" - доклад предложение #4 (2026-11-22):
+      // старото условие пускаше тук и 'neutral' (LIQ данни има, но без посока),
+      // разводнявайки анализа (~94% от старите CONFIRM записи без реален LIQ
+      // сигнал). 'neutral'/'against' минават през LIQ_PASS по-долу вместо.
+      if (decision === 'confirmed' && record.liqConfirm === 'confirm') {
+        console.log(`LIQ_CONFIRM mean_reversion ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)} price=${price}`);
+      }
+      // LIQ_PASS - доклад предложение #4 (2026-11-22) - отделен needle за
+      // ENTRY записи БЕЗ реален LIQ сигнал в тяхна полза (liqConfirm 'neutral'
+      // или 'against', но не са vetoe-нати), за да не се бъркат с истинските
+      // LIQ_CONFIRM случаи в бъдещия анализ.
+      if (decision === 'confirmed' && record.liqConfirm != null && record.liqConfirm !== 'no_data' && record.liqConfirm !== 'confirm') {
+        console.log(`LIQ_PASS mean_reversion ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)} price=${price}`);
       }
       entryResult.entryQualityScore = record.entryQualityScore;
       entryResult.entryQualityTier = record.entryQualityTier;
@@ -6713,11 +6722,15 @@ async function scanSymbolSignals(env, symbol) {
       // реално подобрява резултата (виж calcLiqVetoDetail за gravityDistancePct
       // контекста, calcLiquidationCascade за buySumUsd/sellSumUsd).
       if (decision === 'veto' && record.vetoSource !== 'flow') {
-        console.log(`LIQ_VETO trend_continuation ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)}`);
+        console.log(`LIQ_VETO trend_continuation ${symbol} ${entryDirection} vetoSource=${record.vetoSource} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)} price=${price}`);
       }
       // OBSERVABILITY-ONLY - виж огледалния коментар в MEAN REVERSION блока по-горе.
-      if (decision === 'confirmed' && record.liqConfirm != null && record.liqConfirm !== 'no_data') {
-        console.log(`LIQ_CONFIRM trend_continuation ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)}`);
+      if (decision === 'confirmed' && record.liqConfirm === 'confirm') {
+        console.log(`LIQ_CONFIRM trend_continuation ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)} price=${price}`);
+      }
+      // LIQ_PASS - виж огледалния коментар в MEAN REVERSION блока по-горе.
+      if (decision === 'confirmed' && record.liqConfirm != null && record.liqConfirm !== 'no_data' && record.liqConfirm !== 'confirm') {
+        console.log(`LIQ_PASS trend_continuation ${symbol} ${entryDirection} liqConfirm=${record.liqConfirm} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)} price=${price}`);
       }
       // LIQ_SOFTENED - доклад предложение #1 (2026-11-19) - отделен needle от
       // LIQ_VETO/LIQ_CONFIRM нарочно (не споделя префикс с нито едно от двете),
@@ -6726,7 +6739,7 @@ async function scanSymbolSignals(env, symbol) {
       // смекчено (виж calcLiqVetoDetail) - за да можем да сравним дали
       // смекчаването реално помага.
       if (decision === 'confirmed' && liqVetoDetail.softened) {
-        console.log(`LIQ_SOFTENED trend_continuation ${symbol} ${entryDirection} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)}`);
+        console.log(`LIQ_SOFTENED trend_continuation ${symbol} ${entryDirection} gravityTier=${liqGravityTier ?? 'none'} gravityDir=${liqGravityDirection ?? null} gravityDistancePct=${liqGravityScore.distancePct ?? null} cascadeBuyUsd=${Math.round(liquidationCascade.buySumUsd ?? 0)} cascadeSellUsd=${Math.round(liquidationCascade.sellSumUsd ?? 0)} price=${price}`);
       }
       trendEntryResult.entryQualityScore = record.entryQualityScore;
       trendEntryResult.entryQualityTier = record.entryQualityTier;
