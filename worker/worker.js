@@ -9215,8 +9215,13 @@ export default {
       const rawActive = await env.ALERT_STATE.get(ROTATION_STATE_KEY);
       const active = rawActive ? JSON.parse(rawActive) : {};
       const limit = Math.min(parseInt(url.searchParams.get("limit") || "200", 10) || 200, 1000);
-      const listResult = await env.ALERT_STATE.list({ prefix: "rotation:" });
-      const recordKeys = listResult.keys
+      // PAGINATION FIX (2026-11-25) - виж listKvKeysWithTruncation по-горе и
+      // discussion-а "/cluster-diagnostics пагинация" - единична list({prefix})
+      // заявка спира мълчаливо при 1000 ключа (KV лимит на страница), в
+      // лексикографски, НЕ хронологичен ред.
+      const MAX_KEYS_SCANNED = 5000;
+      const { keys, truncated: listTruncated } = await listKvKeysWithTruncation(env.ALERT_STATE, "rotation:", MAX_KEYS_SCANNED);
+      const recordKeys = keys
         .map(k => k.name)
         .filter(name => name.split(":").length >= 3); // изключва rotation:active/rotation:pending control ключовете
       const records = (await Promise.all(recordKeys.map(k => env.ALERT_STATE.get(k)))).filter(Boolean).map(r => JSON.parse(r));
@@ -9225,6 +9230,7 @@ export default {
         activeCount: Object.keys(active).length,
         active,
         exitedCount: records.length,
+        truncated: listTruncated || records.length > limit,
         exited: records.slice(0, limit),
       });
     }
@@ -9247,14 +9253,21 @@ export default {
       }));
       const openCount = trackedEntries.reduce((n, e) => n + Object.values(e.state?.slots || {}).filter(Boolean).length, 0);
       const limit = Math.min(parseInt(url.searchParams.get("limit") || "200", 10) || 200, 1000);
-      const listResult = await env.ALERT_STATE.list({ prefix: CLUSTER_EVENT_KV_PREFIX });
-      const recordKeys = listResult.keys.map(k => k.name);
-      const records = (await Promise.all(recordKeys.map(k => env.ALERT_STATE.get(k)))).filter(Boolean).map(r => JSON.parse(r));
+      // PAGINATION FIX (2026-11-25) - виж listKvKeysWithTruncation по-горе -
+      // единична list({prefix}) заявка спира мълчаливо при 1000 ключа (KV
+      // лимит на страница), в лексикографски, НЕ хронологичен ред. Потвърдено
+      // с реални данни: 6467 действителни clusterevent: записа срещу само
+      // 1000 видими преди тази поправка (виж седмичния анализ на Liquidation
+      // Cluster Outcome Tracker, 24.11.2026).
+      const MAX_KEYS_SCANNED = 10000;
+      const { keys, truncated: listTruncated } = await listKvKeysWithTruncation(env.ALERT_STATE, CLUSTER_EVENT_KV_PREFIX, MAX_KEYS_SCANNED);
+      const records = (await Promise.all(keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
       records.sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0));
       return json({
         openCount,
         tracked: Object.fromEntries(trackedEntries.map(e => [e.symbol, e.state])),
         closedCount: records.length,
+        truncated: listTruncated || records.length > limit,
         closed: records.slice(0, limit),
       });
     }
@@ -9272,12 +9285,18 @@ export default {
         return [symbol, raw ? JSON.parse(raw) : null];
       }));
       const limit = Math.min(parseInt(url.searchParams.get("limit") || "200", 10) || 200, 1000);
-      const listResult = await env.ALERT_STATE.list({ prefix: CME_GAP_EVENT_KV_PREFIX });
-      const records = (await Promise.all(listResult.keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
+      // PAGINATION FIX (2026-11-25) - виж listKvKeysWithTruncation по-горе,
+      // същия клас поправка като /cluster-diagnostics//tag-outcome-diagnostics
+      // (CME гаповете са рядко събитие, малко вероятно да надхвърлят 1000, но
+      // поправяме за консистентност - без риск, евтино).
+      const MAX_KEYS_SCANNED = 2000;
+      const { keys, truncated: listTruncated } = await listKvKeysWithTruncation(env.ALERT_STATE, CME_GAP_EVENT_KV_PREFIX, MAX_KEYS_SCANNED);
+      const records = (await Promise.all(keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
       records.sort((a, b) => (b.filledAt || 0) - (a.filledAt || 0));
       return json({
         open: Object.fromEntries(openEntries),
         closedCount: records.length,
+        truncated: listTruncated || records.length > limit,
         closed: records.slice(0, limit),
       });
     }
@@ -9294,13 +9313,21 @@ export default {
       if (!env.ALERT_STATE) return json({ error: "ALERT_STATE not configured" }, 500);
       const typeParam = (url.searchParams.get("type") || "").trim();
       const limit = Math.min(parseInt(url.searchParams.get("limit") || "2000", 10) || 2000, 5000);
-      const listResult = await env.ALERT_STATE.list({ prefix: "tagoutcome:" });
-      let records = (await Promise.all(listResult.keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
+      // PAGINATION FIX (2026-11-25) - виж listKvKeysWithTruncation по-горе -
+      // единична list({prefix}) заявка спира мълчаливо при 1000 ключа (KV
+      // лимит на страница), в лексикографски, НЕ хронологичен ред. Потвърдено
+      // с реални данни: 2118 действителни tagoutcome: записа срещу само 1000
+      // видими преди тази поправка (виж седмичния преглед, 22.11.2026) -
+      // buildTagOutcomeSummary по-долу вече реално смята от ПЪЛНИЯ набор, не
+      // от произволна лексикографска част от него.
+      const MAX_KEYS_SCANNED = 10000;
+      const { keys, truncated: listTruncated } = await listKvKeysWithTruncation(env.ALERT_STATE, "tagoutcome:", MAX_KEYS_SCANNED);
+      let records = (await Promise.all(keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
       if (typeParam) records = records.filter(r => r.type === typeParam);
       records.sort((a, b) => (b.at || 0) - (a.at || 0));
       return json({
         count: records.length,
-        truncated: records.length > limit,
+        truncated: listTruncated || records.length > limit,
         summary: buildTagOutcomeSummary(records),
         records: records.slice(0, limit),
       });
