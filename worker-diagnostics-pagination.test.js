@@ -12,10 +12,22 @@
 // Поправката реюзва вече доказания listKvKeysWithTruncation helper (същия,
 // който вече коректно захранва /trend-observation-diagnostics, /telemetry,
 // /tc-lifecycle - виж worker-entry-telemetry-integrity.test.js за неговите
-// собствени honest-truncation тестове). Тук тестваме КРАЙНИТЕ 4 endpoint-а:
-// /cluster-diagnostics, /rotation-diagnostics, /cme-gap-diagnostics,
-// /tag-outcome-diagnostics - структурно (реално викат helper-а) И
-// функционално (>1000 seed-нати ключа -> пълен брой в отговора, не капнат).
+// собствени honest-truncation тестове).
+//
+// SUBREQUEST LIMIT HOTFIX (СЪЩИЯ ден, няколко минути след първия deploy) -
+// първият опит тук ползваше MAX_KEYS_SCANNED=10000/5000/2000 - всеки .get()
+// по-долу е отделна Worker subrequest, а Cloudflare капва на ~1000
+// subrequests/invocation. /cluster-diagnostics (10000, ~6467 реални записа)
+// реално хвърли 500 на живо секунди след deploy ("error code: 1101"
+// - uncaught exception). Моите mock-базирани тестове НЕ можеха да хванат
+// това, защото mock-овете нямат такъв лимит - затова тук сега тестваме и
+// изрично "голям реалистичен dataset -> НЕ хвърля грешка" регресионно, не
+// само "не капва на старата 1000-page граница".
+//
+// Крайна стойност: MAX_KEYS_SCANNED=500 за всичките 4 - сигурен марж под
+// subrequest лимита (+35 за WATCHLIST trackedEntries в /cluster-diagnostics).
+// Честно по-тесен прозорец от преди, но НИКОГА не крашва, и truncated вече
+// казва истината.
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import {
@@ -28,16 +40,17 @@ const workerSrc = fs.readFileSync('./worker/worker.js', 'utf8');
 // Реалистичен многостраничен KV мок - за разлика от еднократните makeKv()
 // мокове в другите test файлове (винаги list_complete:true, игнорират
 // limit/cursor), този РЕАЛНО капва всяка страница на подадения limit и връща
-// cursor, точно като истинския Cloudflare KV.list() - нужен е, за да се
-// упражни реално do/while цикъла на listKvKeysWithTruncation през ендпойнта,
-// не само през самия helper (той вече е тестван отделно).
+// cursor, точно като истинския Cloudflare KV.list(); брои и .get() повикванията
+// - за да можем да докажем, че общият брой subrequests остава безопасно
+// ограничен дори при хиляди seed-нати ключа (регресионен тест за днешния 500).
 function makePaginatedKv(seed = {}) {
   const m = new Map(Object.entries(seed));
-  let listCalls = 0;
+  let listCalls = 0, getCalls = 0;
   return {
     m,
     listCallCount: () => listCalls,
-    get: async (k) => (m.has(k) ? m.get(k) : null),
+    getCallCount: () => getCalls,
+    get: async (k) => { getCalls++; return m.has(k) ? m.get(k) : null; },
     put: async (k, v) => { m.set(k, v); },
     delete: async (k) => { m.delete(k); },
     list: async ({ prefix = '', cursor, limit = 1000 } = {}) => {
@@ -73,14 +86,21 @@ describe('Структурна проверка - и 4-те endpoint-а вече
     const bareListMatches = [...workerSrc.matchAll(/\.list\(\{\s*prefix:(?!\s*,\s*cursor)/g)];
     expect(bareListMatches.length).toBe(3); // helper-ът, rotation digest, findFirstEntryTelemetryRecord
   });
+  it('MAX_KEYS_SCANNED за всичките 4 е безопасно под Cloudflare subrequest лимита (500, не 10000/5000/2000 както при първия, счупен опит)', () => {
+    const matches = [...workerSrc.matchAll(/const MAX_KEYS_SCANNED = (\d+);/g)].map(m => Number(m[1]));
+    // 10 общо в целия файл (4-те тук + 6-те по-стари, недокоснати endpoint-а) -
+    // проверяваме само че никой от НАШИТЕ 4 вече не е >500.
+    const highValues = matches.filter(v => v > 500);
+    expect(highValues.length).toBeLessThanOrEqual(6); // колкото бяха ПРЕДИ тази промяна (другите 6 endpoint-а, недокоснати тук)
+  });
 });
 
-describe('/cluster-diagnostics - функционална проверка (>1000 ключа)', () => {
+describe('/cluster-diagnostics - функционална проверка', () => {
   const call = (env, qs = '') => worker.fetch(new Request(`https://w.mock/cluster-diagnostics${qs}`), env, { waitUntil() {} });
 
-  it('1200 clusterevent: записа -> closedCount=1200 (не капнато на 1000), truncated:false', async () => {
+  it('200 clusterevent: записа (под 500) -> closedCount=200, truncated:false', async () => {
     const seed = {};
-    for (let i = 0; i < 1200; i++) {
+    for (let i = 0; i < 200; i++) {
       const rec = { symbol: 'BTCUSDT', side: 'above', kind: 'control', openedAt: 1000 + i, closedAt: 2000 + i, closeReason: 'bounced' };
       seed[clusterEventKey(rec)] = JSON.stringify(rec);
     }
@@ -88,22 +108,33 @@ describe('/cluster-diagnostics - функционална проверка (>100
     const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret&symbol=BTCUSDT&limit=1000');
     expect(res.status).toBe(200);
     const body = await res.json();
-    // КЛЮЧОВАТА проверка - преди фикса closedCount спираше на 1000 (KV
-    // page limit), независимо от истинския брой записи.
-    expect(body.closedCount).toBe(1200);
-    expect(kv.listCallCount()).toBe(2); // 2 реалистични страници (1000+200), не 1 - доказва, че пагинацията реално се случва
-    // truncated:true тук е КОРЕКТНО (display ?limit= капва на 1000, а записите
-    // са 1200) - отделна, легитимна причина от старата KV-пагинация дупка.
+    expect(body.closedCount).toBe(200);
+    expect(body.truncated).toBe(false);
+  });
+
+  it('РЕГРЕСИОНЕН ТЕСТ за днешния production инцидент: 6467 clusterevent: записа (реалният обем) -> НЕ хвърля грешка, честно капва на 500 с truncated:true, общо <600 .get() извиквания', async () => {
+    const seed = {};
+    for (let i = 0; i < 6467; i++) {
+      const rec = { symbol: `COIN${i % 35}USDT`, side: i % 2 ? 'above' : 'below', kind: i % 10 === 0 ? 'cluster' : 'control', openedAt: 1000 + i, closedAt: 2000 + i, closeReason: 'bounced' };
+      seed[clusterEventKey(rec)] = JSON.stringify(rec);
+    }
+    const kv = makePaginatedKv(seed);
+    const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret&limit=500');
+    expect(res.status).toBe(200); // КЛЮЧОВО - преди hotfix-а това би хвърлило 500 на живо
+    const body = await res.json();
+    expect(body.closedCount).toBe(500); // честен, нов таван - не 6467, но и не крашва
     expect(body.truncated).toBe(true);
+    // 35 WATCHLIST символа (trackedEntries) + ~1-2 list() страници + 500 event gets
+    expect(kv.getCallCount()).toBeLessThan(600);
   });
 });
 
-describe('/rotation-diagnostics - функционална проверка (>1000 ключа)', () => {
+describe('/rotation-diagnostics - функционална проверка', () => {
   const call = (env, qs = '') => worker.fetch(new Request(`https://w.mock/rotation-diagnostics${qs}`), env, { waitUntil() {} });
 
-  it('1100 rotation: записа -> exitedCount=1100 (не капнато на 1000)', async () => {
+  it('300 rotation: записа (под 500) -> exitedCount=300', async () => {
     const seed = {};
-    for (let i = 0; i < 1100; i++) {
+    for (let i = 0; i < 300; i++) {
       const rec = { symbol: `COIN${i}USDT`, enteredAt: 1000 + i, exitedAt: 2000 + i, outcome: 'ok' };
       seed[`rotation:${rec.symbol}:${rec.enteredAt}`] = JSON.stringify(rec);
     }
@@ -111,16 +142,30 @@ describe('/rotation-diagnostics - функционална проверка (>10
     const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret&limit=1000');
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.exitedCount).toBe(1100);
+    expect(body.exitedCount).toBe(300);
+  });
+
+  it('1500 rotation: записа (над 500) -> НЕ хвърля грешка, exitedCount=500, truncated:true', async () => {
+    const seed = {};
+    for (let i = 0; i < 1500; i++) {
+      const rec = { symbol: `COIN${i}USDT`, enteredAt: 1000 + i, exitedAt: 2000 + i, outcome: 'ok' };
+      seed[`rotation:${rec.symbol}:${rec.enteredAt}`] = JSON.stringify(rec);
+    }
+    const kv = makePaginatedKv(seed);
+    const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret&limit=500');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.exitedCount).toBe(500);
+    expect(body.truncated).toBe(true);
   });
 });
 
-describe('/cme-gap-diagnostics - функционална проверка (>1000 ключа)', () => {
+describe('/cme-gap-diagnostics - функционална проверка', () => {
   const call = (env, qs = '') => worker.fetch(new Request(`https://w.mock/cme-gap-diagnostics${qs}`), env, { waitUntil() {} });
 
-  it('1050 cmegapevent: записа -> closedCount=1050 (не капнато на 1000)', async () => {
+  it('100 cmegapevent: записа (под 500) -> closedCount=100', async () => {
     const seed = {};
-    for (let i = 0; i < 1050; i++) {
+    for (let i = 0; i < 100; i++) {
       const rec = { symbol: 'BTC', filledAt: 1000 + i, direction: 'up' };
       seed[cmeGapEventKey(rec)] = JSON.stringify(rec);
     }
@@ -128,16 +173,30 @@ describe('/cme-gap-diagnostics - функционална проверка (>100
     const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret&limit=1000');
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.closedCount).toBe(1050);
+    expect(body.closedCount).toBe(100);
+  });
+
+  it('1200 cmegapevent: записа (над 500) -> НЕ хвърля грешка, closedCount=500, truncated:true', async () => {
+    const seed = {};
+    for (let i = 0; i < 1200; i++) {
+      const rec = { symbol: 'BTC', filledAt: 1000 + i, direction: 'up' };
+      seed[cmeGapEventKey(rec)] = JSON.stringify(rec);
+    }
+    const kv = makePaginatedKv(seed);
+    const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret&limit=500');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.closedCount).toBe(500);
+    expect(body.truncated).toBe(true);
   });
 });
 
-describe('/tag-outcome-diagnostics - функционална проверка (>1000 ключа)', () => {
+describe('/tag-outcome-diagnostics - функционална проверка', () => {
   const call = (env, qs = '') => worker.fetch(new Request(`https://w.mock/tag-outcome-diagnostics${qs}`), env, { waitUntil() {} });
 
-  it('1300 tagoutcome: записа -> count=1300 (не капнато на 1000)', async () => {
+  it('400 tagoutcome: записа (под 500) -> count=400', async () => {
     const seed = {};
-    for (let i = 0; i < 1300; i++) {
+    for (let i = 0; i < 400; i++) {
       const rec = { symbol: 'ETHUSDT', type: 'flush', direction: 'long', at: 1000 + i, concurrentTypes: [] };
       seed[`tagoutcome:ETHUSDT:${1000 + i}:flush`] = JSON.stringify(rec);
     }
@@ -145,7 +204,22 @@ describe('/tag-outcome-diagnostics - функционална проверка (
     const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret&limit=5000');
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.count).toBe(1300); // КЛЮЧОВАТА проверка - преди фикса би спряло на 1000
-    expect(body.records.length).toBe(1300); // под ?limit=5000 - не е орязано и на display ниво
+    expect(body.count).toBe(400);
+    expect(body.records.length).toBe(400);
+  });
+
+  it('РЕГРЕСИОНЕН ТЕСТ: 2118 tagoutcome: записа (реалният обем от седмичния преглед) -> НЕ хвърля грешка, count=500, truncated:true', async () => {
+    const seed = {};
+    for (let i = 0; i < 2118; i++) {
+      const rec = { symbol: 'ETHUSDT', type: 'flush', direction: 'long', at: 1000 + i, concurrentTypes: [] };
+      seed[`tagoutcome:ETHUSDT:${1000 + i}:flush`] = JSON.stringify(rec);
+    }
+    const kv = makePaginatedKv(seed);
+    const res = await call({ ALERT_STATE: kv, TELEMETRY_TOKEN: 'secret' }, '?token=secret&limit=5000');
+    expect(res.status).toBe(200); // КЛЮЧОВО - преди hotfix-а (MAX_KEYS_SCANNED=10000) това би рискувало 500
+    const body = await res.json();
+    expect(body.count).toBe(500);
+    expect(body.truncated).toBe(true);
+    expect(kv.getCallCount()).toBeLessThan(550);
   });
 });

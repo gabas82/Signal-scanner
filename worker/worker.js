@@ -9219,7 +9219,13 @@ export default {
       // discussion-а "/cluster-diagnostics пагинация" - единична list({prefix})
       // заявка спира мълчаливо при 1000 ключа (KV лимит на страница), в
       // лексикографски, НЕ хронологичен ред.
-      const MAX_KEYS_SCANNED = 5000;
+      // SUBREQUEST LIMIT HOTFIX (2026-11-25, СЪЩИЯ ден) - първият опит тук
+      // ползваше MAX_KEYS_SCANNED=5000, но всеки .get() по-долу Е отделна
+      // Worker subrequest - Cloudflare капва на ~1000 subrequests/invocation.
+      // /cluster-diagnostics (10000) наистина продуцира 500 на живо секунди
+      // след deploy. 500 оставя сигурен marж под лимита за всичките 4
+      // поправени endpoint-а в тази промяна (разходи по-долу).
+      const MAX_KEYS_SCANNED = 500;
       const { keys, truncated: listTruncated } = await listKvKeysWithTruncation(env.ALERT_STATE, "rotation:", MAX_KEYS_SCANNED);
       const recordKeys = keys
         .map(k => k.name)
@@ -9259,7 +9265,12 @@ export default {
       // с реални данни: 6467 действителни clusterevent: записа срещу само
       // 1000 видими преди тази поправка (виж седмичния анализ на Liquidation
       // Cluster Outcome Tracker, 24.11.2026).
-      const MAX_KEYS_SCANNED = 10000;
+      // SUBREQUEST LIMIT HOTFIX (2026-11-25, СЪЩИЯ ден) - MAX_KEYS_SCANNED=10000
+      // доведе до ~6467 едновременни .get() извиквания по-долу - всеки е
+      // отделна Worker subrequest, Cloudflare капва на ~1000/invocation -
+      // endpoint-ът реално хвърли 500 на живо секунди след deploy с тази
+      // стойност. 500 оставя сигурен марж (+35 за trackedEntries по-горе).
+      const MAX_KEYS_SCANNED = 500;
       const { keys, truncated: listTruncated } = await listKvKeysWithTruncation(env.ALERT_STATE, CLUSTER_EVENT_KV_PREFIX, MAX_KEYS_SCANNED);
       const records = (await Promise.all(keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
       records.sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0));
@@ -9289,7 +9300,10 @@ export default {
       // същия клас поправка като /cluster-diagnostics//tag-outcome-diagnostics
       // (CME гаповете са рядко събитие, малко вероятно да надхвърлят 1000, но
       // поправяме за консистентност - без риск, евтино).
-      const MAX_KEYS_SCANNED = 2000;
+      // SUBREQUEST LIMIT HOTFIX (2026-11-25) - 500 вместо 2000, виж
+      // коментара в /cluster-diagnostics по-горе (всеки .get() = 1 Worker
+      // subrequest, Cloudflare капва ~1000/invocation).
+      const MAX_KEYS_SCANNED = 500;
       const { keys, truncated: listTruncated } = await listKvKeysWithTruncation(env.ALERT_STATE, CME_GAP_EVENT_KV_PREFIX, MAX_KEYS_SCANNED);
       const records = (await Promise.all(keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
       records.sort((a, b) => (b.filledAt || 0) - (a.filledAt || 0));
@@ -9320,7 +9334,10 @@ export default {
       // видими преди тази поправка (виж седмичния преглед, 22.11.2026) -
       // buildTagOutcomeSummary по-долу вече реално смята от ПЪЛНИЯ набор, не
       // от произволна лексикографска част от него.
-      const MAX_KEYS_SCANNED = 10000;
+      // SUBREQUEST LIMIT HOTFIX (2026-11-25) - 500 вместо 10000, виж
+      // коментара в /cluster-diagnostics по-горе - 2118 едновременни .get()
+      // извиквания също биха надхвърлили Cloudflare subrequest лимита.
+      const MAX_KEYS_SCANNED = 500;
       const { keys, truncated: listTruncated } = await listKvKeysWithTruncation(env.ALERT_STATE, "tagoutcome:", MAX_KEYS_SCANNED);
       let records = (await Promise.all(keys.map(k => env.ALERT_STATE.get(k.name)))).filter(Boolean).map(r => JSON.parse(r));
       if (typeParam) records = records.filter(r => r.type === typeParam);
