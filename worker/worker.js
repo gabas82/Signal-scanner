@@ -2776,6 +2776,50 @@ function buildTcArmedResetRecord({ symbol, direction, armedAt, priceAtArm, reaso
   };
 }
 
+// ═══ MR LIFECYCLE TELEMETRY (2026-11-26, VETO RETROSPECTIVE STAGE 1 директива)
+// ═══════════════════════════════════════════════════════════════════════════
+// Byte-идентичен подход на PR #105 TC LIFECYCLE TELEMETRY по-горе
+// (buildTcSetupCreatedRecord/buildTcArmedCreatedRecord/buildTcArmedResetRecord),
+// приложен към MEAN REVERSION (state.setup/state.armed) вместо TREND
+// CONTINUATION (state.trendSetup/state.trendArmed). Затваря установения blind
+// spot от Stage 1 VETO correlation анализа: MR нямаше SETUP/ARMED-ниво записи
+// за епизоди, които никога не достигат decision (confirmed/missed/veto) -
+// само TC имаше tclifecycle:, затова MR-опозиционната корелация в Stage 1 беше
+// практически невидима (near-0% "никога не реагира" - артефакт на липсващи
+// данни, не реална находка). Собствен KV namespace (mrlifecycle:), diagnostic-
+// only - никога не се чете обратно от SETUP/ARMED/ENTRY логиката никъде, не
+// променя праговете/scoring/VETO решенията на MEAN REVERSION механизма.
+// setupScore тук идва от calcSetupState (TARGET+VAH/VAL base), НЯМА TC-ов
+// confidenceMajority еквивалент - MR няма "confidence" концепция.
+function buildMrSetupCreatedRecord({ symbol, direction, price, setupScore, at }) {
+  return {
+    kind: 'setup_created', symbol, direction, at: at ?? Date.now(),
+    price: price ?? null, setupScore: setupScore ?? null,
+  };
+}
+function buildMrArmedCreatedRecord({ symbol, direction, priceAtArm, structuralReference, atrAtArm, setupAt, at }) {
+  return {
+    kind: 'armed_created', symbol, direction, at: at ?? Date.now(),
+    priceAtArm: priceAtArm ?? null, structuralReference: structuralReference ?? null,
+    atrAtArm: (atrAtArm > 0) ? atrAtArm : null, setupAt: setupAt ?? null,
+  };
+}
+// reason: 'setup_lost'|'direction_changed'|'expired_6h'|'entry_confirmed'|
+// 'entry_missed' - огледално на buildTcArmedResetRecord по-горе, с ЕДИНСТВЕНА
+// разлика: 'confidence_lost' (TC, computeDirectionConfidence) -> 'setup_lost'
+// (MR, TARGET+VAH/VAL условието вече не е изпълнено) - различен механизъм,
+// същата семантика ("driver-ът изчезна").
+function buildMrArmedResetRecord({ symbol, direction, armedAt, priceAtArm, reason, price, atrAtArm, at }) {
+  const resolvedAt = at ?? Date.now();
+  const armedDurationMin = (armedAt != null) ? (resolvedAt - armedAt) / 60000 : null;
+  const pctMoveFromArm = calcOutcomePct(direction, priceAtArm, price);
+  const atrMoveFromArm = pctExcursionToAtrRatio(pctMoveFromArm, priceAtArm, atrAtArm);
+  return {
+    kind: 'armed_reset', symbol, direction, at: resolvedAt, armedAt: armedAt ?? null, reason,
+    price: price ?? null, armedDurationMin, pctMoveFromArm, atrMoveFromArm,
+  };
+}
+
 // Актуализира running MFE/MAE на ЕДИН pending outcome, използвайки вече
 // изтеглената последна затворена 5м свещ (candle.high/candle.low) - БЕЗ нова
 // мрежова заявка (виж wiring-а в scanSymbolSignals - reuse-ва c5Closed, което
@@ -6481,6 +6525,19 @@ async function scanSymbolSignals(env, symbol) {
   });
   const setupFired = setupCanFire(state, setupState.direction);
   if (setupFired) markSetupFired(state, setupState.direction, setupState.score, price);
+  // MR LIFECYCLE TELEMETRY (2026-11-26, VETO RETROSPECTIVE Stage 1 директива) -
+  // SETUP CREATED, огледално на TC LIFECYCLE TELEMETRY (buildTcSetupCreatedRecord
+  // по-горе) - затваря установения blind spot: MR нямаше SETUP/ARMED-ниво
+  // записи за епизоди, които никога не достигат decision. Собствен KV
+  // namespace (mrlifecycle:), diagnostic-only - никога не се чете обратно от
+  // SETUP/ARMED/ENTRY логиката никъде.
+  if (setupFired && env.ALERT_STATE) {
+    const mrSetupRecord = buildMrSetupCreatedRecord({
+      symbol, direction: setupState.direction, price,
+      setupScore: setupState.score, at: state.setup ? state.setup.at : null,
+    });
+    await env.ALERT_STATE.put(`mrlifecycle:${symbol}:${mrSetupRecord.at}:setup_created`, JSON.stringify(mrSetupRecord));
+  }
   if (!setupState.direction) state.setup = null; // деактивирано - следваща активация ще пали НАНОВО
 
   // STAGE DIRECTION COUNTS (diagnostic-only, виж incrementStageDirectionCount
@@ -6502,10 +6559,42 @@ async function scanSymbolSignals(env, symbol) {
   // (проверката по-долу), или изтече ARMED_EXPIRY_HOURS.
   if (!state.swingStruct) state.swingStruct = {};
   updateSwingStructure(state.swingStruct, c5Closed);
-  if (!setupState.direction || (state.armed && state.armed.direction !== setupState.direction)) {
+  // MR LIFECYCLE TELEMETRY: ARMED RESET (setup_lost/direction_changed) - пазим
+  // СТАРИЯ state.armed ПРЕДИ да го нулираме (огледално на prevTrendArmed в TC
+  // блока по-долу) - byte-идентично поведение на предишната единична проверка.
+  const prevArmed = state.armed;
+  // byte-идентично на оригиналното условие по-долу (`!setupState.direction ||
+  // (state.armed && state.armed.direction !== setupState.direction)`) - viz
+  // regression guard-а в worker-liquidation-live.test.js: state.armed трябва
+  // да стане ИЗРИЧНО null тук, дори когато prevArmed вече е null/undefined
+  // (иначе JSON.stringify ИЗПУСКА полето изцяло, вместо да сериализира null).
+  const armedShouldReset = !setupState.direction || (prevArmed && prevArmed.direction !== setupState.direction);
+  let armedResetReason = null;
+  if (prevArmed) {
+    if (!setupState.direction) armedResetReason = 'setup_lost';
+    else if (prevArmed.direction !== setupState.direction) armedResetReason = 'direction_changed';
+  }
+  if (armedShouldReset) {
     state.armed = null; // SETUP деактивиран или смени посока -> RESET към IDLE
+    if (armedResetReason && env.ALERT_STATE) {
+      const resetRecord = buildMrArmedResetRecord({
+        symbol, direction: prevArmed.direction, armedAt: prevArmed.at,
+        priceAtArm: prevArmed.priceAtArm, reason: armedResetReason, price,
+        atrAtArm: prevArmed.atrAtArm,
+      });
+      await env.ALERT_STATE.put(`mrlifecycle:${symbol}:${resetRecord.at}:armed_reset`, JSON.stringify(resetRecord));
+    }
   }
   if (state.armed && (Date.now() - state.armed.at) >= ARMED_EXPIRY_HOURS * 3600000) {
+    // MR LIFECYCLE TELEMETRY: ARMED RESET (expired_6h)
+    if (env.ALERT_STATE) {
+      const expiredRecord = buildMrArmedResetRecord({
+        symbol, direction: state.armed.direction, armedAt: state.armed.at,
+        priceAtArm: state.armed.priceAtArm, reason: 'expired_6h', price,
+        atrAtArm: state.armed.atrAtArm,
+      });
+      await env.ALERT_STATE.put(`mrlifecycle:${symbol}:${expiredRecord.at}:armed_reset`, JSON.stringify(expiredRecord));
+    }
     state.armed = null; // expiry - твърде стар ARMED без дошъл ENTRY TRIGGER
   }
   let armedFired = false;
@@ -6539,12 +6628,25 @@ async function scanSymbolSignals(env, symbol) {
         state.setup.lastArmStructRef = structuralReferenceAtArm;
         state.setup.reArmCount = (state.setup.reArmCount ?? 0) + 1;
       }
+      // MR LIFECYCLE TELEMETRY - atrAtArm четено ТУК (вече наличните c5Closed,
+      // БЕЗ нова мрежова заявка), огледално на TC-то (виж atr5mAtArm по-долу) -
+      // пазено на state.armed за реюз при ARMED RESET записите по-долу.
+      const atr5mAtArmMr = calcATR(c5Closed, 14);
       state.armed = {
         direction: armedDirection, at: Date.now(), priceAtArm: price,
         triggerSource, structuralReferenceAtArm, structRefUnchanged,
         reArmCount: state.setup ? state.setup.reArmCount : null,
+        atrAtArm: (atr5mAtArmMr > 0) ? atr5mAtArmMr : null,
       };
       armedFired = true;
+      if (env.ALERT_STATE) {
+        const mrArmedRecord = buildMrArmedCreatedRecord({
+          symbol, direction: armedDirection, priceAtArm: price,
+          structuralReference: structuralReferenceAtArm, atrAtArm: atr5mAtArmMr,
+          setupAt: state.setup ? state.setup.at : null, at: state.armed.at,
+        });
+        await env.ALERT_STATE.put(`mrlifecycle:${symbol}:${mrArmedRecord.at}:armed_created`, JSON.stringify(mrArmedRecord));
+      }
       // STAGE DIRECTION COUNTS (diagnostic-only) - виж коментара при SETUP по-горе.
       if (env.ALERT_STATE) {
         try {
@@ -6684,6 +6786,22 @@ async function scanSymbolSignals(env, symbol) {
     if (entryResult.status === 'entry' || entryResult.status === 'missed') {
       entryResult.direction = entryDirection;
       entryResult.priceAtArm = state.armed.priceAtArm; // само за контекст в известието
+      // MR LIFECYCLE TELEMETRY: ARMED RESET (entry_confirmed/entry_missed) -
+      // виж коментара при buildMrArmedResetRecord по-горе. Смята се ТУК, ПРЕДИ
+      // state.armed да бъде нулиран 2 реда по-долу.
+      if (env.ALERT_STATE) {
+        const mrTimeFromArmMin = (Date.now() - state.armed.at) / 60000;
+        const mrPctMoveFromArm = calcOutcomePct(entryDirection, state.armed.priceAtArm, entryResult.triggerClose);
+        const mrAtrMoveFromArm = pctExcursionToAtrRatio(mrPctMoveFromArm, state.armed.priceAtArm, state.armed.atrAtArm);
+        const mrTerminalReason = entryResult.status === 'entry' ? 'entry_confirmed' : 'entry_missed';
+        const mrTerminalResetRecord = {
+          kind: 'armed_reset', symbol, direction: entryDirection, at: Date.now(),
+          armedAt: state.armed.at, reason: mrTerminalReason,
+          price: entryResult.triggerClose, armedDurationMin: mrTimeFromArmMin,
+          pctMoveFromArm: mrPctMoveFromArm, atrMoveFromArm: mrAtrMoveFromArm,
+        };
+        await env.ALERT_STATE.put(`mrlifecycle:${symbol}:${mrTerminalResetRecord.at}:armed_reset`, JSON.stringify(mrTerminalResetRecord));
+      }
       state.armed = null; // епизодът приключва (ENTRY или MISSED) - ново SETUP->ARMED е нужно за следващ опит
     }
   }
@@ -9043,6 +9161,8 @@ export {
   buildTelemetryRecord, buildTcSetupCreatedRecord, buildTcArmedCreatedRecord, buildTcArmedResetRecord,
   // VETO RETROSPECTIVE STAGE 2 (2026-11-26) - изложени само за unit тестове.
   OUTCOME_HORIZONS_MIN, buildPendingOutcomeHorizons, resolvePendingOutcomeHorizons, updateExcursion,
+  // MR LIFECYCLE TELEMETRY (2026-11-26) - изложени само за unit тестове.
+  buildMrSetupCreatedRecord, buildMrArmedCreatedRecord, buildMrArmedResetRecord,
   buildTcLifecycleSummary, buildTcReArmStats, buildTcLatencyBuckets, buildTcResetByReason,
   buildTelemetrySummary, buildEpisodeSummary,
   buildTcConversionMetrics, buildCoverageRange, countPossibleDuplicateEvents,

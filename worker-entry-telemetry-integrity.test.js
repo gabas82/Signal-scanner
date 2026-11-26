@@ -25,6 +25,7 @@ import {
   countMissingLatency, buildTcIntegrityDiagnostics, buildTelemetryIntegrityDiagnostics,
   buildTcMissingEpisodeIds, buildTcCohortStatus, listKvKeysWithTruncation,
   OUTCOME_HORIZONS_MIN, buildPendingOutcomeHorizons, resolvePendingOutcomeHorizons, updateExcursion,
+  buildMrSetupCreatedRecord, buildMrArmedCreatedRecord, buildMrArmedResetRecord,
 } from './worker/worker.js';
 
 const workerSrc = fs.readFileSync('./worker/worker.js', 'utf8');
@@ -740,5 +741,89 @@ describe('VETO RETROSPECTIVE STAGE 2 - двупосочно MFE/MAE за VETO ч
     // съвпада с favorable excursion, което SHORT би видял на СЪЩИЯ ценов път (+5%).
     expect(pendingLong.maePct).toBeCloseTo(-pendingShort.mfePct, 6);
     expect(pendingShort.maePct).toBeCloseTo(-pendingLong.mfePct, 6);
+  });
+});
+
+// MR LIFECYCLE TELEMETRY (2026-11-26) - mrlifecycle:, огледално на
+// tclifecycle: (TC), затваря SETUP/ARMED blind spot-а, установен в VETO
+// RETROSPECTIVE Stage 1 анализа.
+describe('MR LIFECYCLE TELEMETRY - builders (огледално на TC builders)', () => {
+  it('buildMrSetupCreatedRecord({at}) записва ТОЧНО подадения at, не нов Date.now()', () => {
+    const canonicalAt = 1700000000000;
+    const rec = buildMrSetupCreatedRecord({ symbol: 'BTCUSDT', direction: 'long', price: 100, setupScore: 4, at: canonicalAt });
+    expect(rec).toEqual({ kind: 'setup_created', symbol: 'BTCUSDT', direction: 'long', at: canonicalAt, price: 100, setupScore: 4 });
+  });
+
+  it('buildMrArmedCreatedRecord({at}) записва ТОЧНО подадения at + setupAt linkage', () => {
+    const canonicalAt = 1700000100000;
+    const rec = buildMrArmedCreatedRecord({
+      symbol: 'ETHUSDT', direction: 'short', priceAtArm: 50, structuralReference: 51,
+      atrAtArm: 0.5, setupAt: 1700000000000, at: canonicalAt,
+    });
+    expect(rec).toEqual({
+      kind: 'armed_created', symbol: 'ETHUSDT', direction: 'short', at: canonicalAt,
+      priceAtArm: 50, structuralReference: 51, atrAtArm: 0.5, setupAt: 1700000000000,
+    });
+  });
+
+  it('buildMrArmedResetRecord - 5-те реални reason клона (setup_lost/direction_changed/expired_6h/entry_confirmed/entry_missed)', () => {
+    for (const reason of ['setup_lost', 'direction_changed', 'expired_6h', 'entry_confirmed', 'entry_missed']) {
+      const rec = buildMrArmedResetRecord({
+        symbol: 'BTCUSDT', direction: 'long', armedAt: 1000, priceAtArm: 100, reason, price: 102, atrAtArm: 1, at: 1600000,
+      });
+      expect(rec.kind).toBe('armed_reset');
+      expect(rec.reason).toBe(reason);
+      expect(rec.armedDurationMin).toBeCloseTo((1600000 - 1000) / 60000, 6);
+      expect(rec.pctMoveFromArm).toBeCloseTo(2, 6); // (102-100)/100*100
+    }
+  });
+
+  it('buildMrArmedResetRecord без armedAt -> armedDurationMin е null (defensive, огледално на TC)', () => {
+    const rec = buildMrArmedResetRecord({ symbol: 'BTCUSDT', direction: 'long', armedAt: null, priceAtArm: 100, reason: 'expired_6h', price: 102 });
+    expect(rec.armedDurationMin).toBeNull();
+  });
+});
+
+describe('MR LIFECYCLE TELEMETRY - wiring присъства в scanSymbolSignals (структурна проверка)', () => {
+  it('SETUP CREATED се записва в mrlifecycle: при setupFired', () => {
+    expect(workerSrc).toMatch(/mrlifecycle:\$\{symbol\}:\$\{mrSetupRecord\.at\}:setup_created/);
+  });
+  it('ARMED CREATED се записва в mrlifecycle: при armedFired', () => {
+    expect(workerSrc).toMatch(/mrlifecycle:\$\{symbol\}:\$\{mrArmedRecord\.at\}:armed_created/);
+  });
+  it('ARMED RESET се записва в mrlifecycle: за всичките 4 reset пътя (setup_lost/direction_changed комбинирани, expired_6h, entry_confirmed/entry_missed)', () => {
+    const matches = [...workerSrc.matchAll(/mrlifecycle:\$\{symbol\}:\$\{\w+\.at\}:armed_reset/g)];
+    expect(matches.length).toBe(3); // 1x (setup_lost|direction_changed), 1x expired_6h, 1x (entry_confirmed|entry_missed)
+  });
+  it('MR ARMED RESET wiring НЕ променя оригиналното armedShouldReset условие (regression guard, виж worker-liquidation-live.test.js байт-идентичност)', () => {
+    expect(workerSrc).toContain("const armedShouldReset = !setupState.direction || (prevArmed && prevArmed.direction !== setupState.direction);");
+  });
+});
+
+describe('MR LIFECYCLE TELEMETRY - end-to-end: SETUP -> ARMED -> ENTRY/RESET linkage (fixture-ниво, огледално на TC-то)', () => {
+  it('setupAt linkage: armed_created.setupAt === setup_created.at за СЪЩИЯ episode', () => {
+    const setupAt = 1700000000000;
+    const armedAt = 1700000050000;
+    const setupRecord = buildMrSetupCreatedRecord({ symbol: 'SOLUSDT', direction: 'long', price: 100, setupScore: 3, at: setupAt });
+    const armedRecord = buildMrArmedCreatedRecord({
+      symbol: 'SOLUSDT', direction: 'long', priceAtArm: 101, structuralReference: 99, atrAtArm: 0.4, setupAt: setupRecord.at, at: armedAt,
+    });
+    expect(armedRecord.setupAt).toBe(setupRecord.at);
+  });
+
+  it('entry_confirmed reset запис + telemetry ENTRY запис за СЪЩИЯ episode - episodeId (от telemetry) и setupAt (от mrlifecycle) съвпадат', () => {
+    const setupAt = 1700000000000;
+    const armedAt = 1700000050000;
+    const entryAt = 1700000100000;
+    const armedResetRecord = buildMrArmedResetRecord({
+      symbol: 'SOLUSDT', direction: 'long', armedAt, priceAtArm: 101, reason: 'entry_confirmed', price: 103, atrAtArm: 0.4, at: entryAt,
+    });
+    const entryTelemetry = buildTelemetryRecord({
+      symbol: 'SOLUSDT', direction: 'long', decision: 'confirmed', setupMode: 'mean_reversion',
+      setupAt, armedAt, structRef: 99, triggerClose: 103, atr5m: 0.4,
+    });
+    expect(entryTelemetry.episodeId).toBe('SOLUSDT_mean_reversion_long_' + setupAt);
+    expect(armedResetRecord.reason).toBe('entry_confirmed');
+    expect(armedResetRecord.armedDurationMin).toBeCloseTo((entryAt - armedAt) / 60000, 6);
   });
 });
