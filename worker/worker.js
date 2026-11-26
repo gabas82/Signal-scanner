@@ -1213,6 +1213,25 @@ function shouldSendDailyRotationDigest(lastSentAt, now) {
 
 const ROTATION_DIGEST_LAST_SENT_KEY = 'rotation:digest:lastSentAt';
 
+// ROTATION_DIGEST_MAX_KEYS_SCANNED - виж listKvKeysWithTruncation по-долу и
+// discussion-а "ПАГИНАЦИОНЕН ПРОБЛЕМ в maybeSendDailyRotationDigest" (2026-11-26)
+// - ИДЕНТИЧЕН бъг клас като /cluster-diagnostics и т.н. ПРЕДИ PR #175/#176
+// (един нешгардиран env.ALERT_STATE.list({prefix}) + N индивидуални .get()
+// извиквания -> Cloudflare subrequest лимит (~1000/invocation), виж
+// production incident-а). Реално производствено количество rotation: записи
+// при писането на фикса: 792 (виж CF KV direct count) - 900 оставя разумен
+// margin СЕГА, но НЕ е "безопасен за всякога" таван: за разлика от 4-те
+// /*-diagnostics ендпойнта (HTTP, truncated:true видимо в response-а), тук
+// digest-ът тръгва от CRON (ctx.waitUntil), никой не чете JSON отговор ->
+// console.warn по-долу е ЕДИНСТВЕНИЯТ начин truncation-ът да се забележи
+// (Cloudflare Observability -> Logs). При truncation - rotation:{symbol}:
+// {enteredAt} key form means KV list() връща лексикографски по SYMBOL first,
+// т.е. truncation би отрязал систематично символи "по-нататък в азбуката",
+// НЕ произволна извадка - приемлив компромис само защото 900 >> 792 (виж
+// discussion-а защо по-нисък таван като 500 - достатъчен за другите 4
+// ендпойнта - би ПОДРЯЗАЛ реални данни тук ДНЕС).
+const ROTATION_DIGEST_MAX_KEYS_SCANNED = 900;
+
 async function maybeSendDailyRotationDigest(env) {
   try {
     if (!env.ALERT_STATE) return;
@@ -1221,8 +1240,11 @@ async function maybeSendDailyRotationDigest(env) {
     const now = Date.now();
     if (!shouldSendDailyRotationDigest(lastSentAt, now)) return;
 
-    const listResult = await env.ALERT_STATE.list({ prefix: 'rotation:' });
-    const recordKeys = listResult.keys.map(k => k.name).filter(name => name.split(':').length >= 3);
+    const { keys, truncated } = await listKvKeysWithTruncation(env.ALERT_STATE, 'rotation:', ROTATION_DIGEST_MAX_KEYS_SCANNED);
+    if (truncated) {
+      console.warn(`maybeSendDailyRotationDigest: rotation: keys truncated at ${ROTATION_DIGEST_MAX_KEYS_SCANNED} - дневният дайджест може да пропусне записи, виж коментара при ROTATION_DIGEST_MAX_KEYS_SCANNED`);
+    }
+    const recordKeys = keys.map(k => k.name).filter(name => name.split(':').length >= 3);
     const records = (await Promise.all(recordKeys.map(k => env.ALERT_STATE.get(k)))).filter(Boolean).map(r => JSON.parse(r));
     const recent = filterRecentRotationExits(records, now - ROTATION_DIGEST_INTERVAL_MS);
 
@@ -2446,7 +2468,14 @@ function calcEntryTrigger({ direction, candle5m, atr5m, candle15m, atr15m, struc
 // 240, 1d (1440) се добавя по-късно след наблюдение на state размера) - виж
 // бележката при state.pendingOutcomes в scanSymbolSignals за защо това НЕ е
 // козметична промяна (pending записите вече стоят в state до 4ч вместо 1ч).
-const OUTCOME_HORIZONS_MIN = [5, 15, 30, 60, 240];
+// VETO RETROSPECTIVE STAGE 2 (2026-11-26, одобрено от потребителя след Stage 1
+// correlation анализа) - добавени 120 и 360 - нужни за VETO/CONFIRM/SOFTENED
+// хоризонтното наблюдение. Споделена между ВСИЧКИ pending-outcome потребители
+// (ENTRY telemetry, TAG OUTCOME TRACKER, TREND OBSERVATION TRACKER) - нулева
+// допълнителна мрежова заявка (виж коментара по-горе - резолюцията пътува на
+// гръба на вече изтеглената `price` на всеки tick), само по-дълго state
+// задържане (до 6ч вместо 4ч) и малко по-голям KV JSON размер.
+const OUTCOME_HORIZONS_MIN = [5, 15, 30, 60, 120, 240, 360];
 
 // Изгражда "чакащите" хоризонти за един нов telemetry запис - чист pure
 // helper, извикван веднъж при confirmed/missed решение (виж wiring-а).
@@ -2522,6 +2551,8 @@ function buildTelemetryRecord({
   targetScore, targetTier, targetDirection,
   reArmCount, triggerSource, structuralReferenceAtArm, structRefUnchanged,
   liqConfirm, vetoSource, liqSoftVetoed,
+  liqGravityTier, liqGravityDirection, liqGravityDistancePct, liqCascadeBuyUsd, liqCascadeSellUsd,
+  htfTrend4h,
 }) {
   const chaseDistance = (structRef != null && triggerClose != null) ? Math.abs(triggerClose - structRef) : null;
   const chaseDistanceAtrRatio = (atr5m > 0 && chaseDistance != null) ? chaseDistance / atr5m : null;
@@ -2573,6 +2604,19 @@ function buildTelemetryRecord({
     // смекчено (не е хард veto инак) - за бъдещ анализ дали смекчаването
     // реално помага (сравнение срещу старото поведение чрез LIQ_SOFTENED лог).
     liqSoftVetoed: liqSoftVetoed === true,
+    // ПАЗАРЕН РЕЖИМ CONTEXT (VETO RETROSPECTIVE, точка 4 от директивата от
+    // 2026-11-26) - снимка на вече изчислените (в СЪЩИЯ тик, без нови заявки)
+    // gravity/cascade стойности, ВИДИМИ до сега единствено в ефимерните
+    // LIQ_VETO/LIQ_CONFIRM/LIQ_PASS/LIQ_SOFTENED console.log редове (виж
+    // wiring-а по-долу) - никога персистирани в telemetry: записа. Чисто
+    // observability, за бъдеща сегментация по режим - НЕ участва в
+    // VETO/CONFIRM/score логиката. htfTrend4h - широк тренд контекст
+    // ('bull'/'bear'/'neutral'), реюзва вече изчисления trend4h/emaFilter
+    // (виж htfAligned по-горе), БЕЗ нова математика.
+    liqGravityTier: liqGravityTier ?? 'none', liqGravityDirection: liqGravityDirection ?? null,
+    liqGravityDistancePct: liqGravityDistancePct ?? null,
+    liqCascadeBuyUsd: liqCascadeBuyUsd ?? null, liqCascadeSellUsd: liqCascadeSellUsd ?? null,
+    htfTrend4h: htfTrend4h ?? null,
     outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome240m: null, // попълват се по-късно от resolvePendingOutcomeHorizons/wiring-а в scanSymbolSignals
     // PR #103 PATH DIAGNOSTICS (MFE/MAE) - попълват се по-късно от
     // updateExcursion/resolvePendingOutcomeHorizons, огледално на outcome{X}m.
@@ -2580,8 +2624,15 @@ function buildTelemetryRecord({
     mfe15m: null, mae15m: null, mfe15mAtr: null, mae15mAtr: null,
     mfe30m: null, mae30m: null, mfe30mAtr: null, mae30mAtr: null,
     mfe60m: null, mae60m: null, mfe60mAtr: null, mae60mAtr: null,
+    // 2ч хоризонт (VETO RETROSPECTIVE STAGE 2, 2026-11-26)
+    outcome120m: null,
+    mfe120m: null, mae120m: null, mfe120mAtr: null, mae120mAtr: null,
     // 4ч хоризонт (виж discussion-а - предпазлива първа стъпка, 1d остава за по-късно)
     mfe240m: null, mae240m: null, mfe240mAtr: null, mae240mAtr: null,
+    // 6ч хоризонт (VETO RETROSPECTIVE STAGE 2, 2026-11-26) - съвпада с лаговете
+    // от 2.5-4.5ч, установени в Stage 1 анализа за liq-базирани TC VETO.
+    outcome360m: null,
+    mfe360m: null, mae360m: null, mfe360mAtr: null, mae360mAtr: null,
     timeToMfeMin: null, timeToMaeMin: null, maeBeforeMfePct: null, mfeBeforeMaePct: null,
     // PR #104 - BOTH QUALITY (виж classifyBothQuality по-долу) - null освен
     // когато TC и MR произведат ENTRY В СЪЩИЯ tick ('normal'/'degraded').
@@ -2660,12 +2711,14 @@ function buildTagOutcomeRecord({ symbol, type, direction, at, price, concurrentT
   return {
     symbol, type, direction, at: at ?? Date.now(), entryPrice: price ?? null,
     concurrentTypes: concurrentTypes ?? [],
-    outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome240m: null,
+    outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome120m: null, outcome240m: null, outcome360m: null,
     mfe5m: null, mae5m: null, mfe5mAtr: null, mae5mAtr: null,
     mfe15m: null, mae15m: null, mfe15mAtr: null, mae15mAtr: null,
     mfe30m: null, mae30m: null, mfe30mAtr: null, mae30mAtr: null,
     mfe60m: null, mae60m: null, mfe60mAtr: null, mae60mAtr: null,
+    mfe120m: null, mae120m: null, mfe120mAtr: null, mae120mAtr: null,
     mfe240m: null, mae240m: null, mfe240mAtr: null, mae240mAtr: null,
+    mfe360m: null, mae360m: null, mfe360mAtr: null, mae360mAtr: null,
     timeToMfeMin: null, timeToMaeMin: null, maeBeforeMfePct: null, mfeBeforeMaePct: null,
   };
 }
@@ -3017,12 +3070,14 @@ function buildTrendObservationRecord({
     trendTargetDirection: trendTargetDirection ?? null, trendTargetDistancePct: trendTargetDistancePct ?? null,
     historicalPocPrice: historicalPocPrice ?? null, historicalPocTier: historicalPocTier ?? null,
     historicalPocDirection: historicalPocDirection ?? null, historicalPocDistancePct: historicalPocDistancePct ?? null,
-    outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome240m: null,
+    outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome120m: null, outcome240m: null, outcome360m: null,
     mfe5m: null, mae5m: null, mfe5mAtr: null, mae5mAtr: null,
     mfe15m: null, mae15m: null, mfe15mAtr: null, mae15mAtr: null,
     mfe30m: null, mae30m: null, mfe30mAtr: null, mae30mAtr: null,
     mfe60m: null, mae60m: null, mfe60mAtr: null, mae60mAtr: null,
+    mfe120m: null, mae120m: null, mfe120mAtr: null, mae120mAtr: null,
     mfe240m: null, mae240m: null, mfe240mAtr: null, mae240mAtr: null,
+    mfe360m: null, mae360m: null, mfe360mAtr: null, mae360mAtr: null,
     timeToMfeMin: null, timeToMaeMin: null, maeBeforeMfePct: null, mfeBeforeMaePct: null,
     // "Удари ли се" целта (виж resolveTargetHits по-долу) - ОТДЕЛНО от
     // outcome%-овете на фиксираните хоризонти, защото "достигане на точно
@@ -6478,6 +6533,11 @@ async function scanSymbolSignals(env, symbol) {
         structRefUnchanged: state.armed.structRefUnchanged,
         liqConfirm: liqLiveEnabled ? liqConfirmStatus(liquidationCascade, liquidationHasData, entryDirection) : null,
         vetoSource: entryResult.vetoSource,
+        // ПАЗАРЕН РЕЖИМ CONTEXT (виж коментара при buildTelemetryRecord по-горе) -
+        // вече изчислени по-рано в тика стойности, нулева нова математика.
+        liqGravityTier, liqGravityDirection, liqGravityDistancePct: liqGravityScore.distancePct,
+        liqCascadeBuyUsd: liquidationCascade.buySumUsd, liqCascadeSellUsd: liquidationCascade.sellSumUsd,
+        htfTrend4h: trend4h.bull ? 'bull' : (trend4h.bear ? 'bear' : 'neutral'),
       });
       // OBSERVABILITY-ONLY (наблюдателен период, Binance Liquidation Etap 3) -
       // console.log при liqVeto, видимо на живо в Cloudflare Observability →
@@ -6514,7 +6574,18 @@ async function scanSymbolSignals(env, symbol) {
         // TREND CONTINUATION блок по-долу.
         const telemetryKey = `telemetry:${symbol}:${record.at}:${record.setupMode}`;
         await env.ALERT_STATE.put(telemetryKey, JSON.stringify(record));
-        if (decision === 'confirmed' || decision === 'missed') {
+        // VETO RETROSPECTIVE STAGE 2 (2026-11-26) - VETO решенията СЪЩО влизат
+        // в pendingOutcomes от тук нататък (досега само confirmed/missed).
+        // `direction` остава БЛОКИРАНАТА посока (entryDirection) - mfe{X}m/
+        // mfe{X}mAtr проследява движение В ТАЗИ посока (щеше ли блокираната
+        // сделка да е печеливша), а mae{X}m/mae{X}mAtr - движение В
+        // ПРОТИВОПОЛОЖНАТА посока (огледално, виж calcOutcomePct/
+        // updateExcursion по-горе: adverse за една посока = favorable за
+        // обратната) - ЕДИН съществуващ механизъм вече покрива "движение в
+        // двете посоки", без нов паралелен tracking. entryPrice =
+        // record.triggerClose - цената в момента на VETO evaluation-а (не
+        // реална сделка).
+        if (decision === 'confirmed' || decision === 'missed' || decision === 'veto') {
           if (!state.pendingOutcomes) state.pendingOutcomes = [];
           state.pendingOutcomes.push({
             key: telemetryKey, horizons: buildPendingOutcomeHorizons(record.at),
@@ -6714,6 +6785,11 @@ async function scanSymbolSignals(env, symbol) {
         liqConfirm: liqLiveEnabled ? liqConfirmStatus(liquidationCascade, liquidationHasData, entryDirection) : null,
         vetoSource: trendEntryResult.vetoSource,
         liqSoftVetoed: liqVetoDetail.softened,
+        // ПАЗАРЕН РЕЖИМ CONTEXT (виж коментара при buildTelemetryRecord по-горе) -
+        // вече изчислени по-рано в тика стойности, нулева нова математика.
+        liqGravityTier, liqGravityDirection, liqGravityDistancePct: liqGravityScore.distancePct,
+        liqCascadeBuyUsd: liquidationCascade.buySumUsd, liqCascadeSellUsd: liquidationCascade.sellSumUsd,
+        htfTrend4h: trend4h.bull ? 'bull' : (trend4h.bear ? 'bear' : 'neutral'),
       });
       // OBSERVABILITY-ONLY (наблюдателен период, Binance Liquidation Etap 3) -
       // виж огледалния коментар в MEAN REVERSION блока по-горе. gravityDistancePct/
@@ -6746,7 +6822,18 @@ async function scanSymbolSignals(env, symbol) {
       if (env.ALERT_STATE) {
         const telemetryKey = `telemetry:${symbol}:${record.at}:${record.setupMode}`;
         await env.ALERT_STATE.put(telemetryKey, JSON.stringify(record));
-        if (decision === 'confirmed' || decision === 'missed') {
+        // VETO RETROSPECTIVE STAGE 2 (2026-11-26) - VETO решенията СЪЩО влизат
+        // в pendingOutcomes от тук нататък (досега само confirmed/missed).
+        // `direction` остава БЛОКИРАНАТА посока (entryDirection) - mfe{X}m/
+        // mfe{X}mAtr проследява движение В ТАЗИ посока (щеше ли блокираната
+        // сделка да е печеливша), а mae{X}m/mae{X}mAtr - движение В
+        // ПРОТИВОПОЛОЖНАТА посока (огледално, виж calcOutcomePct/
+        // updateExcursion по-горе: adverse за една посока = favorable за
+        // обратната) - ЕДИН съществуващ механизъм вече покрива "движение в
+        // двете посоки", без нов паралелен tracking. entryPrice =
+        // record.triggerClose - цената в момента на VETO evaluation-а (не
+        // реална сделка).
+        if (decision === 'confirmed' || decision === 'missed' || decision === 'veto') {
           if (!state.pendingOutcomes) state.pendingOutcomes = [];
           state.pendingOutcomes.push({
             key: telemetryKey, horizons: buildPendingOutcomeHorizons(record.at),
@@ -8868,6 +8955,8 @@ export {
   // (виж worker-entry-telemetry-integrity.test.js), НЕ се ползват от друг
   // производствен код извън worker.js самия.
   buildTelemetryRecord, buildTcSetupCreatedRecord, buildTcArmedCreatedRecord, buildTcArmedResetRecord,
+  // VETO RETROSPECTIVE STAGE 2 (2026-11-26) - изложени само за unit тестове.
+  OUTCOME_HORIZONS_MIN, buildPendingOutcomeHorizons, resolvePendingOutcomeHorizons, updateExcursion,
   buildTcLifecycleSummary, buildTcReArmStats, buildTcLatencyBuckets, buildTcResetByReason,
   buildTelemetrySummary, buildEpisodeSummary,
   buildTcConversionMetrics, buildCoverageRange, countPossibleDuplicateEvents,
@@ -8900,6 +8989,7 @@ export {
   buildRotationCandidates, trackCoinRotation, ROTATION_STATE_KEY, ROTATION_PENDING_KEY,
   filterRecentRotationExits, buildRotationDigestMessage, shouldSendDailyRotationDigest,
   maybeSendDailyRotationDigest, ROTATION_DIGEST_LAST_SENT_KEY, ROTATION_DIGEST_INTERVAL_MS,
+  ROTATION_DIGEST_MAX_KEYS_SCANNED,
   // LIQUIDATION CLUSTER OUTCOME TRACKER - изложени само за unit тестове.
   CLUSTER_TRACK_PROXIMITY_PCT, CLUSTER_TRACK_NEGLIGIBLE_RATIO, CLUSTER_TRACK_WATCH_RATIO,
   CLUSTER_TRACK_MAX_AGE_MS, buildClusterLedgerBaseline, updateClusterLedger,

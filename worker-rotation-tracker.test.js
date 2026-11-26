@@ -10,6 +10,7 @@ import {
   BASE_ROTATION_SYMBOLS, trackCoinRotation, ROTATION_STATE_KEY, ROTATION_PENDING_KEY,
   filterRecentRotationExits, buildRotationDigestMessage, shouldSendDailyRotationDigest,
   maybeSendDailyRotationDigest, ROTATION_DIGEST_LAST_SENT_KEY, ROTATION_DIGEST_INTERVAL_MS,
+  ROTATION_DIGEST_MAX_KEYS_SCANNED,
 } from './worker/worker.js';
 import worker from './worker/worker.js';
 
@@ -385,6 +386,93 @@ describe('maybeSendDailyRotationDigest (orchestration)', () => {
     } finally { Date.now = realDateNow; }
     expect(sentText).toContain('WIFUSDT');
     expect(kv.m.get(ROTATION_DIGEST_LAST_SENT_KEY)).toBe(String(now));
+  });
+});
+
+// ПАГИНАЦИОНЕН ПРОБЛЕМ в maybeSendDailyRotationDigest (2026-11-26, одобрено
+// от потребителя) - истинска cursor-respecting KV mock (огледално на
+// worker-diagnostics-pagination.test.js makePaginatedKv), за да проверим
+// РЕАЛНОТО поведение при production-мащаб (792 rotation: записа към момента
+// на фикса, виж коментара при ROTATION_DIGEST_MAX_KEYS_SCANNED в worker.js).
+function makePaginatedKv(seed = {}) {
+  const m = new Map(Object.entries(seed));
+  let listCalls = 0, getCalls = 0;
+  return {
+    m,
+    listCallCount: () => listCalls,
+    getCallCount: () => getCalls,
+    get: async (k) => { getCalls++; return m.has(k) ? m.get(k) : null; },
+    put: async (k, v) => { m.set(k, v); },
+    delete: async (k) => { m.delete(k); },
+    list: async ({ prefix = '', cursor, limit = 1000 } = {}) => {
+      listCalls++;
+      const allKeys = [...m.keys()].filter(k => k.startsWith(prefix)).sort();
+      const start = cursor ? parseInt(cursor, 10) : 0;
+      const page = allKeys.slice(start, start + limit);
+      const nextStart = start + limit;
+      const list_complete = nextStart >= allKeys.length;
+      return { keys: page.map(name => ({ name })), list_complete, cursor: list_complete ? undefined : String(nextStart) };
+    },
+  };
+}
+
+describe('maybeSendDailyRotationDigest - пагинационен фикс (production мащаб)', () => {
+  it('ROTATION_DIGEST_MAX_KEYS_SCANNED е безопасно под Cloudflare subrequest лимита, но над реалния production обем (792)', () => {
+    expect(ROTATION_DIGEST_MAX_KEYS_SCANNED).toBeGreaterThan(792);
+    expect(ROTATION_DIGEST_MAX_KEYS_SCANNED).toBeLessThan(950); // margin за list()+get()+put()+WhatsApp под ~1000 subrequest лимита
+  });
+
+  it('792 rotation: записа (реален production обем) -> нито един пропуснат, truncated=false, без crash', async () => {
+    const now = 3_000_000_000;
+    const seed = {};
+    for (let i = 0; i < 792; i++) {
+      const exitedAt = now - 1000 - i; // всички в рамките на последните 24ч
+      seed[`rotation:SYM${String(i).padStart(4, '0')}USDT:${1000 + i}`] = JSON.stringify({
+        symbol: `SYM${i}USDT`, entryPrice: 1, exitPrice: 1.01, durationMin: 30, exitedAt, outcome60m: null,
+      });
+    }
+    const kv = makePaginatedKv(seed);
+    let sentText = null;
+    globalThis.fetch = async (url) => { sentText = decodeURIComponent(String(url).match(/text=([^&]*)/)[1]); return new Response('{"success":true}'); };
+    const realDateNow = Date.now;
+    Date.now = () => now;
+    let warned = null;
+    const realWarn = console.warn;
+    console.warn = (msg) => { warned = msg; };
+    try {
+      await maybeSendDailyRotationDigest({ ALERT_STATE: kv, CALLMEBOT_PHONE: '+1', TEXTMEBOT_APIKEY: 'k' });
+    } finally { Date.now = realDateNow; console.warn = realWarn; }
+    expect(warned).toBeNull(); // 792 < 900 -> без truncation warning
+    expect(sentText).toContain('792'); // всичките 792 "монети напуснаха" броя се вижда в заглавния ред
+    expect(kv.getCallCount()).toBeLessThan(900); // бюджет под subrequest лимита
+  });
+
+  it('над ROTATION_DIGEST_MAX_KEYS_SCANNED записа -> truncated:true, console.warn, БЕЗ crash, .get() бюджет остава ограничен', async () => {
+    const now = 3_000_000_000;
+    const seed = {};
+    const total = ROTATION_DIGEST_MAX_KEYS_SCANNED + 300; // изкуствено над таванa
+    for (let i = 0; i < total; i++) {
+      const exitedAt = now - 1000 - i;
+      seed[`rotation:SYM${String(i).padStart(5, '0')}USDT:${1000 + i}`] = JSON.stringify({
+        symbol: `SYM${i}USDT`, entryPrice: 1, exitPrice: 1.01, durationMin: 30, exitedAt, outcome60m: null,
+      });
+    }
+    const kv = makePaginatedKv(seed);
+    globalThis.fetch = async () => new Response('{"success":true}');
+    const realDateNow = Date.now;
+    Date.now = () => now;
+    let warned = null;
+    const realWarn = console.warn;
+    console.warn = (msg) => { warned = msg; };
+    let threw = null;
+    try {
+      await maybeSendDailyRotationDigest({ ALERT_STATE: kv, CALLMEBOT_PHONE: '+1', TEXTMEBOT_APIKEY: 'k' });
+    } catch (e) { threw = e; } finally { Date.now = realDateNow; console.warn = realWarn; }
+    expect(threw).toBeNull(); // НЕ гърми, дори при 300 записа над таванa
+    expect(warned).toContain('truncated');
+    // +1 - началният env.ALERT_STATE.get(ROTATION_DIGEST_LAST_SENT_KEY) гейт-check,
+    // отделен от самите rotation: record .get() извиквания (капнати на MAX_KEYS_SCANNED).
+    expect(kv.getCallCount()).toBeLessThanOrEqual(ROTATION_DIGEST_MAX_KEYS_SCANNED + 1);
   });
 });
 
