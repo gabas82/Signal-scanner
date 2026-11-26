@@ -10,7 +10,7 @@ import {
   BASE_ROTATION_SYMBOLS, trackCoinRotation, ROTATION_STATE_KEY, ROTATION_PENDING_KEY,
   filterRecentRotationExits, buildRotationDigestMessage, shouldSendDailyRotationDigest,
   maybeSendDailyRotationDigest, ROTATION_DIGEST_LAST_SENT_KEY, ROTATION_DIGEST_INTERVAL_MS,
-  ROTATION_DIGEST_MAX_KEYS_SCANNED,
+  ROTATION_DIGEST_MAX_KEYS_SCANNED, ROTATION_RECORD_RETENTION_DAYS, rotationRecordExpiration,
 } from './worker/worker.js';
 import worker from './worker/worker.js';
 
@@ -19,10 +19,11 @@ afterEach(() => { globalThis.fetch = realFetch; });
 
 function makeKv(seed = {}) {
   const m = new Map(Object.entries(seed));
+  const putOpts = new Map(); // key -> last {expiration, expirationTtl} опции, за TTL проверки
   return {
-    m,
+    m, putOpts,
     get: async (k) => (m.has(k) ? m.get(k) : null),
-    put: async (k, v) => { m.set(k, v); },
+    put: async (k, v, opts) => { m.set(k, v); if (opts) putOpts.set(k, opts); },
     delete: async (k) => { m.delete(k); },
     list: async ({ prefix } = {}) => ({
       keys: [...m.keys()].filter(k => !prefix || k.startsWith(prefix)).map(name => ({ name })),
@@ -300,6 +301,43 @@ describe('trackCoinRotation (orchestration, fake KV + fetch)', () => {
     expect(updated.outcome60m).toBeCloseTo(10); // (1980-1800)/1800*100
     const pending = JSON.parse(kv.m.get(ROTATION_PENDING_KEY));
     expect(pending).toEqual([]); // единственият хоризонт е резолвнат -> изчезва от опашката
+    // ROTATION_RECORD_RETENTION_DAYS (т.6, 2026-11-26) - резолюционният препис
+    // ТРЯБВА пак да носи expiration, анкерирано към ОРИГИНАЛНИЯ enteredAt
+    // (1000мс), не към момента на преписа - иначе всеки препис би "обезсмъртил"
+    // записа (виж коментара при rotationRecordExpiration в worker.js).
+    expect(kv.putOpts.get('rotation:ETHUSDT:1000')).toEqual({ expiration: rotationRecordExpiration(1000) });
+  });
+
+  it('финализиран запис при излизане носи expiration, анкерирано към enteredAt (устойчиво решение срещу неограничен KV ръст, т.6)', async () => {
+    const enteredAt = 1000;
+    const lastSeenAt = 2000;
+    const seededActive = { ETHUSDT: { enteredAt, entryPrice: 1800, entryRank: 0, peakRank: 0, maxPrice: 1850, minPrice: 1750, lastPrice: 1820, sourceTags: ['base'], lastSeenAt } };
+    const kv = makeKv({ [ROTATION_STATE_KEY]: JSON.stringify(seededActive) });
+    const now = lastSeenAt + 13 * 60000;
+    const realDateNow = Date.now;
+    Date.now = () => now;
+    try {
+      globalThis.fetch = async () => new Response(JSON.stringify([]), { status: 200 });
+      await trackCoinRotation({ ALERT_STATE: kv, RELAY_URL: 'https://relay.mock', RELAY_TOKEN: 't' });
+    } finally { Date.now = realDateNow; }
+    const key = `rotation:ETHUSDT:${enteredAt}`;
+    expect(kv.putOpts.get(key)).toEqual({ expiration: rotationRecordExpiration(enteredAt) });
+  });
+});
+
+describe('rotationRecordExpiration / ROTATION_RECORD_RETENTION_DAYS', () => {
+  it('14 дни >> максимално нужния прозорец (24ч резолюция + 24ч digest look-back = 48ч)', () => {
+    expect(ROTATION_RECORD_RETENTION_DAYS).toBeGreaterThanOrEqual(7);
+  });
+  it('връща enteredAt (секунди) + RETENTION_DAYS дни - абсолютен UNIX timestamp, не относителен TTL', () => {
+    const enteredAtMs = 1_700_000_000_000;
+    expect(rotationRecordExpiration(enteredAtMs)).toBe(Math.floor(enteredAtMs / 1000) + ROTATION_RECORD_RETENTION_DAYS * 86400);
+  });
+  it('анкерирано към enteredAt - НЕ към "сега" (детерминистично, независимо кога се извиква)', () => {
+    const enteredAtMs = 1_700_000_000_000;
+    const a = rotationRecordExpiration(enteredAtMs);
+    const b = rotationRecordExpiration(enteredAtMs);
+    expect(a).toBe(b);
   });
 });
 
