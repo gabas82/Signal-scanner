@@ -1192,7 +1192,14 @@ function formatRotationOutcome(pct) {
   return (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%';
 }
 
-function buildRotationDigestMessage(records) {
+// `truncated` (VETO RETROSPECTIVE STAGE 2, т.6, 2026-11-26) - когато
+// listKvKeysWithTruncation е отрязал rotation: записите на
+// ROTATION_DIGEST_MAX_KEYS_SCANNED, дайджестът трябва ЯВНО да го каже в
+// самото WhatsApp съобщение - console.warn (виж wiring-а по-долу) се вижда
+// само в Cloudflare Observability логове, никой не ги следи ежедневно, но
+// пропуснат отчет без видимо предупреждение е точно сценарият, който
+// потребителят изрично поиска да НЕ се повтаря.
+function buildRotationDigestMessage(records, truncated = false) {
   if (records.length === 0) {
     return '🔄 РОТАЦИЯ (24ч): нито една монета не напусна dashboard листата - стабилен състав.';
   }
@@ -1204,6 +1211,7 @@ function buildRotationDigestMessage(records) {
     lines.push(`• ${r.symbol}: ${durationH}ч в листата, ${formatRotationOutcome(whileListedPct)} докато вътре, 1ч след изход: ${formatRotationOutcome(r.outcome60m)}`);
   }
   if (records.length > 15) lines.push(`… и още ${records.length - 15}`);
+  if (truncated) lines.push(`⚠️ ВНИМАНИЕ: rotation: записите надхвърлиха ${ROTATION_DIGEST_MAX_KEYS_SCANNED} - този дайджест може да пропуска скорошни записи.`);
   return lines.join('\n');
 }
 
@@ -1231,6 +1239,10 @@ const ROTATION_DIGEST_LAST_SENT_KEY = 'rotation:digest:lastSentAt';
 // discussion-а защо по-нисък таван като 500 - достатъчен за другите 4
 // ендпойнта - би ПОДРЯЗАЛ реални данни тук ДНЕС).
 const ROTATION_DIGEST_MAX_KEYS_SCANNED = 900;
+// 0.85 -> предупреждение при 765+ записа (viz. 792 реални към 2026-11-26,
+// вече над този праг - съзнателно, за да демонстрира веднага предупреждението
+// при следващия реален cron fire, не само в тестовете).
+const ROTATION_DIGEST_NEAR_LIMIT_RATIO = 0.85;
 
 async function maybeSendDailyRotationDigest(env) {
   try {
@@ -1243,12 +1255,18 @@ async function maybeSendDailyRotationDigest(env) {
     const { keys, truncated } = await listKvKeysWithTruncation(env.ALERT_STATE, 'rotation:', ROTATION_DIGEST_MAX_KEYS_SCANNED);
     if (truncated) {
       console.warn(`maybeSendDailyRotationDigest: rotation: keys truncated at ${ROTATION_DIGEST_MAX_KEYS_SCANNED} - дневният дайджест може да пропусне записи, виж коментара при ROTATION_DIGEST_MAX_KEYS_SCANNED`);
+    } else if (keys.length >= ROTATION_DIGEST_MAX_KEYS_SCANNED * ROTATION_DIGEST_NEAR_LIMIT_RATIO) {
+      // "ПОЧТИ достигнат лимит" - предупреждение ПРЕДИ реално да се отрязват
+      // записи (виж discussion-а, 2026-11-26: 792/900 вече е близо до
+      // капацитета) - дава видим прозорец да се вдигне MAX_KEYS_SCANNED,
+      // преди дайджестът реално да започне да пропуска записи.
+      console.warn(`maybeSendDailyRotationDigest: rotation: keys ${keys.length}/${ROTATION_DIGEST_MAX_KEYS_SCANNED} (≥${Math.round(ROTATION_DIGEST_NEAR_LIMIT_RATIO * 100)}%) - наближава лимита, виж коментара при ROTATION_DIGEST_MAX_KEYS_SCANNED`);
     }
     const recordKeys = keys.map(k => k.name).filter(name => name.split(':').length >= 3);
     const records = (await Promise.all(recordKeys.map(k => env.ALERT_STATE.get(k)))).filter(Boolean).map(r => JSON.parse(r));
     const recent = filterRecentRotationExits(records, now - ROTATION_DIGEST_INTERVAL_MS);
 
-    await sendWhatsApp(env, buildRotationDigestMessage(recent));
+    await sendWhatsApp(env, buildRotationDigestMessage(recent, truncated));
     await env.ALERT_STATE.put(ROTATION_DIGEST_LAST_SENT_KEY, String(now));
   } catch (e) {
     console.error('maybeSendDailyRotationDigest error:', e);
@@ -2833,23 +2851,43 @@ function buildMrArmedResetRecord({ symbol, direction, armedAt, priceAtArm, reaso
 // не null. maeBeforeMfePct/mfeBeforeMaePct (RETRACE BEFORE MOVE, PR #103 т.3)
 // пазят СУРОВАТА стойност на "другата" excursion В МОМЕНТА на всеки нов
 // екстремум - без нов threshold, само наблюдение.
-function updateExcursion(pending, candle, now = Date.now()) {
-  if (!candle || candle.high == null || candle.low == null || pending.entryPrice == null) return;
+// VETO RETROSPECTIVE STAGE 2, т.2 (2026-11-26) - приема МАСИВ от затворени
+// свещи (не една единствена), за да остане коректна при прекъсване/забавяне
+// на скан цикъла: ако даден tick пропусне няколко 5м свещи (напр. Cloudflare
+// invocation забавяне/грешка - виж "whatsAppChain" инцидента по-долу в
+// scheduled()), преди фикса само ПОСЛЕДНАТА свещ се проверяваше за excursion -
+// екстремумите в пропуснатите междинни свещи се губеха завинаги за MFE/MAE,
+// въпреки че самите свещи си стоят напълно налични (c5Closed носи 200 свещи
+// назад, ~16.7ч - далеко над дори новия 360мин/6ч хоризонт). `lastExcursionCandleTime`
+// (persisted на pending обекта) пази cursor-а - всеки извикване обработва
+// само свещите СЛЕД него (или след entryAt при първо извикване), без да
+// преизчислява вече обходени - нулева допълнителна мрежова заявка, само
+// честен обход на вече изтегленото.
+function updateExcursion(pending, candles, now = Date.now()) {
+  const list = Array.isArray(candles) ? candles : (candles ? [candles] : []);
+  if (!list.length || pending.entryPrice == null) return;
   if (pending.mfePct == null) pending.mfePct = 0;
   if (pending.maePct == null) pending.maePct = 0;
-  const favorablePrice = pending.direction === 'short' ? candle.low : candle.high;
-  const adversePrice = pending.direction === 'short' ? candle.high : candle.low;
-  const favorablePct = calcOutcomePct(pending.direction, pending.entryPrice, favorablePrice);
-  const adversePct = calcOutcomePct(pending.direction, pending.entryPrice, adversePrice);
-  if (favorablePct != null && favorablePct > pending.mfePct) {
-    pending.mfePct = favorablePct;
-    pending.mfeAt = now;
-    pending.maeBeforeMfePct = pending.maePct;
-  }
-  if (adversePct != null && adversePct < pending.maePct) {
-    pending.maePct = adversePct;
-    pending.maeAt = now;
-    pending.mfeBeforeMaePct = pending.mfePct;
+  const sinceTime = pending.lastExcursionCandleTime ?? (pending.entryAt != null ? pending.entryAt - 1 : -Infinity);
+  for (const candle of list) {
+    if (!candle || candle.high == null || candle.low == null) continue;
+    if (candle.openTime != null && candle.openTime <= sinceTime) continue; // вече обходена/преди entry
+    const at = candle.openTime ?? now;
+    const favorablePrice = pending.direction === 'short' ? candle.low : candle.high;
+    const adversePrice = pending.direction === 'short' ? candle.high : candle.low;
+    const favorablePct = calcOutcomePct(pending.direction, pending.entryPrice, favorablePrice);
+    const adversePct = calcOutcomePct(pending.direction, pending.entryPrice, adversePrice);
+    if (favorablePct != null && favorablePct > pending.mfePct) {
+      pending.mfePct = favorablePct;
+      pending.mfeAt = at;
+      pending.maeBeforeMfePct = pending.maePct;
+    }
+    if (adversePct != null && adversePct < pending.maePct) {
+      pending.maePct = adversePct;
+      pending.maeAt = at;
+      pending.mfeBeforeMaePct = pending.mfePct;
+    }
+    if (candle.openTime != null) pending.lastExcursionCandleTime = candle.openTime;
   }
 }
 
@@ -7086,13 +7124,15 @@ async function scanSymbolSignals(env, symbol) {
   // допълнителни мрежови заявки. Изцяло observability, не влияе на ENTRY.
   if (state.pendingOutcomes && state.pendingOutcomes.length && env.ALERT_STATE) {
     const stillPending = [];
-    // PR #103 PATH DIAGNOSTICS (MFE/MAE) - последната вече изтеглена затворена
-    // 5м свещ на ТАЗИ монета/tick (БЕЗ нова мрежова заявка), за да актуализираме
+    // PR #103 PATH DIAGNOSTICS (MFE/MAE) - вече изтеглените затворени 5м
+    // свещи на ТАЗИ монета/tick (БЕЗ нова мрежова заявка), за да актуализираме
     // running MFE/MAE на всеки pending outcome ПРЕДИ да проверим кои хоризонти
-    // са due (виж updateExcursion по-горе).
-    const lastClosed5mForExcursion = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
+    // са due (виж updateExcursion по-горе). ЦЕЛИЯТ c5Closed (не само
+    // последната свещ) - виж коментара при updateExcursion за защо: гарантира
+    // покритие при прекъснат/забавен scan цикъл (lastExcursionCandleTime
+    // cursor-ът на pending обекта пази кои вече са обходени).
     for (const p of state.pendingOutcomes) {
-      updateExcursion(p, lastClosed5mForExcursion);
+      updateExcursion(p, c5Closed);
       const { updates, allResolved } = resolvePendingOutcomeHorizons(p, price);
       if (Object.keys(updates).length) {
         const raw = await env.ALERT_STATE.get(p.key);
@@ -7112,9 +7152,8 @@ async function scanSymbolSignals(env, symbol) {
   // buildTagOutcomeRecord по-горе за контекста).
   if (state.pendingTagOutcomes && state.pendingTagOutcomes.length && env.ALERT_STATE) {
     const stillPendingTags = [];
-    const lastClosed5mForTagExcursion = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
     for (const p of state.pendingTagOutcomes) {
-      updateExcursion(p, lastClosed5mForTagExcursion);
+      updateExcursion(p, c5Closed);
       const { updates, allResolved } = resolvePendingOutcomeHorizons(p, price);
       if (Object.keys(updates).length) {
         const raw = await env.ALERT_STATE.get(p.key);
@@ -7141,12 +7180,15 @@ async function scanSymbolSignals(env, symbol) {
   if (state.pendingTrendObservations && state.pendingTrendObservations.length && env.ALERT_STATE) {
     try {
       const stillPendingTrendObs = [];
-      const lastClosed5mForTrendObs = c5Closed.length ? c5Closed[c5Closed.length - 1] : null;
       for (const p of state.pendingTrendObservations) {
         try {
-          updateExcursion(p, lastClosed5mForTrendObs);
+          updateExcursion(p, c5Closed);
           const wasTrendTargetHit = p.trendTargetHit, wasHistoricalPocHit = p.historicalPocHit;
-          resolveTargetHits(p, lastClosed5mForTrendObs);
+          // resolveTargetHits е idempotent (guard-нато от !pending.xHit) и
+          // entryAt-aware - обхождаме ВСИЧКИТЕ налични свещи (не само
+          // последната), огледално на updateExcursion по-горе, за да не
+          // изгубим "удар" на ниво, станал в свещ от пропуснат/забавен tick.
+          for (const candle of c5Closed) resolveTargetHits(p, candle);
           const { updates, allResolved } = resolvePendingOutcomeHorizons(p, price);
           if (!wasTrendTargetHit && p.trendTargetHit) { updates.trendTargetHit = true; updates.trendTargetHitAt = p.trendTargetHitAt; }
           if (!wasHistoricalPocHit && p.historicalPocHit) { updates.historicalPocHit = true; updates.historicalPocHitAt = p.historicalPocHitAt; }
@@ -9195,7 +9237,7 @@ export {
   buildRotationCandidates, trackCoinRotation, ROTATION_STATE_KEY, ROTATION_PENDING_KEY,
   filterRecentRotationExits, buildRotationDigestMessage, shouldSendDailyRotationDigest,
   maybeSendDailyRotationDigest, ROTATION_DIGEST_LAST_SENT_KEY, ROTATION_DIGEST_INTERVAL_MS,
-  ROTATION_DIGEST_MAX_KEYS_SCANNED,
+  ROTATION_DIGEST_MAX_KEYS_SCANNED, ROTATION_DIGEST_NEAR_LIMIT_RATIO,
   // LIQUIDATION CLUSTER OUTCOME TRACKER - изложени само за unit тестове.
   CLUSTER_TRACK_PROXIMITY_PCT, CLUSTER_TRACK_NEGLIGIBLE_RATIO, CLUSTER_TRACK_WATCH_RATIO,
   CLUSTER_TRACK_MAX_AGE_MS, buildClusterLedgerBaseline, updateClusterLedger,

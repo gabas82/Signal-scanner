@@ -744,6 +744,60 @@ describe('VETO RETROSPECTIVE STAGE 2 - двупосочно MFE/MAE за VETO ч
   });
 });
 
+// VETO RETROSPECTIVE STAGE 2, т.2 (2026-11-26, одобрено от потребителя) -
+// гарантира пълно покритие на свещите при прекъснат/забавен scan цикъл,
+// за ВСИЧКИТЕ хоризонти (включително новите 120/360м).
+describe('updateExcursion - backfill при прекъснат/забавен scan цикъл', () => {
+  it('единична свещ (стар call pattern) продължава да работи (backward-compat сигнатура)', () => {
+    const pending = { direction: 'long', entryPrice: 100 };
+    updateExcursion(pending, { openTime: 1000, high: 105, low: 99 });
+    expect(pending.mfePct).toBeCloseTo(5, 6);
+  });
+
+  it('пропуснат tick (няколко нови свещи наведнъж) - ВСИЧКИТЕ се обхождат, не само последната', () => {
+    const pending = { direction: 'long', entryPrice: 100, entryAt: 500 };
+    // Симулира tick, пропуснал 3 междинни свещи - типично при Cloudflare
+    // invocation забавяне/грешка (виж коментара в worker.js). Екстремумът
+    // (high=120) е в СРЕДНАТА свещ, не в последната.
+    const candles = [
+      { openTime: 1000, high: 102, low: 98 },
+      { openTime: 1300, high: 120, low: 97 }, // екстремумът
+      { openTime: 1600, high: 103, low: 100 },
+    ];
+    updateExcursion(pending, candles);
+    expect(pending.mfePct).toBeCloseTo(20, 6); // (120-100)/100*100 - НЕ 3 (само последната свещ)
+    expect(pending.mfeAt).toBe(1300); // openTime на свещта с екстремума, не now()
+  });
+
+  it('lastExcursionCandleTime cursor пази кои свещи вече са обходени - следващ tick не ги преобхожда/не губи вече намерен екстремум', () => {
+    const pending = { direction: 'long', entryPrice: 100, entryAt: 500 };
+    updateExcursion(pending, [{ openTime: 1000, high: 120, low: 99 }]);
+    expect(pending.mfePct).toBeCloseTo(20, 6);
+    expect(pending.lastExcursionCandleTime).toBe(1000);
+    // Следващ tick носи СЪЩИЯТ исторически прозорец (c5Closed винаги носи 200
+    // свещи назад) + 1 нова свещ с по-слаб екстремум - резултатът остава 20%,
+    // не се разваля от повторна обработка на вече видяната свещ.
+    updateExcursion(pending, [{ openTime: 1000, high: 120, low: 99 }, { openTime: 1300, high: 105, low: 101 }]);
+    expect(pending.mfePct).toBeCloseTo(20, 6);
+    expect(pending.lastExcursionCandleTime).toBe(1300);
+  });
+
+  it('свещи преди entryAt се игнорират дори при първо извикване (без lastExcursionCandleTime)', () => {
+    const pending = { direction: 'long', entryPrice: 100, entryAt: 1500 };
+    const candles = [
+      { openTime: 1000, high: 200, low: 50 }, // преди entry - трябва да се игнорира
+      { openTime: 2000, high: 103, low: 99 },
+    ];
+    updateExcursion(pending, candles);
+    expect(pending.mfePct).toBeCloseTo(3, 6); // НЕ 100 (от игнорираната по-ранна свещ)
+  });
+
+  it('wiring: всичките 3 pending-outcome резолюционни блока подават c5Closed (целия масив), не само последната свещ', () => {
+    const matches = [...workerSrc.matchAll(/updateExcursion\(p, c5Closed\)/g)];
+    expect(matches.length).toBe(3); // pendingOutcomes, pendingTagOutcomes, pendingTrendObservations
+  });
+});
+
 // MR LIFECYCLE TELEMETRY (2026-11-26) - mrlifecycle:, огледално на
 // tclifecycle: (TC), затваря SETUP/ARMED blind spot-а, установен в VETO
 // RETROSPECTIVE Stage 1 анализа.
