@@ -249,6 +249,31 @@ describe('/tv-cme-gap endpoint', () => {
     const res = await call({ ALERT_STATE: makeKv() }, { qs: '?token=anything', body: ENTERED_TEXT });
     expect(res.status).toBe(401);
   });
+
+  // TV_ALERT_TOKEN coordinated rotation (2026-11-26, одобрено от потребителя) -
+  // TV_ALERT_TOKEN_PREV позволява безпрекъсваема ротация: виж isValidTvAlertToken в worker.js.
+  it('TV_ALERT_TOKEN_PREV приема СТАРИЯ token по време на ротационен прозорец', async () => {
+    const kv = makeKv();
+    const res = await call(
+      { ALERT_STATE: kv, TV_ALERT_TOKEN: 'new-secret', TV_ALERT_TOKEN_PREV: 'old-secret' },
+      { qs: '?token=old-secret', body: ENTERED_TEXT },
+    );
+    expect(res.status).toBe(200);
+  });
+  it('TV_ALERT_TOKEN_PREV не отваря достъп за произволен token - само точно старата стойност', async () => {
+    const res = await call(
+      { ALERT_STATE: makeKv(), TV_ALERT_TOKEN: 'new-secret', TV_ALERT_TOKEN_PREV: 'old-secret' },
+      { qs: '?token=something-else', body: ENTERED_TEXT },
+    );
+    expect(res.status).toBe(401);
+  });
+  it('без TV_ALERT_TOKEN_PREV зададен - старият token вече НЕ работи (ротацията приключила)', async () => {
+    const res = await call(
+      { ALERT_STATE: makeKv(), TV_ALERT_TOKEN: 'new-secret' },
+      { qs: '?token=old-secret', body: ENTERED_TEXT },
+    );
+    expect(res.status).toBe(401);
+  });
 });
 
 describe('/cme-gap-diagnostics endpoint', () => {
