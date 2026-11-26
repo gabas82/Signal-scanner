@@ -4174,6 +4174,21 @@ async function listKvKeysWithTruncation(kv, prefix, maxKeysScanned) {
   return { keys: keys.slice(0, maxKeysScanned), truncated };
 }
 
+// TV_ALERT_TOKEN - coordinated rotation support (2026-11-26), огледално на
+// RELAY_TOKEN_PREV в relay/server.js. env.TV_ALERT_TOKEN_PREV (по избор) -
+// ВРЕМЕННО приет ВТОРИ валиден token по време на ротация: (1) деплойва се
+// TV_ALERT_TOKEN=нов + TV_ALERT_TOKEN_PREV=стар (Worker-ът приема и двата);
+// (2) TradingView webhook URL-ът се обновява да праща новия token; (3) след
+// потвърждение, TV_ALERT_TOKEN_PREV се маха. Празно по подразбиране - нулева
+// промяна в поведението, докато не бъде изрично зададено. Споделена между
+// /tv-alert и /tv-cme-gap (и двата използват СЪЩИЯ TV_ALERT_TOKEN).
+function isValidTvAlertToken(supplied, expected, expectedPrev) {
+  if (!expected) return false; // fail-closed - виж коментара при call site-овете
+  if (supplied === expected) return true;
+  if (expectedPrev && supplied === expectedPrev) return true;
+  return false;
+}
+
 // TELEMETRY_TOKEN - приема токена и през X-Telemetry-Token header (за
 // автоматизирани клиенти, за да не стои в URL/query string), освен
 // досегашния ?token= query param. Чисто адитивно - query параметърът
@@ -9290,6 +9305,8 @@ export {
   OUTCOME_HORIZONS_MIN, buildPendingOutcomeHorizons, resolvePendingOutcomeHorizons, updateExcursion,
   // MEXC ДИАГНОСТИКА (2026-11-26) - изложени само за unit тестове.
   fetchMexcDiagEndpoint, runMexcDiagProbe, MEXC_DIAG_SPOT_URL, MEXC_DIAG_FUTURES_URL,
+  // TV_ALERT_TOKEN coordinated rotation (2026-11-26) - изложени само за unit тестове.
+  isValidTvAlertToken,
   // MR LIFECYCLE TELEMETRY (2026-11-26) - изложени само за unit тестове.
   buildMrSetupCreatedRecord, buildMrArmedCreatedRecord, buildMrArmedResetRecord,
   buildTcLifecycleSummary, buildTcReArmStats, buildTcLatencyBuckets, buildTcResetByReason,
@@ -9541,10 +9558,11 @@ export default {
     if (path === "/tv-alert" && (request.method === "POST" || request.method === "GET")) {
       const suppliedToken = (url.searchParams.get("token") || "").trim();
       const expectedToken = (env.TV_ALERT_TOKEN || "").trim();
+      const expectedTokenPrev = (env.TV_ALERT_TOKEN_PREV || "").trim();
       // fail-closed: ако TV_ALERT_TOKEN secret-ът липсва, expectedToken е "" и
       // старата проверка `expectedToken && ...` се прескачаше изцяло, пускайки
       // всякакви заявки без токен. Сега липсващ secret също отказва достъп.
-      if (!expectedToken || suppliedToken !== expectedToken) {
+      if (!isValidTvAlertToken(suppliedToken, expectedToken, expectedTokenPrev)) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
           status: 401,
           headers: { "Content-Type": "application/json" }
@@ -9581,7 +9599,8 @@ export default {
     if (path === "/tv-cme-gap" && (request.method === "POST" || request.method === "GET")) {
       const suppliedToken = (url.searchParams.get("token") || "").trim();
       const expectedToken = (env.TV_ALERT_TOKEN || "").trim();
-      if (!expectedToken || suppliedToken !== expectedToken) {
+      const expectedTokenPrev = (env.TV_ALERT_TOKEN_PREV || "").trim();
+      if (!isValidTvAlertToken(suppliedToken, expectedToken, expectedTokenPrev)) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
           status: 401,
           headers: { "Content-Type": "application/json" }

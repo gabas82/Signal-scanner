@@ -18,7 +18,24 @@ const PORT = process.env.PORT || 8080;
 // .trim() guards against a stray trailing newline/space that platform UIs
 // sometimes add when a secret value is pasted into a textarea.
 const TOKEN = (process.env.RELAY_TOKEN || '').trim();
-console.log(`RELAY_TOKEN configured: ${TOKEN ? 'yes (' + TOKEN.length + ' chars)' : 'no'}`);
+// RELAY_TOKEN_PREV (coordinated secret rotation, 2026-11-26) - по избор,
+// ВРЕМЕННО приет ВТОРИ валиден token по време на ротация, за да може Worker-ът
+// да премине към нов RELAY_TOKEN secret БЕЗ прекъсване: (1) тук се деплойва
+// RELAY_TOKEN=нов + RELAY_TOKEN_PREV=стар (relay приема и двата); (2) Worker
+// секретът се обновява на новата стойност; (3) след потвърждение,
+// RELAY_TOKEN_PREV се маха. Празно по подразбиране - нулева промяна в
+// поведението, докато не бъде изрично зададено.
+const TOKEN_PREV = (process.env.RELAY_TOKEN_PREV || '').trim();
+console.log(`RELAY_TOKEN configured: ${TOKEN ? 'yes (' + TOKEN.length + ' chars)' : 'no'}${TOKEN_PREV ? `, RELAY_TOKEN_PREV also accepted (${TOKEN_PREV.length} chars)` : ''}`);
+
+// Чиста, тестваема проверка (параметризирана, не чете env/closure директно) -
+// виж discussion-а за coordinated rotation по-горе.
+function isValidToken(supplied, token, tokenPrev) {
+  if (!token) return true; // no token configured - allow (not recommended, but don't hard-fail)
+  if (supplied === token) return true;
+  if (tokenPrev && supplied === tokenPrev) return true;
+  return false;
+}
 
 // BINANCE LIQUIDATION COLLECTOR (виж liquidation-collector.js) - ИЗКЛЮЧЕН,
 // освен ако LIQ_COLLECTOR_ENABLED=1. Държи 1 WebSocket към Binance
@@ -58,9 +75,8 @@ function buildTicker24hrTarget(symbol) {
 }
 
 function requireToken(url, res) {
-  if (!TOKEN) return true; // no token configured - allow (not recommended, but don't hard-fail)
   const supplied = (url.searchParams.get('token') || '').trim();
-  if (supplied === TOKEN) return true;
+  if (isValidToken(supplied, TOKEN, TOKEN_PREV)) return true;
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Unauthorized' }));
   return false;
@@ -222,4 +238,12 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-server.listen(PORT, () => console.log(`Relay listening on port ${PORT}`));
+// require.main === module - само когато файлът се стартира директно
+// (`node server.js`, точно както App Platform прави), не когато е require-нат
+// като модул (виж unit тестовете за isValidToken/buildTicker24hrTarget) -
+// предпазва от реално стартиране на HTTP сървър по време на тестове.
+if (require.main === module) {
+  server.listen(PORT, () => console.log(`Relay listening on port ${PORT}`));
+}
+
+module.exports = { isValidToken, buildTicker24hrTarget, requireToken, server };
