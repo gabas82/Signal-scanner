@@ -674,20 +674,25 @@ function calcEntryImpulse(candles, opts = {}) {
   return { impulseUp, impulseDn, volX, bodyPct };
 }
 
+// `emaDistancePct` в резултата (т.4 от директивата, 2026-11-26) - разстоянието
+// между цената и EMA в момента на сигнала, вече смятано (`ema`) тук -
+// допълнителен "магнитуд на разширение" показател, нулева нова математика в
+// gate/long/short логиката по-долу.
 function calcMMx25Entry(candles, opts = {}) {
   const volLen = opts.volLen ?? 20, atrLen = opts.atrLen ?? 14, emaLen = opts.emaLen ?? 20;
   const proxyVolX = opts.proxyVolX ?? 2.5, proxyATRX = opts.proxyATRX ?? 1.8;
   const n = candles.length;
   const minLen = Math.max(volLen, atrLen, emaLen) + 1;
-  if (n < minLen) return { long: false, short: false, ema: null };
+  if (n < minLen) return { long: false, short: false, ema: null, emaDistancePct: null };
   const emaSeries = calcEMASeries(candles.map(c => c.close), emaLen);
   const ema = emaSeries[n - 1];
   const volMA = calcSMA(candles.map(c => c.volume), volLen);
   const atr = calcATR(candles, atrLen);
   const last = candles[n - 1];
-  if (ema == null || volMA == null || atr == null) return { long: false, short: false, ema: null };
+  if (ema == null || volMA == null || atr == null) return { long: false, short: false, ema: null, emaDistancePct: null };
   const proxyOK = last.volume <= volMA * proxyVolX && (last.high - last.low) <= atr * proxyATRX;
-  return { long: last.close > ema && proxyOK, short: last.close < ema && proxyOK, ema, proxyOK };
+  const emaDistancePct = ema > 0 ? Math.abs(last.close - ema) / ema * 100 : null;
+  return { long: last.close > ema && proxyOK, short: last.close < ema && proxyOK, ema, proxyOK, emaDistancePct };
 }
 
 // ─── "Mario – Build-Up Detector + EMA Filter" ────────────────────────────
@@ -804,15 +809,19 @@ function calcMMOscPullbackZone(osc, direction, opts = {}) {
 
 // ─── "Mario IMPULSE + CONFIRMED + GAP FILTER + BTC.D FILTER" (само IMPULSE и
 // CONFIRMED - Gap/BTC.D филтрите изискват данни, които Binance API не дава) ──
+// `atrPct` в резултата (т.4 от директивата, 2026-11-26 - TAG OUTCOME TRACKER
+// магнитуд-телеметрия) - вече изчислена стойност в ТАЗИ функция, връщана
+// ДОПЪЛНИТЕЛНО към long/short, БЕЗ нова математика/заявка. Нулева промяна в
+// gate/volatilityOK/long/short логиката по-долу.
 function calcImpulseAtrSignal(candles, opts = {}) {
   const volLen = opts.volLen ?? 20, impulseVolMult = opts.impulseVolMult ?? 2.5;
   const impulseBodyPct = opts.impulseBodyPct ?? 0.6;
   const atrLen = opts.atrLen ?? 14, atrMinPct = opts.atrMinPct ?? 0.15, atrMaxPct = opts.atrMaxPct ?? 3.0;
   const n = candles.length;
-  if (n < Math.max(volLen, atrLen) + 2) return { long: false, short: false };
+  if (n < Math.max(volLen, atrLen) + 2) return { long: false, short: false, atrPct: null };
   const volMA = calcSMA(candles.map(c => c.volume), volLen);
   const atr = calcATR(candles, atrLen);
-  if (volMA == null || atr == null) return { long: false, short: false };
+  if (volMA == null || atr == null) return { long: false, short: false, atrPct: null };
   const last = candles[n - 1], prev = candles[n - 2];
   const atrPct = atr / last.close * 100;
   const volatilityOK = atrPct >= atrMinPct && atrPct <= atrMaxPct;
@@ -820,7 +829,7 @@ function calcImpulseAtrSignal(candles, opts = {}) {
   const impulseCandle = Math.abs(last.close - last.open) / rng >= impulseBodyPct;
   const impulseVol = last.volume >= volMA * impulseVolMult;
   const gate = impulseCandle && impulseVol && volatilityOK;
-  return { long: gate && last.close > prev.high, short: gate && last.close < prev.low };
+  return { long: gate && last.close > prev.high, short: gate && last.close < prev.low, atrPct };
 }
 
 function calcConfirmedSignal(candles15, candles1h, opts = {}) {
@@ -2725,10 +2734,17 @@ const TAG_OUTCOME_TRACKED_TYPES = new Set(['flush', 'blowoff', 'squeeze', 'dumpS
 // от посока - именно тук се вижда дали FLUSH и DUMP SQUEEZE реално се
 // задействат едновременно на практика (виж buildTagCoFireCounts по-долу),
 // а не само теоретично от условията им.
-function buildTagOutcomeRecord({ symbol, type, direction, at, price, concurrentTypes }) {
+// `magnitude` (т.4 от директивата, 2026-11-26 - impulseAtr/mmX25 магнитуд-
+// телеметрия) - СТОЙНОСТТА В МОМЕНТА НА ЗАДЕЙСТВАНЕТО (impulseAtr.atrPct /
+// x25.emaDistancePct, виж calcImpulseAtrSignal/calcMMx25Entry по-горе),
+// подадена директно от sig обекта в wiring-а по-долу - НЕ преизчислена
+// по-късно (при резолюция на хоризонтите), за да отразява точно условията
+// при самото фалиране. null за типове без established магнитуд метрика
+// (flush/blowoff/squeeze/dumpSqueeze/mm) - не измисляме нова само за тях.
+function buildTagOutcomeRecord({ symbol, type, direction, at, price, concurrentTypes, magnitude }) {
   return {
     symbol, type, direction, at: at ?? Date.now(), entryPrice: price ?? null,
-    concurrentTypes: concurrentTypes ?? [],
+    concurrentTypes: concurrentTypes ?? [], magnitude: magnitude ?? null,
     outcome5m: null, outcome15m: null, outcome30m: null, outcome60m: null, outcome120m: null, outcome240m: null, outcome360m: null,
     mfe5m: null, mae5m: null, mfe5mAtr: null, mae5mAtr: null,
     mfe15m: null, mae15m: null, mfe15mAtr: null, mae15mAtr: null,
@@ -6192,14 +6208,14 @@ async function scanSymbolSignals(env, symbol) {
   if (superDownDump) fired.push({ label: '🚨 SUPER DOWN (DUMP)', direction: 'short', weight: SIGNAL_WEIGHTS.superDown, family: 'volumeMomentum', type: 'superDown' });
   if (mmLong) fired.push({ label: '🟢 MM LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mm, family: 'mmEngine', type: 'mm' });
   if (mmShort) fired.push({ label: '🔴 MM SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mm, family: 'mmEngine', type: 'mm' });
-  if (mmX25Long) fired.push({ label: '💎 MM x25 LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine', type: 'mmX25' });
-  if (mmX25Short) fired.push({ label: '💀 MM x25 SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine', type: 'mmX25' });
+  if (mmX25Long) fired.push({ label: '💎 MM x25 LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine', type: 'mmX25', magnitude: x25.emaDistancePct });
+  if (mmX25Short) fired.push({ label: '💀 MM x25 SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmX25, family: 'mmEngine', type: 'mmX25', magnitude: x25.emaDistancePct });
   if (oscBestLong) fired.push({ label: '🟢▲ MM-OSC BEST LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmOscBest, family: 'mmEngine', type: 'mmOscBest' });
   if (oscBestShort) fired.push({ label: '🔴▼ MM-OSC BEST SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmOscBest, family: 'mmEngine', type: 'mmOscBest' });
   if (oscReLong) fired.push({ label: '🟢△ MM-OSC RE-LONG', direction: 'long', weight: SIGNAL_WEIGHTS.mmOscRe, family: 'mmEngine', type: 'mmOscRe' });
   if (oscReShort) fired.push({ label: '🔴▽ MM-OSC RE-SHORT', direction: 'short', weight: SIGNAL_WEIGHTS.mmOscRe, family: 'mmEngine', type: 'mmOscRe' });
-  if (impulseAtr.long) fired.push({ label: '⚡ IMPULSE+ATR ▲', direction: 'long', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime, type: 'impulseAtr' });
-  if (impulseAtr.short) fired.push({ label: '⚡ IMPULSE+ATR ▼', direction: 'short', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime, type: 'impulseAtr' });
+  if (impulseAtr.long) fired.push({ label: '⚡ IMPULSE+ATR ▲', direction: 'long', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime, type: 'impulseAtr', magnitude: impulseAtr.atrPct });
+  if (impulseAtr.short) fired.push({ label: '⚡ IMPULSE+ATR ▼', direction: 'short', weight: SIGNAL_WEIGHTS.impulseAtr, family: 'impulseFamily', candleTime: impulseAtrCandleTime, type: 'impulseAtr', magnitude: impulseAtr.atrPct });
   if (confirmed.long) fired.push({ label: '✅ CONFIRMED ▲', direction: 'long', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime, type: 'confirmed' });
   if (confirmed.short) fired.push({ label: '✅ CONFIRMED ▼', direction: 'short', weight: SIGNAL_WEIGHTS.confirmed, family: 'structure', candleTime: confirmedCandleTime, type: 'confirmed' });
 
@@ -6252,7 +6268,7 @@ async function scanSymbolSignals(env, symbol) {
       const allNewTypes = newFired.map(sig => sig.type);
       for (const sig of trackedNewFired) {
         const concurrentTypes = allNewTypes.filter(t => t !== sig.type);
-        const record = buildTagOutcomeRecord({ symbol, type: sig.type, direction: sig.direction, at: now, price, concurrentTypes });
+        const record = buildTagOutcomeRecord({ symbol, type: sig.type, direction: sig.direction, at: now, price, concurrentTypes, magnitude: sig.magnitude });
         const tagOutcomeKey = `tagoutcome:${symbol}:${record.at}:${sig.type}`;
         await env.ALERT_STATE.put(tagOutcomeKey, JSON.stringify(record));
         state.pendingTagOutcomes.push({ key: tagOutcomeKey, horizons: buildPendingOutcomeHorizons(record.at), entryPrice: price, direction: sig.direction, entryAt: record.at });
@@ -9309,6 +9325,7 @@ export {
   // SIGNAL TAG OUTCOME TRACKER (Step 1, observational) - изложени само за
   // unit тестове.
   TAG_OUTCOME_TRACKED_TYPES, buildTagOutcomeRecord, tagTypeKey, tagSoloKey,
+  calcImpulseAtrSignal, calcMMx25Entry,
   buildTagOutcomeTypeSoloBreakdown, buildTagCoFireCounts, buildTagOutcomeSummary,
   // TREND BALANCE OBSERVATION TRACKER (Etап 2, observational) - изложени
   // само за unit тестове.
