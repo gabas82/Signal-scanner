@@ -212,8 +212,8 @@ describe('scanSymbolSignals wiring (structural)', () => {
     const saveIdx = WORKER_SRC.indexOf('await saveSymbolState(env, symbol, state);');
     expect(saveIdx).toBeGreaterThan(idx);
   });
-  it('resolveTargetHits се извиква в резолюционния блок', () => {
-    expect(WORKER_SRC.includes('resolveTargetHits(p, lastClosed5mForTrendObs);')).toBe(true);
+  it('resolveTargetHits се извиква в резолюционния блок (за всяка налична свещ, виж VETO RETROSPECTIVE STAGE 2 т.2 - gap backfill)', () => {
+    expect(WORKER_SRC.includes('for (const candle of c5Closed) resolveTargetHits(p, candle);')).toBe(true);
   });
   it('резолюцията е обвита в try/catch (PR #170 review т.3 - изолация от основното сканиране)', () => {
     const needle = 'if (state.pendingTrendObservations && state.pendingTrendObservations.length && env.ALERT_STATE) {';

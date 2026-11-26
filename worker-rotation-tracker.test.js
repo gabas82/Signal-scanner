@@ -422,7 +422,7 @@ describe('maybeSendDailyRotationDigest - пагинационен фикс (prod
     expect(ROTATION_DIGEST_MAX_KEYS_SCANNED).toBeLessThan(950); // margin за list()+get()+put()+WhatsApp под ~1000 subrequest лимита
   });
 
-  it('792 rotation: записа (реален production обем) -> нито един пропуснат, truncated=false, без crash', async () => {
+  it('792 rotation: записа (реален production обем) -> нито един пропуснат, НЕ truncated, без crash - но над near-limit прага (88% >= 85%)', async () => {
     const now = 3_000_000_000;
     const seed = {};
     for (let i = 0; i < 792; i++) {
@@ -442,9 +442,36 @@ describe('maybeSendDailyRotationDigest - пагинационен фикс (prod
     try {
       await maybeSendDailyRotationDigest({ ALERT_STATE: kv, CALLMEBOT_PHONE: '+1', TEXTMEBOT_APIKEY: 'k' });
     } finally { Date.now = realDateNow; console.warn = realWarn; }
-    expect(warned).toBeNull(); // 792 < 900 -> без truncation warning
+    // 792/900 = 88% >= ROTATION_DIGEST_NEAR_LIMIT_RATIO (85%) - near-limit
+    // предупреждение СЕ очаква (не truncation предупреждение - виж
+    // отделния needle по-долу), точно сценарият, който потребителят поиска
+    // да бъде видим ПРЕДИ реално да се пропускат записи.
+    expect(warned).toContain('наближава лимита');
     expect(sentText).toContain('792'); // всичките 792 "монети напуснаха" броя се вижда в заглавния ред
+    expect(sentText).not.toContain('ВНИМАНИЕ'); // truncated=false -> без truncation ред в самото съобщение
     expect(kv.getCallCount()).toBeLessThan(900); // бюджет под subrequest лимита
+  });
+
+  it('под near-limit прага (напр. 500 записа) -> нито truncation, нито near-limit предупреждение', async () => {
+    const now = 3_000_000_000;
+    const seed = {};
+    for (let i = 0; i < 500; i++) {
+      const exitedAt = now - 1000 - i;
+      seed[`rotation:SYM${String(i).padStart(4, '0')}USDT:${1000 + i}`] = JSON.stringify({
+        symbol: `SYM${i}USDT`, entryPrice: 1, exitPrice: 1.01, durationMin: 30, exitedAt, outcome60m: null,
+      });
+    }
+    const kv = makePaginatedKv(seed);
+    globalThis.fetch = async () => new Response('{"success":true}');
+    const realDateNow = Date.now;
+    Date.now = () => now;
+    let warned = null;
+    const realWarn = console.warn;
+    console.warn = (msg) => { warned = msg; };
+    try {
+      await maybeSendDailyRotationDigest({ ALERT_STATE: kv, CALLMEBOT_PHONE: '+1', TEXTMEBOT_APIKEY: 'k' });
+    } finally { Date.now = realDateNow; console.warn = realWarn; }
+    expect(warned).toBeNull();
   });
 
   it('над ROTATION_DIGEST_MAX_KEYS_SCANNED записа -> truncated:true, console.warn, БЕЗ crash, .get() бюджет остава ограничен', async () => {
@@ -473,6 +500,30 @@ describe('maybeSendDailyRotationDigest - пагинационен фикс (prod
     // +1 - началният env.ALERT_STATE.get(ROTATION_DIGEST_LAST_SENT_KEY) гейт-check,
     // отделен от самите rotation: record .get() извиквания (капнати на MAX_KEYS_SCANNED).
     expect(kv.getCallCount()).toBeLessThanOrEqual(ROTATION_DIGEST_MAX_KEYS_SCANNED + 1);
+  });
+
+  it('truncated=true -> предупреждението се вижда и в самото WhatsApp съобщение (не само console.warn логове)', async () => {
+    const now = 3_000_000_000;
+    const seed = {};
+    const total = ROTATION_DIGEST_MAX_KEYS_SCANNED + 300;
+    for (let i = 0; i < total; i++) {
+      const exitedAt = now - 1000 - i;
+      seed[`rotation:SYM${String(i).padStart(5, '0')}USDT:${1000 + i}`] = JSON.stringify({
+        symbol: `SYM${i}USDT`, entryPrice: 1, exitPrice: 1.01, durationMin: 30, exitedAt, outcome60m: null,
+      });
+    }
+    const kv = makePaginatedKv(seed);
+    let sentText = null;
+    globalThis.fetch = async (url) => { sentText = decodeURIComponent(String(url).match(/text=([^&]*)/)[1]); return new Response('{"success":true}'); };
+    const realDateNow = Date.now;
+    Date.now = () => now;
+    const realWarn = console.warn;
+    console.warn = () => {};
+    try {
+      await maybeSendDailyRotationDigest({ ALERT_STATE: kv, CALLMEBOT_PHONE: '+1', TEXTMEBOT_APIKEY: 'k' });
+    } finally { Date.now = realDateNow; console.warn = realWarn; }
+    expect(sentText).toContain('ВНИМАНИЕ');
+    expect(sentText).toContain(String(ROTATION_DIGEST_MAX_KEYS_SCANNED));
   });
 });
 
