@@ -1139,6 +1139,26 @@ function buildRotationCandidates(bulkTicker) {
 const ROTATION_STATE_KEY = 'rotation:active';
 const ROTATION_PENDING_KEY = 'rotation:pending';
 
+// ROTATION_RECORD_RETENTION_DAYS (т.6 от директивата, 2026-11-26) - устойчиво
+// решение срещу "периодично вдигане на MAX_KEYS_SCANNED", вместо само по-висок
+// таван: KV `expiration` на всеки rotation: запис, анкерирано към enteredAt
+// (НЕ към момента на записа/препис - виж коментара при rotationRecordExpiration
+// по-долу) - Cloudflare автоматично ги трие след 14 дни, БЕЗ отделна cleanup
+// задача. 14 дни >> максималния нужен прозорец (24ч резолюция на последния
+// хоризонт + 24ч digest look-back = 48ч, с голям margin) - rotation:
+// обемът вече не расте неограничено с времето, стабилизира се около
+// ~2-седмичния churn rate, независимо колко дълго работи проекта.
+const ROTATION_RECORD_RETENTION_DAYS = 14;
+// Absolute `expiration` (UNIX секунди), НЕ `expirationTtl` (относително "сега +
+// N") - записът се пренаписва МНОГОКРАТНО (при всеки резолвнат хоризонт, виж
+// wiring-а по-долу), а `expirationTtl` би RESET-вал изтичането при всеки
+// препис (вечно "плъзгащ се" prozorec, никога реално не изтича). `expiration`
+// остава закотвено към оригиналния enteredAt независимо колко пъти записът е
+// презаписан.
+function rotationRecordExpiration(enteredAt) {
+  return Math.floor(enteredAt / 1000) + ROTATION_RECORD_RETENTION_DAYS * 86400;
+}
+
 // Главен cron tick за rotation tracker-а - чисто observational, успоредно на
 // (не вътре в) checkMarketSignals/Discovery Radar. Пази state в СЪЩИЯ вече
 // бинднат ALERT_STATE KV namespace, нови rotation:* ключове - без нова
@@ -1162,7 +1182,7 @@ async function trackCoinRotation(env) {
     let pending = rawPending ? JSON.parse(rawPending) : [];
 
     for (const record of exitedRecords) {
-      await env.ALERT_STATE.put(`rotation:${record.symbol}:${record.enteredAt}`, JSON.stringify(record));
+      await env.ALERT_STATE.put(`rotation:${record.symbol}:${record.enteredAt}`, JSON.stringify(record), { expiration: rotationRecordExpiration(record.enteredAt) });
       pending.push({ symbol: record.symbol, enteredAt: record.enteredAt, exitPrice: record.exitPrice, horizons: record.horizons });
     }
 
@@ -1174,7 +1194,7 @@ async function trackCoinRotation(env) {
       if (Object.keys(updates).length > 0) {
         const key = `rotation:${p.symbol}:${p.enteredAt}`;
         const raw = await env.ALERT_STATE.get(key);
-        if (raw) await env.ALERT_STATE.put(key, JSON.stringify({ ...JSON.parse(raw), ...updates }));
+        if (raw) await env.ALERT_STATE.put(key, JSON.stringify({ ...JSON.parse(raw), ...updates }), { expiration: rotationRecordExpiration(p.enteredAt) });
       }
       if (!allResolved) stillPending.push(p);
     }
@@ -9299,6 +9319,7 @@ export {
   buildLiqGravityPublicSnapshot,
   // ROTATION TRACKER - изложени само за unit тестове.
   ROTATION_OUTCOME_HORIZONS_MIN, rankRotationCandidates, buildPendingRotationHorizons,
+  ROTATION_RECORD_RETENTION_DAYS, rotationRecordExpiration,
   calcRotationOutcomePct, diffRotationMembership, resolvePendingRotationOutcomes,
   BASE_ROTATION_SYMBOLS, selectHighMoveSymbols, selectHighVolumeSymbols,
   buildRotationCandidates, trackCoinRotation, ROTATION_STATE_KEY, ROTATION_PENDING_KEY,
