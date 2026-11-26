@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest';
 import {
   TAG_OUTCOME_TRACKED_TYPES, buildTagOutcomeRecord, tagTypeKey, tagSoloKey,
   buildTagOutcomeTypeSoloBreakdown, buildTagCoFireCounts, buildTagOutcomeSummary,
+  calcImpulseAtrSignal, calcMMx25Entry,
 } from './worker/worker.js';
 import worker from './worker/worker.js';
 
@@ -60,6 +61,63 @@ describe('buildTagOutcomeRecord', () => {
   it('entryPrice null когато price не е подаден', () => {
     const r = buildTagOutcomeRecord({ symbol: 'ETH', type: 'blowoff', direction: 'long', at: 1000 });
     expect(r.entryPrice).toBeNull();
+  });
+  it('magnitude по подразбиране е null (типове без established метрика - flush/blowoff/squeeze/dumpSqueeze/mm)', () => {
+    const r = buildTagOutcomeRecord({ symbol: 'BTC', type: 'flush', direction: 'short', at: 1000, price: 64000 });
+    expect(r.magnitude).toBeNull();
+  });
+  it('magnitude се пази ТОЧНО както е подадена (impulseAtr/mmX25 - виж wiring-а в scanSymbolSignals)', () => {
+    const r = buildTagOutcomeRecord({ symbol: 'BTC', type: 'impulseAtr', direction: 'long', at: 1000, price: 64000, magnitude: 0.87 });
+    expect(r.magnitude).toBe(0.87);
+  });
+});
+
+// МАГНИТУД-ТЕЛЕМЕТРИЯ (т.4 от директивата, 2026-11-26) - impulseAtr.atrPct/
+// x25.emaDistancePct вече се смятаха в тези функции, само не се връщаха.
+// Нулева нова математика/заявка - виж коментарите при самите функции.
+describe('calcImpulseAtrSignal - atrPct магнитуд (без промяна в gate логиката)', () => {
+  function buildFlat(n, closeStart = 100) {
+    const out = [];
+    for (let i = 0; i < n; i++) out.push({ open: closeStart, high: closeStart + 0.5, low: closeStart - 0.5, close: closeStart, volume: 100 });
+    return out;
+  }
+  it('недостатъчно свещи -> atrPct:null, long/short:false (огледално на преди фикса)', () => {
+    const r = calcImpulseAtrSignal(buildFlat(3));
+    expect(r).toEqual({ long: false, short: false, atrPct: null });
+  });
+  it('atrPct е положително число, когато има достатъчно данни', () => {
+    const flat = buildFlat(25);
+    const r = calcImpulseAtrSignal(flat);
+    expect(typeof r.atrPct).toBe('number');
+    expect(r.atrPct).toBeGreaterThan(0);
+  });
+  it('breakout сценарий (long:true) носи и валидна atrPct стойност едновременно', () => {
+    const flat = buildFlat(25);
+    const breakout = { open: 100, high: 112, low: 99.5, close: 111, volume: 500 };
+    const r = calcImpulseAtrSignal([...flat, breakout]);
+    expect(r.long).toBe(true);
+    expect(typeof r.atrPct).toBe('number');
+  });
+});
+
+describe('calcMMx25Entry - emaDistancePct магнитуд (без промяна в proxyOK/long/short логиката)', () => {
+  function buildTrend(dir, n = 25) {
+    const out = [];
+    let price = 100;
+    for (let i = 0; i < n; i++) {
+      price += dir === 'up' ? 0.3 : -0.3;
+      out.push({ open: price, high: price + 0.2, low: price - 0.2, close: price, volume: 50 });
+    }
+    return out;
+  }
+  it('недостатъчно свещи -> ema/emaDistancePct:null', () => {
+    const r = calcMMx25Entry([{ open: 1, high: 1, low: 1, close: 1, volume: 1 }]);
+    expect(r).toEqual({ long: false, short: false, ema: null, emaDistancePct: null });
+  });
+  it('emaDistancePct е неотрицателно число (абсолютно разстояние), когато има достатъчно данни', () => {
+    const r = calcMMx25Entry(buildTrend('up'));
+    expect(typeof r.emaDistancePct).toBe('number');
+    expect(r.emaDistancePct).toBeGreaterThanOrEqual(0);
   });
 });
 
@@ -163,6 +221,13 @@ describe('scanSymbolSignals wiring (structural)', () => {
     const trackerIdx = WORKER_SRC.indexOf('const trackedNewFired = newFired.filter(sig => TAG_OUTCOME_TRACKED_TYPES.has(sig.type));');
     expect(scoreIdx).toBeGreaterThan(-1);
     expect(trackerIdx).toBeGreaterThan(scoreIdx);
+  });
+  it('magnitude се подава от sig.magnitude към buildTagOutcomeRecord (т.4, 2026-11-26)', () => {
+    expect(WORKER_SRC).toContain("buildTagOutcomeRecord({ symbol, type: sig.type, direction: sig.direction, at: now, price, concurrentTypes, magnitude: sig.magnitude });");
+  });
+  it('impulseAtr/mmX25 fired записите носят magnitude от съответния detector (atrPct/emaDistancePct)', () => {
+    expect(WORKER_SRC).toContain("type: 'impulseAtr', magnitude: impulseAtr.atrPct");
+    expect(WORKER_SRC).toContain("type: 'mmX25', magnitude: x25.emaDistancePct");
   });
 });
 
