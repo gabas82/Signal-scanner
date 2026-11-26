@@ -24,6 +24,7 @@ import {
   buildCoverageRange, countPossibleDuplicateEvents, countUnmatchedEvaluations,
   countMissingLatency, buildTcIntegrityDiagnostics, buildTelemetryIntegrityDiagnostics,
   buildTcMissingEpisodeIds, buildTcCohortStatus, listKvKeysWithTruncation,
+  OUTCOME_HORIZONS_MIN, buildPendingOutcomeHorizons, resolvePendingOutcomeHorizons, updateExcursion,
 } from './worker/worker.js';
 
 const workerSrc = fs.readFileSync('./worker/worker.js', 'utf8');
@@ -647,5 +648,97 @@ describe('END-TO-END regression - SETUP CREATED -> ARMED CREATED -> ENTRY CONFIR
     expect(diag.conversionMetrics.episode.confirmedEpisodeCount).toBe(1); // само BTCUSDT
     expect(diag.conversionMetrics.episode.episodeConfirmedPct).toBe(50); // НЕ 100%, НЕ колизия
     expect(diag.unmatchedEvaluationCount).toBe(0);
+  });
+});
+
+// VETO RETROSPECTIVE STAGE 2 (2026-11-26) - разширени хоризонти (120/360м) +
+// пазарен режим context + VETO влизащ в pendingOutcomes.
+describe('VETO RETROSPECTIVE STAGE 2 - разширени хоризонти', () => {
+  it('OUTCOME_HORIZONS_MIN съдържа всичките 7 одобрени хоризонта, във възходящ ред', () => {
+    expect(OUTCOME_HORIZONS_MIN).toEqual([5, 15, 30, 60, 120, 240, 360]);
+  });
+
+  it('buildPendingOutcomeHorizons произвежда m120/m360 ключове с коректен dueAt', () => {
+    const horizons = buildPendingOutcomeHorizons(1000000);
+    expect(horizons.m120.dueAt).toBe(1000000 + 120 * 60000);
+    expect(horizons.m360.dueAt).toBe(1000000 + 360 * 60000);
+    expect(Object.keys(horizons).length).toBe(7);
+  });
+
+  it('resolvePendingOutcomeHorizons попълва outcome120m/outcome360m при due момента', () => {
+    const pending = { horizons: buildPendingOutcomeHorizons(0), entryPrice: 100, direction: 'long' };
+    const { updates, allResolved } = resolvePendingOutcomeHorizons(pending, 110, 360 * 60000);
+    expect(updates.outcome120m).toBeCloseTo(10, 5);
+    expect(updates.outcome360m).toBeCloseTo(10, 5);
+    expect(allResolved).toBe(true);
+  });
+
+  it('buildTelemetryRecord има null placeholder-и за всичките нови 120м/360м полета', () => {
+    const rec = buildTelemetryRecord({
+      symbol: 'BTCUSDT', direction: 'long', decision: 'veto', setupMode: 'trend_continuation',
+      armedAt: 1, structRef: 100, triggerClose: 101, atr5m: 1, vetoSource: 'liq',
+    });
+    for (const f of ['outcome120m', 'outcome360m', 'mfe120m', 'mae120m', 'mfe120mAtr', 'mae120mAtr',
+      'mfe360m', 'mae360m', 'mfe360mAtr', 'mae360mAtr']) {
+      expect(rec[f]).toBeNull();
+    }
+  });
+});
+
+describe('VETO RETROSPECTIVE STAGE 2 - пазарен режим context в telemetry', () => {
+  it('buildTelemetryRecord записва подадените liqGravity*/htfTrend4h стойности', () => {
+    const rec = buildTelemetryRecord({
+      symbol: 'ETHUSDT', direction: 'short', decision: 'veto', setupMode: 'mean_reversion',
+      armedAt: 1, structRef: 100, triggerClose: 99, atr5m: 1, vetoSource: 'liq',
+      liqGravityTier: 'watch', liqGravityDirection: 'long', liqGravityDistancePct: 1.23,
+      liqCascadeBuyUsd: 50000, liqCascadeSellUsd: 12000, htfTrend4h: 'bear',
+    });
+    expect(rec.liqGravityTier).toBe('watch');
+    expect(rec.liqGravityDirection).toBe('long');
+    expect(rec.liqGravityDistancePct).toBe(1.23);
+    expect(rec.liqCascadeBuyUsd).toBe(50000);
+    expect(rec.liqCascadeSellUsd).toBe(12000);
+    expect(rec.htfTrend4h).toBe('bear');
+  });
+
+  it('buildTelemetryRecord без подадени режим полета -> безопасни default-и (none/null)', () => {
+    const rec = buildTelemetryRecord({
+      symbol: 'ETHUSDT', direction: 'short', decision: 'confirmed', setupMode: 'mean_reversion',
+      armedAt: 1, structRef: 100, triggerClose: 99, atr5m: 1,
+    });
+    expect(rec.liqGravityTier).toBe('none');
+    expect(rec.liqGravityDirection).toBeNull();
+    expect(rec.liqGravityDistancePct).toBeNull();
+    expect(rec.liqCascadeBuyUsd).toBeNull();
+    expect(rec.liqCascadeSellUsd).toBeNull();
+    expect(rec.htfTrend4h).toBeNull();
+  });
+});
+
+describe('VETO RETROSPECTIVE STAGE 2 - двупосочно MFE/MAE за VETO чрез wiring-а в scanSymbolSignals', () => {
+  it('worker.js wiring-ът включва decision===\'veto\' в pendingOutcomes push условието (2 call sites: MR + TC)', () => {
+    const matches = workerSrc.match(/decision === 'confirmed' \|\| decision === 'missed' \|\| decision === 'veto'/g) || [];
+    expect(matches.length).toBe(2);
+  });
+
+  it('updateExcursion/calcOutcomePct огледална симетрия: mae за direction=long == -(mfe за direction=short) на ИДЕНТИЧЕН ценов път', () => {
+    // Доказва твърдението в коментара на wiring-а: за един VETO LONG запис,
+    // mae{X}m (движение В ПРОТИВОПОЛОЖНАТА, SHORT посока) е математически
+    // идентично на mfe{X}m, което БИ се получило, ако directio=short за
+    // СЪЩИЯ ценов път - т.е. ЕДИН pendingOutcomes запис реално носи
+    // информация за движение в двете посоки, без нужда от паралелен tracking.
+    const candle = { high: 105, low: 95 };
+    const pendingLong = { direction: 'long', entryPrice: 100 };
+    const pendingShort = { direction: 'short', entryPrice: 100 };
+    updateExcursion(pendingLong, candle, 0);
+    updateExcursion(pendingShort, candle, 0);
+    expect(pendingLong.mfePct).toBeCloseTo(5, 6); // LONG favorable = high movement
+    expect(pendingLong.maePct).toBeCloseTo(-5, 6); // LONG adverse = low movement
+    expect(pendingShort.mfePct).toBeCloseTo(5, 6); // SHORT favorable = low movement (огледално положително)
+    expect(pendingShort.maePct).toBeCloseTo(-5, 6); // SHORT adverse = high movement
+    // Самата огледална симетрия: adverse excursion за LONG (-5%) по модул
+    // съвпада с favorable excursion, което SHORT би видял на СЪЩИЯ ценов път (+5%).
+    expect(pendingLong.maePct).toBeCloseTo(-pendingShort.mfePct, 6);
+    expect(pendingShort.maePct).toBeCloseTo(-pendingLong.mfePct, 6);
   });
 });

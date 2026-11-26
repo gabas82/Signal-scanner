@@ -79,12 +79,12 @@ describe('Структурна проверка - и 4-те endpoint-а вече
     expect(workerSrc).toMatch(/listKvKeysWithTruncation\(env\.ALERT_STATE, "tagoutcome:", MAX_KEYS_SCANNED\)/);
   });
   it('нито един от 4-те вече НЕ прави директен list({prefix: ...}) без cursor (старият бъг)', () => {
-    // Единствените оставащи "голи" .list({ prefix заявки трябва да са: helper-ът
-    // самия (1), maybeSendDailyRotationDigest (production cron, отделен discussion,
-    // не диагностичен endpoint) и findFirstEntryTelemetryRecord (per-symbol, нисък
-    // обем) - вижда се по broя срещи по-долу.
+    // ПАГИНАЦИОНЕН ПРОБЛЕМ в maybeSendDailyRotationDigest (2026-11-26) - вече
+    // фиксиран (виж worker-rotation-tracker.test.js) - остава само helper-ът
+    // самия (1) и findFirstEntryTelemetryRecord (per-symbol, нисък обем, извън
+    // обхвата на тая директива).
     const bareListMatches = [...workerSrc.matchAll(/\.list\(\{\s*prefix:(?!\s*,\s*cursor)/g)];
-    expect(bareListMatches.length).toBe(3); // helper-ът, rotation digest, findFirstEntryTelemetryRecord
+    expect(bareListMatches.length).toBe(2); // helper-ът, findFirstEntryTelemetryRecord
   });
   it('MAX_KEYS_SCANNED за всичките 4 е безопасно под Cloudflare subrequest лимита (500, не 10000/5000/2000 както при първия, счупен опит)', () => {
     const matches = [...workerSrc.matchAll(/const MAX_KEYS_SCANNED = (\d+);/g)].map(m => Number(m[1]));
