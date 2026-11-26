@@ -4149,6 +4149,55 @@ function getSuppliedTelemetryToken(request, url) {
   return (url.searchParams.get("token") || "").trim();
 }
 
+// ═══ MEXC ДИАГНОСТИКА (т.3 от директивата 2026-11-26) ═══════════════════════
+// Отговаря на конкретния въпрос "достижим ли е MEXC Spot/Futures ОТ САМАТА
+// Cloudflare Workers edge мрежа" - sandbox средата на тая conversation НЯМА
+// достъп до api.mexc.com/contract.mexc.com (отделен network allowlist, виж
+// discussion-а), което казва нищо за Worker-а самия (различна мрежа изцяло,
+// точно както fapi.binance.com случая - виж relay/README.md). Публични
+// ticker ендпойнти - БЕЗ търговски API ключ, няма нужда от нова secret.
+// Нарочно само 2 леки заявки (spot+futures), БЕЗ retry/loop/KV запис -
+// "ограничено потребление на ресурси", чисто еднократна проба при GET заявка,
+// не cron-вързана. 5s timeout на всяка - никога да не увисне целия Worker
+// request заради бавен/неотговарящ upstream.
+const MEXC_DIAG_SPOT_URL = 'https://api.mexc.com/api/v3/ticker/price?symbol=BTCUSDT';
+const MEXC_DIAG_FUTURES_URL = 'https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT';
+const MEXC_DIAG_TIMEOUT_MS = 5000;
+
+async function fetchMexcDiagEndpoint(targetUrl, label, fetchImpl = fetch) {
+  const startedAt = Date.now();
+  try {
+    const res = await fetchImpl(targetUrl, { signal: AbortSignal.timeout(MEXC_DIAG_TIMEOUT_MS) });
+    const latencyMs = Date.now() - startedAt;
+    const text = await res.text();
+    let sample = null;
+    try { sample = JSON.parse(text); } catch (e) { /* не-JSON отговор - пазим суровия текст по-долу */ }
+    return {
+      label, url: targetUrl, reachable: true, httpStatus: res.status, latencyMs,
+      sample: sample ?? text.slice(0, 300),
+    };
+  } catch (e) {
+    // AbortSignal.timeout хвърля DOMException 'TimeoutError' - разграничаваме
+    // я от истинска network грешка (DNS/TLS/connection refused), за да личи в
+    // отговора КАКЪВ тип недостъпност е (бавен upstream срещу истински блок).
+    const isTimeout = e && (e.name === 'TimeoutError' || e.name === 'AbortError');
+    return {
+      label, url: targetUrl, reachable: false, latencyMs: Date.now() - startedAt,
+      error: isTimeout ? 'timeout' : String((e && e.message) || e),
+    };
+  }
+}
+
+// Чиста orchestration функция (inject-ваем fetchImpl за тестваемост, виж
+// discussion-а - НЕ прави реална мрежова заявка в unit тестовете).
+async function runMexcDiagProbe(fetchImpl = fetch) {
+  const [spot, futures] = await Promise.all([
+    fetchMexcDiagEndpoint(MEXC_DIAG_SPOT_URL, 'spot', fetchImpl),
+    fetchMexcDiagEndpoint(MEXC_DIAG_FUTURES_URL, 'futures', fetchImpl),
+  ]);
+  return { at: Date.now(), spot, futures };
+}
+
 // COVERAGE RANGE - най-ранния/най-късния `at` timestamp сред сканираните
 // записи. Чисто observational - показва какъв времеви прозорец реално
 // покрива текущата (евентуално truncated) извадка.
@@ -9203,6 +9252,8 @@ export {
   buildTelemetryRecord, buildTcSetupCreatedRecord, buildTcArmedCreatedRecord, buildTcArmedResetRecord,
   // VETO RETROSPECTIVE STAGE 2 (2026-11-26) - изложени само за unit тестове.
   OUTCOME_HORIZONS_MIN, buildPendingOutcomeHorizons, resolvePendingOutcomeHorizons, updateExcursion,
+  // MEXC ДИАГНОСТИКА (2026-11-26) - изложени само за unit тестове.
+  fetchMexcDiagEndpoint, runMexcDiagProbe, MEXC_DIAG_SPOT_URL, MEXC_DIAG_FUTURES_URL,
   // MR LIFECYCLE TELEMETRY (2026-11-26) - изложени само за unit тестове.
   buildMrSetupCreatedRecord, buildMrArmedCreatedRecord, buildMrArmedResetRecord,
   buildTcLifecycleSummary, buildTcReArmStats, buildTcLatencyBuckets, buildTcResetByReason,
@@ -9544,6 +9595,16 @@ export default {
       summary.source = getLiqDiagSource(env);
       if (url.searchParams.get("full") === "1") summary.raw = Object.fromEntries(entries.map(e => [e.symbol, e.diag]));
       return json(summary);
+    }
+    // MEXC ДИАГНОСТИКА (т.3, 2026-11-26) - read-only, token-gated като
+    // /liq-diagnostics. Виж runMexcDiagProbe по-горе - само 2 леки, публични
+    // ticker заявки (без търговски API ключ), БЕЗ KV запис/cron връзка.
+    if (path === "/mexc-diag" && request.method === "GET") {
+      const suppliedToken = getSuppliedTelemetryToken(request, url);
+      const expectedToken = (env.TELEMETRY_TOKEN || "").trim();
+      const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+      if (!expectedToken || suppliedToken !== expectedToken) return json({ error: "Unauthorized" }, 401);
+      return json(await runMexcDiagProbe());
     }
     // ROTATION TRACKER diagnostics - read-only, token-gated като /liq-diagnostics.
     // Показва текущо активните монети в динамичната dashboard листа + вече
