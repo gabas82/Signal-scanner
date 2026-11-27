@@ -9033,15 +9033,43 @@ function buildDiscoveryEpisode(poolMember) {
 // Намира ПЪРВИЯ (най-ранен) telemetry:{symbol}:* запис с at >= sinceAt - без
 // да тегли стойностите на всички кандидати, само листва ключовете (евтино),
 // сортира по вградения в самия ключ timestamp, после чете САМО избрания.
+// ПАГИНАЦИОНЕН ФИКС (2026-11-27, същ. бъг клас като PR #175/#176) - старата
+// версия правеше ЕДИН .list() без cursor (Cloudflare подразбиране: 1000
+// ключа/страница). При 130 283+ telemetry: записа на ~35 символа (средно
+// ~3700/символ, реално разпределени нееднородно - активните монети лесно
+// надхвърлят 1000) това означаваше: ако истинският пръв match (at >= sinceAt)
+// се пада ОТВЪД първите 1000 лексикографски ключа за този символ, функцията
+// тихо връщаше null, въпреки че match-ът реално съществува - сериен bug,
+// не хипотетичен (discovery episode linking разчита на тая функция). Keys
+// са `telemetry:{symbol}:{at}:{setupMode}` - `at` като 13-цифрен ms
+// timestamp string, лексикографски ред == хронологичен (без leading-zero
+// проблем в обозримия хоризонт), затова страниците са вътрешно сортирани -
+// ПЪРВАТА страница, съдържаща match, съдържа ВСИЧКИ хронологично най-рано
+// match-ващи записи (нищо по-рано не може да се появи в по-късна страница).
+// Early-exit веднага щом страница с match се намери - без нужда да се
+// сканира ЦЯЛАТА история на символа, само до точката на първото съвпадение.
+// MAX_PAGES - безопасен таван (200 страници = до 200 000 ключа сканирани,
+// само .list() извиквания, НЕ .get() - далеко под subrequest лимита дори в
+// най-лошия случай "никога няма match").
 async function findFirstEntryTelemetryRecord(env, symbol, sinceAt) {
-  const listResult = await env.ALERT_STATE.list({ prefix: `telemetry:${symbol}:` });
-  const candidates = (listResult.keys || [])
-    .map((k) => ({ name: k.name, at: parseInt(k.name.split(':')[2], 10) }))
-    .filter((c) => Number.isFinite(c.at) && c.at >= sinceAt)
-    .sort((a, b) => a.at - b.at);
-  if (!candidates.length) return null;
-  const raw = await env.ALERT_STATE.get(candidates[0].name);
-  return raw ? JSON.parse(raw) : null;
+  const prefix = `telemetry:${symbol}:`;
+  const MAX_PAGES = 200;
+  let cursor, listComplete = false, pages = 0;
+  while (!listComplete && pages < MAX_PAGES) {
+    const listResult = await env.ALERT_STATE.list({ prefix, cursor, limit: 1000 });
+    pages++;
+    const candidates = (listResult.keys || [])
+      .map((k) => ({ name: k.name, at: parseInt(k.name.split(':')[2], 10) }))
+      .filter((c) => Number.isFinite(c.at) && c.at >= sinceAt)
+      .sort((a, b) => a.at - b.at);
+    if (candidates.length) {
+      const raw = await env.ALERT_STATE.get(candidates[0].name);
+      return raw ? JSON.parse(raw) : null;
+    }
+    listComplete = !!listResult.list_complete;
+    cursor = listComplete ? undefined : listResult.cursor;
+  }
+  return null;
 }
 
 // Wiring: за всеки текущ (дедупликиран, виж runDiscoveryFullAnalysis) pool
@@ -9350,7 +9378,7 @@ export {
   expireLevelLifecycle, finalizeClusterLifecycleRecord, advanceClusterTracking,
   priceToLiqBucket, liqBucketToPrice,
   CLUSTER_TRACK_KV_PREFIX, CLUSTER_EVENT_KV_PREFIX, clusterTrackKey, clusterEventKey,
-  trackSymbolClusterOutcome,
+  trackSymbolClusterOutcome, findFirstEntryTelemetryRecord,
   // Stage 3 - АНАЛИЗ - изложени само за unit тестове.
   CLUSTER_OUTCOME_MIN_SAMPLE, CLUSTER_OUTCOME_REASONS, buildOutcomeRateStats,
   groupClusterOutcomeRecords, buildClusterOutcomeSummary, compareOutcomeGroups,
