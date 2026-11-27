@@ -6,7 +6,7 @@
 // API ключ. Директен ESM import, огледално на другите *-diagnostics тестове.
 import { describe, it, expect, afterEach } from 'vitest';
 import worker, {
-  fetchMexcDiagEndpoint, runMexcDiagProbe, MEXC_DIAG_SPOT_URL, MEXC_DIAG_FUTURES_URL,
+  fetchMexcDiagEndpoint, runMexcDiagProbe, MEXC_DIAG_SPOT_URL, MEXC_DIAG_FUTURES_CANDIDATES,
 } from './worker/worker.js';
 
 const realFetch = globalThis.fetch;
@@ -45,25 +45,36 @@ describe('fetchMexcDiagEndpoint - pure, inject-ваем fetch (без реалн
   });
 });
 
-describe('runMexcDiagProbe - orchestration: spot + futures паралелно', () => {
-  it('извиква и двата URL-а (spot+futures), връща at + двата резултата', async () => {
+describe('runMexcDiagProbe - orchestration: spot + НЯКОЛКО futures кандидата паралелно', () => {
+  // futures URL-ът на MEXC смени домейн (contract.mexc.com -> api.mexc.com,
+  // 19.01.2026) и може да ползва path- вместо query-param стил - виж
+  // коментара при MEXC_DIAG_FUTURES_CANDIDATES в worker.js. Нито един кандидат
+  // не е лично потвърден (sandbox няма достъп до mexc.com), затова тестваме
+  // ВСИЧКИТЕ наведнъж, за да получим пълна картина от едно /mexc-diag извикване.
+  it('извиква spot URL-а + ВСИЧКИТЕ futures кандидати, връща at + пълните резултати', async () => {
     const calledUrls = [];
     const fakeFetch = async (u) => { calledUrls.push(u); return new Response(JSON.stringify({ ok: true }), { status: 200 }); };
     const result = await runMexcDiagProbe(fakeFetch);
-    expect(calledUrls.sort()).toEqual([MEXC_DIAG_FUTURES_URL, MEXC_DIAG_SPOT_URL].sort());
+    const expectedUrls = [MEXC_DIAG_SPOT_URL, ...MEXC_DIAG_FUTURES_CANDIDATES.map(c => c.url)];
+    expect(calledUrls.sort()).toEqual(expectedUrls.sort());
     expect(result.spot.label).toBe('spot');
-    expect(result.futures.label).toBe('futures');
+    expect(result.futuresCandidates).toHaveLength(MEXC_DIAG_FUTURES_CANDIDATES.length);
+    expect(result.futuresCandidates.map(f => f.label).sort()).toEqual(MEXC_DIAG_FUTURES_CANDIDATES.map(c => c.label).sort());
     expect(typeof result.at).toBe('number');
   });
 
-  it('spot достижим, futures не -> двата се виждат независимо (не "all or nothing")', async () => {
+  it('spot достижим, НЯКОИ futures кандидати не -> всеки се вижда независимо (не "all or nothing")', async () => {
+    const workingCandidate = MEXC_DIAG_FUTURES_CANDIDATES[1].url;
     const fakeFetch = async (u) => {
-      if (u === MEXC_DIAG_SPOT_URL) return new Response(JSON.stringify({ price: '1' }), { status: 200 });
+      if (u === MEXC_DIAG_SPOT_URL || u === workingCandidate) return new Response(JSON.stringify({ price: '1' }), { status: 200 });
       throw new Error('blocked');
     };
     const result = await runMexcDiagProbe(fakeFetch);
     expect(result.spot.reachable).toBe(true);
-    expect(result.futures.reachable).toBe(false);
+    const working = result.futuresCandidates.find(f => f.url === workingCandidate);
+    const blocked = result.futuresCandidates.filter(f => f.url !== workingCandidate);
+    expect(working.reachable).toBe(true);
+    expect(blocked.every(f => f.reachable === false)).toBe(true);
   });
 });
 
@@ -76,13 +87,13 @@ describe('/mexc-diag endpoint - read-only, token-защитен (огледал�
     expect((await call('/mexc-diag?token=x', {})).status).toBe(401); // без изобщо конфигуриран TELEMETRY_TOKEN -> fail-closed
   });
 
-  it('коректен token -> 200, връща spot+futures диагностика (fetch мокнат)', async () => {
+  it('коректен token -> 200, връща spot+futuresCandidates диагностика (fetch мокнат)', async () => {
     globalThis.fetch = async () => new Response(JSON.stringify({ symbol: 'BTCUSDT', price: '95000' }), { status: 200 });
     const res = await call('/mexc-diag?token=tok', { TELEMETRY_TOKEN: 'tok' });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.spot.reachable).toBe(true);
-    expect(body.futures.reachable).toBe(true);
+    expect(body.futuresCandidates.every(f => f.reachable === true)).toBe(true);
   });
 
   it('endpoint-ът НЕ пише в KV (чист read-only, нулев производствен товар)', async () => {

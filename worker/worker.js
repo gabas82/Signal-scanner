@@ -4212,7 +4212,20 @@ function getSuppliedTelemetryToken(request, url) {
 // не cron-вързана. 5s timeout на всяка - никога да не увисне целия Worker
 // request заради бавен/неотговарящ upstream.
 const MEXC_DIAG_SPOT_URL = 'https://api.mexc.com/api/v3/ticker/price?symbol=BTCUSDT';
-const MEXC_DIAG_FUTURES_URL = 'https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT';
+// FUTURES - НЯКОЛКО кандидата (2026-11-27 research) - MEXC смени futures REST
+// домейна от contract.mexc.com към api.mexc.com на 19.01.2026 (WebSocket-ът
+// остава на contract.mexc.com, НЕ REST-ът), а futures endpoint-ите по принцип
+// следват path-param конвенция ({symbol} в самия URL path), не query param
+// (?symbol=) като spot/Binance-стил - вижда се от документираните
+// fair_price/{symbol} примери. Нито едно от трите не е потвърдено лично
+// (sandbox-ът няма достъп до mexc.com) - затова тестваме и трите наведнъж,
+// за да получим пълна картина от ЕДИН /mexc-diag извикване от Cloudflare
+// edge, вместо няколко deploy-test цикъла.
+const MEXC_DIAG_FUTURES_CANDIDATES = [
+  { label: 'futures_old_host_query', url: 'https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT' },
+  { label: 'futures_new_host_query', url: 'https://api.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT' },
+  { label: 'futures_new_host_path', url: 'https://api.mexc.com/api/v1/contract/ticker/BTC_USDT' },
+];
 const MEXC_DIAG_TIMEOUT_MS = 5000;
 
 async function fetchMexcDiagEndpoint(targetUrl, label, fetchImpl = fetch) {
@@ -4242,11 +4255,11 @@ async function fetchMexcDiagEndpoint(targetUrl, label, fetchImpl = fetch) {
 // Чиста orchestration функция (inject-ваем fetchImpl за тестваемост, виж
 // discussion-а - НЕ прави реална мрежова заявка в unit тестовете).
 async function runMexcDiagProbe(fetchImpl = fetch) {
-  const [spot, futures] = await Promise.all([
+  const [spot, ...futuresCandidates] = await Promise.all([
     fetchMexcDiagEndpoint(MEXC_DIAG_SPOT_URL, 'spot', fetchImpl),
-    fetchMexcDiagEndpoint(MEXC_DIAG_FUTURES_URL, 'futures', fetchImpl),
+    ...MEXC_DIAG_FUTURES_CANDIDATES.map(c => fetchMexcDiagEndpoint(c.url, c.label, fetchImpl)),
   ]);
-  return { at: Date.now(), spot, futures };
+  return { at: Date.now(), spot, futuresCandidates };
 }
 
 // COVERAGE RANGE - най-ранния/най-късния `at` timestamp сред сканираните
@@ -9332,7 +9345,7 @@ export {
   // VETO RETROSPECTIVE STAGE 2 (2026-11-26) - изложени само за unit тестове.
   OUTCOME_HORIZONS_MIN, buildPendingOutcomeHorizons, resolvePendingOutcomeHorizons, updateExcursion,
   // MEXC ДИАГНОСТИКА (2026-11-26) - изложени само за unit тестове.
-  fetchMexcDiagEndpoint, runMexcDiagProbe, MEXC_DIAG_SPOT_URL, MEXC_DIAG_FUTURES_URL,
+  fetchMexcDiagEndpoint, runMexcDiagProbe, MEXC_DIAG_SPOT_URL, MEXC_DIAG_FUTURES_CANDIDATES,
   // TV_ALERT_TOKEN coordinated rotation (2026-11-26) - изложени само за unit тестове.
   isValidTvAlertToken,
   // MR LIFECYCLE TELEMETRY (2026-11-26) - изложени само за unit тестове.
