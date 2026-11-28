@@ -7,6 +7,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import worker, {
   fetchMexcDiagEndpoint, runMexcDiagProbe, MEXC_DIAG_SPOT_URL, MEXC_DIAG_FUTURES_CANDIDATES,
+  MEXC_DIAG_SPOT_KLINE_URL, MEXC_DIAG_FUTURES_KLINE_CANDIDATES,
 } from './worker/worker.js';
 
 const realFetch = globalThis.fetch;
@@ -51,15 +52,22 @@ describe('runMexcDiagProbe - orchestration: spot + НЯКОЛКО futures кан
   // коментара при MEXC_DIAG_FUTURES_CANDIDATES в worker.js. Нито един кандидат
   // не е лично потвърден (sandbox няма достъп до mexc.com), затова тестваме
   // ВСИЧКИТЕ наведнъж, за да получим пълна картина от едно /mexc-diag извикване.
-  it('извиква spot URL-а + ВСИЧКИТЕ futures кандидати, връща at + пълните резултати', async () => {
+  it('извиква spot+spotKline URL-ите + ВСИЧКИТЕ futures ticker/kline кандидати, връща at + пълните резултати', async () => {
     const calledUrls = [];
     const fakeFetch = async (u) => { calledUrls.push(u); return new Response(JSON.stringify({ ok: true }), { status: 200 }); };
     const result = await runMexcDiagProbe(fakeFetch);
-    const expectedUrls = [MEXC_DIAG_SPOT_URL, ...MEXC_DIAG_FUTURES_CANDIDATES.map(c => c.url)];
+    const expectedUrls = [
+      MEXC_DIAG_SPOT_URL, MEXC_DIAG_SPOT_KLINE_URL,
+      ...MEXC_DIAG_FUTURES_CANDIDATES.map(c => c.url),
+      ...MEXC_DIAG_FUTURES_KLINE_CANDIDATES.map(c => c.url),
+    ];
     expect(calledUrls.sort()).toEqual(expectedUrls.sort());
     expect(result.spot.label).toBe('spot');
+    expect(result.spotKline.label).toBe('spot_kline');
     expect(result.futuresCandidates).toHaveLength(MEXC_DIAG_FUTURES_CANDIDATES.length);
     expect(result.futuresCandidates.map(f => f.label).sort()).toEqual(MEXC_DIAG_FUTURES_CANDIDATES.map(c => c.label).sort());
+    expect(result.futuresKlineCandidates).toHaveLength(MEXC_DIAG_FUTURES_KLINE_CANDIDATES.length);
+    expect(result.futuresKlineCandidates.map(f => f.label).sort()).toEqual(MEXC_DIAG_FUTURES_KLINE_CANDIDATES.map(c => c.label).sort());
     expect(typeof result.at).toBe('number');
   });
 
