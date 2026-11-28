@@ -4226,6 +4226,21 @@ const MEXC_DIAG_FUTURES_CANDIDATES = [
   { label: 'futures_new_host_query', url: 'https://api.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT' },
   { label: 'futures_new_host_path', url: 'https://api.mexc.com/api/v1/contract/ticker/BTC_USDT' },
 ];
+// KLINE ДИАГНОСТИКА (2026-11-28) - ticker ендпойнтите по-горе потвърдиха
+// reachability, но pipeline fallback-ът се нуждае от РЕАЛНИ candles, не
+// ticker. Официалната документация е противоречива/непотвърдена откъм
+// точен host+стил за futures klines (виж discussion-а - ticker изненадващо
+// се оказа query-param, не path-param, въпреки документираните fair_price/
+// {symbol} примери) - затова същият "тествай няколко кандидата наведнъж"
+// подход, вместо да се гради продукционен парсър върху непотвърдена форма
+// на отговора. limit=3 - минимален товар, само за да видим РЕАЛНАТА форма
+// на отговора (field order/имена), не за реални данни все още.
+const MEXC_DIAG_SPOT_KLINE_URL = 'https://api.mexc.com/api/v3/klines?symbol=BTCUSDT&interval=60m&limit=3';
+const MEXC_DIAG_FUTURES_KLINE_CANDIDATES = [
+  { label: 'futures_kline_new_host_path', url: 'https://api.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min60' },
+  { label: 'futures_kline_old_host_path', url: 'https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min60' },
+  { label: 'futures_kline_new_host_query', url: 'https://api.mexc.com/api/v1/contract/kline?symbol=BTC_USDT&interval=Min60' },
+];
 const MEXC_DIAG_TIMEOUT_MS = 5000;
 
 async function fetchMexcDiagEndpoint(targetUrl, label, fetchImpl = fetch) {
@@ -4255,11 +4270,16 @@ async function fetchMexcDiagEndpoint(targetUrl, label, fetchImpl = fetch) {
 // Чиста orchestration функция (inject-ваем fetchImpl за тестваемост, виж
 // discussion-а - НЕ прави реална мрежова заявка в unit тестовете).
 async function runMexcDiagProbe(fetchImpl = fetch) {
-  const [spot, ...futuresCandidates] = await Promise.all([
+  const futuresKlineCount = MEXC_DIAG_FUTURES_KLINE_CANDIDATES.length;
+  const [spot, spotKline, ...rest] = await Promise.all([
     fetchMexcDiagEndpoint(MEXC_DIAG_SPOT_URL, 'spot', fetchImpl),
+    fetchMexcDiagEndpoint(MEXC_DIAG_SPOT_KLINE_URL, 'spot_kline', fetchImpl),
     ...MEXC_DIAG_FUTURES_CANDIDATES.map(c => fetchMexcDiagEndpoint(c.url, c.label, fetchImpl)),
+    ...MEXC_DIAG_FUTURES_KLINE_CANDIDATES.map(c => fetchMexcDiagEndpoint(c.url, c.label, fetchImpl)),
   ]);
-  return { at: Date.now(), spot, futuresCandidates };
+  const futuresCandidates = rest.slice(0, rest.length - futuresKlineCount);
+  const futuresKlineCandidates = rest.slice(rest.length - futuresKlineCount);
+  return { at: Date.now(), spot, spotKline, futuresCandidates, futuresKlineCandidates };
 }
 
 // COVERAGE RANGE - най-ранния/най-късния `at` timestamp сред сканираните
@@ -9346,6 +9366,7 @@ export {
   OUTCOME_HORIZONS_MIN, buildPendingOutcomeHorizons, resolvePendingOutcomeHorizons, updateExcursion,
   // MEXC ДИАГНОСТИКА (2026-11-26) - изложени само за unit тестове.
   fetchMexcDiagEndpoint, runMexcDiagProbe, MEXC_DIAG_SPOT_URL, MEXC_DIAG_FUTURES_CANDIDATES,
+  MEXC_DIAG_SPOT_KLINE_URL, MEXC_DIAG_FUTURES_KLINE_CANDIDATES,
   // TV_ALERT_TOKEN coordinated rotation (2026-11-26) - изложени само за unit тестове.
   isValidTvAlertToken,
   // MR LIFECYCLE TELEMETRY (2026-11-26) - изложени само за unit тестове.
